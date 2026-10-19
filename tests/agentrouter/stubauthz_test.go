@@ -42,9 +42,10 @@ func startStubAuthz(t *testing.T) *stubAuthz {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &stubAuthz{server: grpc.NewServer(), addr: lis.Addr().String()}
-	authv3.RegisterAuthorizationServer(s.server, s)
-	go func() { _ = s.server.Serve(lis) }()
+	srv := grpc.NewServer()
+	s := &stubAuthz{server: srv, addr: lis.Addr().String()}
+	authv3.RegisterAuthorizationServer(srv, s)
+	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(s.Stop)
 	return s
 }

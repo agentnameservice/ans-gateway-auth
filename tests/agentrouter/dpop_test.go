@@ -5,14 +5,21 @@ package agentrouter
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 )
+
+// accessLogFlushTimeout bounds the wait for an access-log entry: Envoy flushes file sinks on a
+// ten-second interval by default.
+const accessLogFlushTimeout = 20 * time.Second
 
 type routeEnv struct {
 	ids      identities
@@ -216,10 +223,58 @@ func caseResponseAboveCap(t *testing.T, env *routeEnv) {
 	t.Logf("response above cap: details %q", res.Header.Get("X-Envoy-Response-Code-Details"))
 }
 
+// caseAccessLog checks that the rejection sink attributes requests from the verifier's dynamic
+// metadata: a forged identity header on an unsigned request is not logged as the agent, and a
+// verified agent refused by the authorization rule is. Query strings tag the requests, which a
+// signed request can carry because htu excludes them.
 func caseAccessLog(t *testing.T, env *routeEnv) {
-	logs := env.proc.stdout.String() + env.proc.stderr.String()
-	if !strings.Contains(logs, "ext_authz_denied") {
-		t.Errorf("no ext_authz_denied access-log line found in aigw output")
+	forged := fmt.Sprintf("forged-%d", time.Now().UnixNano())
+	req := chatRequest(t, chatBody, map[string]string{"X-ANS-Name": "ans://v1.0.0.forged.example", "X-ANS-Agent-Id": "forged-agent"})
+	req.URL.RawQuery = "log=" + forged
+	if res := send(t, req); res.Status != http.StatusUnauthorized {
+		t.Fatalf("unsigned forged request: status %d, want 401", res.Status)
+	}
+	denied := fmt.Sprintf("denied-%d", time.Now().UnixNano())
+	req = chatRequest(t, chatBody, nil)
+	req.URL.RawQuery = "log=" + denied
+	if err := env.ids.b.Bundle.Attach(req); err != nil {
+		t.Fatal(err)
+	}
+	if res := send(t, req); res.Status != http.StatusForbidden {
+		t.Fatalf("agent B: status %d, want 403", res.Status)
+	}
+
+	entry := waitForAccessLog(t, env.proc, forged)
+	if entry["response_code_details"] != "ext_authz_denied" {
+		t.Errorf("401 logged with response_code_details %v, want ext_authz_denied", entry["response_code_details"])
+	}
+	if id, _ := entry["ans.agent_id"].(string); id != "" {
+		t.Errorf("forged header was attributed: ans.agent_id = %q, want empty", id)
+	}
+	entry = waitForAccessLog(t, env.proc, denied)
+	if entry["ans.agent_id"] != agentBID {
+		t.Errorf("403 logged with ans.agent_id %v, want %q", entry["ans.agent_id"], agentBID)
+	}
+}
+
+// waitForAccessLog returns the JSON access-log entry whose request path carries tag.
+func waitForAccessLog(t *testing.T, p *process, tag string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(accessLogFlushTimeout)
+	for {
+		for _, line := range strings.Split(p.stdout.String(), "\n") {
+			if !strings.HasPrefix(line, "{") || !strings.Contains(line, tag) {
+				continue
+			}
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err == nil {
+				return entry
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no access-log entry for %q within %s", tag, accessLogFlushTimeout)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

@@ -20,6 +20,9 @@ const (
 	rootKeyPlaceholder = "REPLACE_WITH_THE_LOG_ROOT_KEY_LINE"
 	// distrolessNonroot is the uid and gid of the distroless nonroot user the image runs as.
 	distrolessNonroot = 65532
+	// replayResetGrace is the SDK's replay-retention grace the verifier adds to 2 x popSkew when
+	// it fails closed after a Redis keyspace loss; the recipe's startup quarantine must match.
+	replayResetGrace = 5 * time.Second
 )
 
 // These tests need no gateway: they keep the shipped Agent Router recipes loadable and
@@ -153,6 +156,15 @@ func TestVerifierDeploymentHardening(t *testing.T) {
 	// HA variant's Redis connect.
 	if need := k8s.StartupTimeout * time.Duration(len(k8s.TransparencyLogs)+1); budget < need {
 		t.Errorf("startupProbe allows %s, want at least %s (startupTimeout %s x %d)", budget, need, k8s.StartupTimeout, len(k8s.TransparencyLogs)+1)
+	}
+	// The memory replay cache dies with the process: the new pod must stay out of the Service
+	// until every proof the previous one could have accepted has expired.
+	if k8s.PoPSkew <= 0 {
+		t.Fatal("loaded config has no popSkew default")
+	}
+	delay, _ := startup["initialDelaySeconds"].(int)
+	if quarantine, want := time.Duration(delay)*time.Second, 2*k8s.PoPSkew+replayResetGrace; quarantine < want {
+		t.Errorf("startupProbe.initialDelaySeconds = %s, want at least 2 x popSkew + %s (%s)", quarantine, replayResetGrace, want)
 	}
 }
 

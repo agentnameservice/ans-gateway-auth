@@ -25,8 +25,8 @@ spec:
             json:
               gen_ai.request.model: "%REQ(X-AI-EG-MODEL)%"
               gen_ai.provider.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:backend_name)%"
-              ans.name: "%REQ(X-ANS-NAME)%"
-              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              ans.name: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:ans_name)%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
               method: "%REQ(:METHOD)%"
               request.path: "%REQ(:PATH)%"
               response_code: "%RESPONSE_CODE%"
@@ -35,7 +35,9 @@ spec:
               upstream_host: "%UPSTREAM_HOST%"
         # 401 identity rejected (ext_authz_denied, agent id empty), 403 authorization rule
         # (rbac_access_denied, agent id set), 413 request_payload_too_large,
-        # 500 response_payload_too_large, 503 ext_authz_error.
+        # 500 response_payload_too_large, 503 ext_authz_error. ans.name and ans.agent_id come
+        # from the verifier's dynamic metadata, which only a successful check sets, never from
+        # the X-ANS-* request headers: a rejected request still carries whatever the client sent.
         - matches:
             - "response.code >= 400"
           sinks:
@@ -49,7 +51,7 @@ spec:
               response_code: "%RESPONSE_CODE%"
               response_code_details: "%RESPONSE_CODE_DETAILS%"
               response_flags: "%RESPONSE_FLAGS%"
-              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
               authority: "%REQ(:AUTHORITY)%"
               x-request-id: "%REQ(X-REQUEST-ID)%"
               method: "%REQ(:METHOD)%"

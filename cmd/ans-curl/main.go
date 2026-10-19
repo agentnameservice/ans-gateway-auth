@@ -87,7 +87,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ans-curl:", err)
 		return exitFailure
 	}
-	if err := sendAll(&http.Client{Timeout: opts.timeout}, req, body, opts.replay, stdout); err != nil {
+	client := &http.Client{Timeout: opts.timeout, CheckRedirect: noRedirect}
+	if err := sendAll(client, req, body, opts.replay, stdout); err != nil {
 		fmt.Fprintln(stderr, "ans-curl:", err)
 		return exitFailure
 	}
@@ -144,6 +145,11 @@ func buildRequest(o *options, body []byte) (*http.Request, error) {
 
 // sendAll sends the signed request once, or twice byte-for-byte when replay is set, so the
 // second response shows the verifier rejecting the reused proof.
+// noRedirect keeps the one signed request single, as curl does without -L: following a
+// redirect would resend a proof bound to the original URL and carry the identity headers to
+// whatever host the redirect names.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
 func sendAll(client *http.Client, req *http.Request, body []byte, replay bool, out io.Writer) error {
 	attempts := 1
 	if replay {

@@ -61,8 +61,8 @@ spec:
             json:
               gen_ai.request.model: "%REQ(X-AI-EG-MODEL)%"
               gen_ai.provider.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:backend_name)%"
-              ans.name: "%REQ(X-ANS-NAME)%"
-              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              ans.name: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:ans_name)%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
               method: "%REQ(:METHOD)%"
               request.path: "%REQ(:PATH)%"
               response_code: "%RESPONSE_CODE%"
@@ -71,7 +71,10 @@ spec:
               upstream_host: "%UPSTREAM_HOST%"
         # Denials, verifier errors and size rejections are issued by ext_authz before the
         # AI processor runs, so they carry no x-ai-eg-model header and need their own sink.
-        # ans.agent_id is empty for 401s (nothing was verified) and set for 403s and later failures.
+        # ans.agent_id comes from the verifier's dynamic metadata, which only a successful check
+        # sets: empty for 401s, 413s and 503s, the verified id for 403s and later failures. The
+        # X-ANS-* request headers are never logged; a rejected request still carries whatever
+        # the client sent.
         - matches:
             - "response.code >= 400"
           sinks:
@@ -85,7 +88,7 @@ spec:
               response_code: "%RESPONSE_CODE%"
               response_code_details: "%RESPONSE_CODE_DETAILS%"
               response_flags: "%RESPONSE_FLAGS%"
-              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
               authority: "%REQ(:AUTHORITY)%"
               x-request-id: "%REQ(X-REQUEST-ID)%"
               method: "%REQ(:METHOD)%"

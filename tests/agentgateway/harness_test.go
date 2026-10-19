@@ -64,13 +64,6 @@ func skipOrFailf(t *testing.T, format string, args ...any) {
 	t.Skipf(format, args...)
 }
 
-func goarch() string {
-	if runtime.GOARCH == "x86_64" {
-		return "amd64"
-	}
-	return runtime.GOARCH
-}
-
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -89,7 +82,7 @@ func loadEnv(t *testing.T) env {
 		tlURL:      getenv("ANS_E2E_TL_URL", "http://localhost:18081"),
 		apiKey:     getenv("ANS_E2E_RA_API_KEY", "ans-dev-key-change-me"),
 		ansRepo:    os.Getenv("ANS_E2E_ANS_REPO"),
-		agwBin:     getenv("ANS_E2E_AGENTGATEWAY_BIN", filepath.Join(root, ".cache", "agentgateway-"+runtime.GOOS+"-"+goarch())),
+		agwBin:     getenv("ANS_E2E_AGENTGATEWAY_BIN", filepath.Join(root, ".cache", "agentgateway-"+runtime.GOOS+"-"+runtime.GOARCH)),
 		startStack: os.Getenv("ANS_E2E_START_STACK") == "1",
 		repoRoot:   root,
 	}

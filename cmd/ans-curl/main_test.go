@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
@@ -298,4 +299,32 @@ func writeFile(t *testing.T, name, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestRunDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	dir, _ := writeBundle(t, true)
+	var followed, hits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		followed.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, target.URL+"/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(redirecting.Close)
+
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"--identity", dir, redirecting.URL + "/start"}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("exit %d: %s", got, stderr.String())
+	}
+	if hits.Load() != 1 || followed.Load() != 0 {
+		t.Errorf("redirecting server saw %d requests and the target %d; want 1 and 0", hits.Load(), followed.Load())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "302 Found") || !strings.Contains(out, "Location: "+target.URL+"/elsewhere") {
+		t.Errorf("stdout should show the redirect response itself:\n%s", out)
+	}
 }

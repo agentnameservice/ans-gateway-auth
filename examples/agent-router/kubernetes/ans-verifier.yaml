@@ -57,9 +57,13 @@ metadata:
     app.kubernetes.io/name: ans-authz
 spec:
   # Exactly one replica: two in-memory replay caches behind one Service would each accept a
-  # replayed proof once. Recreate keeps a rollout from running two at the same time, at the
-  # cost of a short fail-closed window (pod restart + readiness + endpoint propagation). Every
-  # node drain or preemption costs the same window; give the pod a high priorityClassName.
+  # replayed proof once. Recreate stops the old pod before the new one starts, which is what
+  # makes the startupProbe's initialDelaySeconds below a sound quarantine: the delay counts
+  # from the new container's start, so every proof the old pod could have accepted has expired
+  # when the new pod joins the Service. A surge rollout (maxSurge > 0) overlaps the pods and
+  # voids it; that case needs the HA variant, whose Redis sentinel covers the whole store.
+  # Each rollout, node drain or preemption is therefore a fail-closed window of about four
+  # minutes; give the pod a high priorityClassName, or use the HA variant.
   replicas: 1
   strategy:
     type: Recreate
@@ -92,14 +96,22 @@ spec:
               containerPort: 9191
             - name: http
               containerPort: 9192
-          # Nothing listens until trust material is loaded: each transparency log without
-          # pinned keys is retried for startupTimeout (30 s by default), then the Redis connect
-          # in the HA variant for the same. 90 s covers two such waits; raise it with
-          # startupTimeout. Liveness starts only after this probe succeeds.
+          # Startup quarantine: the in-memory replay cache does not survive a restart, so a
+          # proof the previous process accepted would be accepted again until its validity
+          # window closes. The pod stays out of the Service for 2 x popSkew + 5 s (245 s at the
+          # default 120 s skew: a proof may carry an iat one skew in the future, plus the SDK's
+          # retention grace; the same window the verifier applies after a Redis keyspace loss).
+          # Envoy reports the gap as 503 ext_authz_error. Raise it with popSkew; the HA variant
+          # needs no quarantine because its Redis cache persists.
+          # After the delay, nothing listens until trust material is loaded: each transparency
+          # log without pinned keys is retried for startupTimeout (30 s by default), then the
+          # Redis connect in the HA variant for the same. 90 s of probing covers two such
+          # waits; raise it with startupTimeout. Liveness starts only after this probe succeeds.
           startupProbe:
             httpGet:
               path: /readyz
               port: http
+            initialDelaySeconds: 245
             periodSeconds: 5
             failureThreshold: 18
           readinessProbe:
@@ -178,7 +190,8 @@ spec:
 # can point it, and the Redis address, at any secret the pod carries: grant write access to
 # the ConfigMap to no one who may not read the Secret. Then set replicas: 2 and strategy
 # RollingUpdate {maxUnavailable: 0, maxSurge: 1}, add a PodDisruptionBudget with
-# minAvailable: 1, and keep the preStop sleep so endpoints drain.
+# minAvailable: 1, and keep the preStop sleep so endpoints drain. Drop the startupProbe's
+# initialDelaySeconds: the shared cache survives restarts.
 #
 # ---
 # TLS variant: Envoy verifies the verifier's certificate, so no on-path host inside the

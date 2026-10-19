@@ -130,12 +130,16 @@ externally visible authority to share it, so:
 | Topology | Replay protection | Use when |
 |---|---|---|
 | One local process (`aigw run`) | complete | development and tests |
-| One Deployment, `replicas: 1` | complete; a rollout, drain or preemption is a short fail-closed window | the default |
-| Sidecar per Envoy pod | complete only with one Envoy replica | single-replica gateways |
+| One Deployment, `replicas: 1` | complete, including across restarts: the startup quarantine (2 × `popSkew` + 5 s, 245 s) outlasts every proof the previous pod accepted, so each rollout, drain or preemption is a fail-closed window of that length | the default |
+| Sidecar per Envoy pod | complete only with one Envoy replica and the same startup quarantine | single-replica gateways |
 | Several replicas with the `redis` replay backend | complete; a Redis outage is a fail-closed 503, so run Redis highly available | high availability |
 
 Do not scale the memory-backed Deployment: two in-memory caches each accept a replayed proof
-once. Consistent-hash load balancing on the `DPoP` header does not help, because Envoy hashes the
+once, and the cache dies with the process, so `ans-verifier.yaml` keeps a restarted pod out of the
+Service for 2 × `popSkew` + 5 s (the startup probe's `initialDelaySeconds`, the window the verifier
+itself applies after a Redis keyspace loss), a fail-closed 503 window in which every proof the
+previous pod accepted expires. That holds only under `Recreate`, which stops the old pod before the
+new one starts; a surge rollout overlaps them and needs the Redis variant. Consistent-hash load balancing on the `DPoP` header does not help, because Envoy hashes the
 headers of its own gRPC `Check` call, which never carries the client's `DPoP` header. Give the
 single replica a high `priorityClassName`; a PodDisruptionBudget with one replica only blocks
 drains. `replay.maxEntries` bounds the proofs remembered for the 120 s skew window and fails
@@ -155,8 +159,9 @@ the verifier's `/metrics`.
 
 Envoy counts the first 503 under `cluster.<route cluster>.ext_authz.error` and the second under
 `.ext_authz.denied`; alert on both, and on the verifier's own `/metrics`. The rejection sink logs
-`ans.agent_id` and `:authority`, so 403s can be attributed to an agent and htu mismatches to a
-host name.
+`ans.agent_id` from the verifier's dynamic metadata, which only a successful check sets, and
+`:authority`, so 403s can be attributed to an agent and htu mismatches to a host name; a forged
+`X-ANS-Agent-Id` on a rejected request is never logged as the agent.
 
 ### Body size and concurrency
 
@@ -212,7 +217,10 @@ a rate limit so unauthenticated traffic cannot exhaust the gateway before it is 
 - (g) The identity headers (`X-ANS-*` and `x-ai-eg-mcp-subject`) reach the upstream. Remove them
   with the AIServiceBackend's `headerMutation.remove` when a third-party provider should not see
   them.
-- (h) Replay protection is per verifier process until the `redis` replay backend is configured.
+- (h) Replay protection is per verifier process until the `redis` replay backend is configured. A
+  memory-backed verifier that restarts forgets every proof it accepted; `kubernetes/ans-verifier.yaml`
+  covers that with its startup quarantine, while a verifier run without one (`aigw run`, a sidecar
+  without the delay) accepts a replay of a proof its predecessor saw until that proof expires.
 - (i) With `requireTokenClaims: false`, the `cnf.jkt` binding of a DPoP-bound OAuth access token is
   not checked at the gateway, because Envoy Gateway forwards no validated claims to ext_authz.
   These recipes consume no access tokens; an upstream that does must verify the binding itself.
