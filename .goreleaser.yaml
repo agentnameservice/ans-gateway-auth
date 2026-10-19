@@ -1,0 +1,91 @@
+# GoReleaser config for the ans-authz verifier and its companion tools.
+# release-please owns the changelog and the GitHub Release body; GoReleaser
+# only attaches binaries and checksums to the release it created.
+# Docs: https://goreleaser.com/customization/
+version: 2
+
+project_name: ans-gateway-auth
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ans-authz
+    main: ./cmd/ans-authz
+    binary: ans-authz
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+  - id: ans-curl
+    main: ./cmd/ans-curl
+    binary: ans-curl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+  - id: ans-dev-identity
+    main: ./cmd/ans-dev-identity
+    binary: ans-dev-identity
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: ans-gateway-auth
+    ids:
+      - ans-authz
+      - ans-curl
+      - ans-dev-identity
+    name_template: "ans-gateway-auth_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  disable: true
+
+release:
+  mode: append
+  github:
+    owner: agentnameservice
+    name: ans-gateway-auth
