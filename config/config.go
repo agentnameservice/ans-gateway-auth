@@ -29,8 +29,8 @@ const (
 
 // Replay backend types.
 const (
-	ReplayTypeMemory = "memory"
-	ReplayTypeRedis  = "redis"
+	ReplayTypeMemory = replay.BackendMemory
+	ReplayTypeRedis  = replay.BackendRedis
 )
 
 // Config is the complete service configuration. The authz policy is inline so

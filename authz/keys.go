@@ -27,7 +27,7 @@ const (
 )
 
 // KeySource is one transparency log's trusted keys with optional refresh
-// hooks, typically a *scitt.RefreshableKeyStore's methods.
+// hooks; the verifier binary supplies its per-log key store's methods.
 type KeySource struct {
 	// Name labels the source in telemetry and status; it must be unique.
 	Name string

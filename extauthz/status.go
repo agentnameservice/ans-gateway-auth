@@ -88,10 +88,10 @@ func (c *statusCollector) Collect(ch chan<- prometheus.Metric) {
 	st := c.cache.Stats()
 	ch <- prometheus.MustNewConstMetric(c.d.descReplayUp, prometheus.GaugeValue, boolValue(st.Up), st.Backend)
 	switch st.Backend {
-	case "memory":
+	case replay.BackendMemory:
 		ch <- prometheus.MustNewConstMetric(c.d.descReplayEntries, prometheus.GaugeValue, float64(st.Entries))
 		ch <- prometheus.MustNewConstMetric(c.d.descReplayCapacity, prometheus.GaugeValue, float64(st.Capacity))
-	case "redis":
+	case replay.BackendRedis:
 		ch <- prometheus.MustNewConstMetric(c.d.descReplayUsedMemory, prometheus.GaugeValue, float64(st.UsedMemory))
 		ch <- prometheus.MustNewConstMetric(c.d.descReplayMaxMemory, prometheus.GaugeValue, float64(st.MaxMemory))
 		ch <- prometheus.MustNewConstMetric(c.d.descReplayNoEviction, prometheus.GaugeValue, boolValue(st.EvictionPolicy == "noeviction"))

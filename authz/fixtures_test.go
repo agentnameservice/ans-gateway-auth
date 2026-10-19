@@ -262,7 +262,6 @@ func toRequest(t *testing.T, req *http.Request) *Request {
 	}
 	return &Request{
 		Method:    req.Method,
-		Scheme:    req.URL.Scheme,
 		Authority: req.URL.Host,
 		Path:      req.URL.RequestURI(),
 		Header:    req.Header.Clone(),

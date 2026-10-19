@@ -133,13 +133,14 @@ func TestMemoryDefaultCapacity(t *testing.T) {
 
 func TestKeyspaceResetErrorMatchesUnavailable(t *testing.T) {
 	t.Parallel()
-	if !errors.Is(ErrKeyspaceReset, ErrUnavailable) {
-		t.Fatal("ErrKeyspaceReset must satisfy errors.Is(err, ErrUnavailable)")
+	err := &KeyspaceResetError{}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatal("KeyspaceResetError must satisfy errors.Is(err, ErrUnavailable)")
 	}
-	if errors.Is(ErrKeyspaceReset, ErrFull) {
-		t.Fatal("ErrKeyspaceReset must not match ErrFull")
+	if errors.Is(err, ErrFull) {
+		t.Fatal("KeyspaceResetError must not match ErrFull")
 	}
-	if ErrKeyspaceReset.Error() == "" {
-		t.Fatal("ErrKeyspaceReset must have a message")
+	if err.Error() == "" {
+		t.Fatal("KeyspaceResetError must have a message")
 	}
 }

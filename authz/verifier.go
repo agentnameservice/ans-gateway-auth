@@ -73,11 +73,10 @@ const (
 	misconfigurationLogInterval = time.Minute
 )
 
-// Request is the transport-neutral view of one gateway check. Scheme is
-// informational only: the htu scheme always comes from configuration.
+// Request is the transport-neutral view of one gateway check. It carries no
+// request scheme: the htu scheme always comes from configuration.
 type Request struct {
 	Method      string
-	Scheme      string
 	Authority   string
 	Path        string
 	Header      http.Header
@@ -152,8 +151,8 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if k, isKeyring := keys.(*Keyring); keys == nil || (isKeyring && k == nil) {
-		return nil, errors.New("authz: keyring is required")
+	if keys == nil {
+		return nil, errors.New("authz: key provider is required")
 	}
 	if cache == nil {
 		return nil, errors.New("authz: replay cache is required")
@@ -313,10 +312,21 @@ func (v *Verifier) authenticate(ctx context.Context, r *Request, hdrs *scitt.Hea
 	proof := r.Header.Get(pop.DPoPHeader)
 	cache := boundReplay{ctx: ctx, cache: v.cache}
 	id, err := pop.VerifyCaller(ctx, proof, hdrs, r.Method, rawURL, v.keys, cache, opts...)
-	if err != nil && isUnknownKeyID(err) && v.keys.RefreshFor(ctx) {
+	if kid, unknown := unknownKeyID(err); unknown && v.keyAvailable(ctx, kid) {
 		id, err = pop.VerifyCaller(ctx, proof, hdrs, r.Method, rawURL, v.keys, cache, opts...)
 	}
 	return id, err
+}
+
+// keyAvailable refreshes the root keys for a kid the provider did not hold
+// and reports whether a retry can succeed: this refresh completed, or another
+// caller's refresh landed the key since the first lookup.
+func (v *Verifier) keyAvailable(ctx context.Context, kid [4]byte) bool {
+	if v.keys.RefreshFor(ctx) {
+		return true
+	}
+	_, err := v.keys.Get(kid)
+	return err == nil
 }
 
 // completeTokenBinding finishes RFC 9449 section 7 token binding: a DPoP-bound
@@ -332,8 +342,8 @@ func (v *Verifier) completeTokenBinding(ctx context.Context, r *Request, id *pop
 		if r.TokenClaims[claimConfirmation] != nil {
 			return deny(http.StatusUnauthorized, CategoryTokenBindingMismatch)
 		}
-		if _, other, found := strings.Cut(r.Header.Get(headerAuthorization), " "); found {
-			if jkt, ok := tokenThumbprint(strings.TrimSpace(other)); ok && jkt != "" {
+		if other, found := schemeCredentials(r.Header.Get(headerAuthorization)); found {
+			if jkt, ok := tokenThumbprint(other); ok && jkt != "" {
 				return deny(http.StatusUnauthorized, CategoryTokenBindingMismatch)
 			}
 		}
@@ -379,6 +389,8 @@ func (v *Verifier) mapError(ctx context.Context, err error) *Denial {
 		return withDetail(deny(http.StatusServiceUnavailable, CategoryMisconfigured), err)
 	case pe.Type == pop.ErrMisconfigured, pe.Type == pop.ErrClientGone:
 		return withDetail(deny(http.StatusServiceUnavailable, string(pe.Type)), err)
+	case pe.Type == pop.ErrExpectedPeerMismatch:
+		return withDetail(deny(http.StatusForbidden, string(pe.Type)), err)
 	default:
 		return withDetail(deny(http.StatusUnauthorized, string(pe.Type)), err)
 	}
@@ -528,9 +540,24 @@ func confirmationThumbprint(claims map[string]any) string {
 	return jkt
 }
 
-func isUnknownKeyID(err error) bool {
+// unknownKeyID extracts the kid of a proof whose key the provider did not
+// hold.
+func unknownKeyID(err error) ([4]byte, bool) {
 	var sigErr *scitt.SignatureError
-	return errors.As(err, &sigErr) && sigErr.Type == scitt.SigErrUnknownKeyID
+	if errors.As(err, &sigErr) && sigErr.Type == scitt.SigErrUnknownKeyID {
+		return sigErr.Kid, true
+	}
+	return [4]byte{}, false
+}
+
+// schemeCredentials returns the credentials following the scheme in an
+// Authorization value, split on the space or tab RFC 9110 allows there.
+func schemeCredentials(auth string) (string, bool) {
+	i := strings.IndexAny(auth, " \t")
+	if i < 0 {
+		return "", false
+	}
+	return strings.TrimSpace(auth[i+1:]), true
 }
 
 func pathOnly(p string) string {

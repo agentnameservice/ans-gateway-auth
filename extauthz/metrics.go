@@ -109,7 +109,7 @@ func (m *Metrics) CheckTimeout() {
 // through its own counter by the status collector, not as a backend error.
 func (m *Metrics) ReplayBackend(op string, d time.Duration, err error) {
 	m.replayLatency.WithLabelValues(op).Observe(d.Seconds())
-	if err == nil || isContextError(err) || errors.Is(err, replay.ErrKeyspaceReset) {
+	if err == nil || isContextError(err) || isKeyspaceReset(err) {
 		return
 	}
 	m.replayErrors.WithLabelValues(op).Inc()
@@ -117,4 +117,9 @@ func (m *Metrics) ReplayBackend(op string, d time.Duration, err error) {
 
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isKeyspaceReset(err error) bool {
+	var reset *replay.KeyspaceResetError
+	return errors.As(err, &reset)
 }

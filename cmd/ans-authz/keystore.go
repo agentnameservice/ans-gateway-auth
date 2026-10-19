@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type keyStore struct {
 
 	mu            sync.RWMutex
 	current       *scitt.KeyStore
+	fetched       map[[4]byte]string
 	lastRefreshed *time.Time
 }
 
@@ -39,8 +41,10 @@ func (s *keyStore) Get(kid [4]byte) (*scitt.TrustedKey, error) {
 }
 
 // DoRefresh fetches the log's root keys and installs pinned ∪ fetched as the
-// new snapshot. A static store (no client) is a no-op; a failed fetch keeps
-// the previous snapshot and does not count as a refresh.
+// new snapshot. A static store (no client) is a no-op; a failed fetch, or one
+// in which no line parsed, keeps the previous snapshot and does not count as a
+// refresh. Every change to the fetched set is logged, at WARN when a key was
+// withdrawn or a kid collided with a key of another name.
 func (s *keyStore) DoRefresh(ctx context.Context) error {
 	if s.client == nil {
 		return nil
@@ -50,18 +54,50 @@ func (s *keyStore) DoRefresh(ctx context.Context) error {
 		return fmt.Errorf("fetch root keys: %w", err)
 	}
 	merged, result := s.pinned.MergeFrom(lines)
+	if result.Added+result.SkippedDuplicate == 0 {
+		return fmt.Errorf("fetch root keys: none of %d lines parsed", len(lines))
+	}
+	fetched := parseKids(lines)
 	now := time.Now()
 	s.mu.Lock()
-	previous := s.current
-	s.current = merged
-	s.lastRefreshed = &now
+	previous, previousFetched := s.current, s.fetched
+	s.current, s.fetched, s.lastRefreshed = merged, fetched, &now
 	s.mu.Unlock()
-	if previous.Len() != merged.Len() || result.SkippedUnparseable > 0 || len(result.Collisions) > 0 {
-		s.logger.InfoContext(ctx, "root keys refreshed",
-			"keys_before", previous.Len(), "keys_after", merged.Len(), "fetched", len(lines),
-			"unparseable", result.SkippedUnparseable, "collisions", len(result.Collisions))
+	added, removed := onlyIn(fetched, previousFetched), onlyIn(previousFetched, fetched)
+	if len(added)+len(removed)+result.SkippedUnparseable+len(result.Collisions) == 0 {
+		return nil
 	}
+	level := slog.LevelInfo
+	if len(removed) > 0 || len(result.Collisions) > 0 {
+		level = slog.LevelWarn
+	}
+	s.logger.Log(ctx, level, "root keys refreshed",
+		"log", s.name, "keys_before", previous.Len(), "keys_after", merged.Len(), "fetched", len(lines),
+		"added", added, "removed", removed, "unparseable", result.SkippedUnparseable, "collisions", result.Collisions)
 	return nil
+}
+
+// parseKids maps every parseable line's kid to its key name.
+func parseKids(lines []string) map[[4]byte]string {
+	kids := make(map[[4]byte]string, len(lines))
+	for _, line := range lines {
+		if tk, err := scitt.ParseC2SPKey(line); err == nil {
+			kids[tk.Kid] = tk.Name
+		}
+	}
+	return kids
+}
+
+// onlyIn lists the keys of set absent from other as "name/kid", sorted.
+func onlyIn(set, other map[[4]byte]string) []string {
+	out := make([]string, 0, len(set))
+	for kid, name := range set {
+		if _, ok := other[kid]; !ok {
+			out = append(out, fmt.Sprintf("%s/%x", name, kid))
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // LastRefreshed reports the last successful fetch, nil before the first.

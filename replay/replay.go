@@ -63,20 +63,18 @@ var (
 	// ErrUnavailable reports that the backend could not be consulted. The
 	// verifier maps it to the REPLAY_CACHE_UNAVAILABLE category.
 	ErrUnavailable = errors.New("replay cache unavailable")
-	// ErrKeyspaceReset reports that the shared backend lost its keyspace and
-	// every replica is failing closed until the replay window has elapsed. It
-	// matches ErrUnavailable under errors.Is.
-	ErrKeyspaceReset = &keyspaceResetError{}
 )
 
-type keyspaceResetError struct{}
+// Backend names, reported in Stats.Backend and used as the configured replay
+// type.
+const (
+	BackendMemory = "memory"
+	BackendRedis  = "redis"
+)
 
-func (*keyspaceResetError) Error() string        { return "replay cache keyspace reset" }
-func (*keyspaceResetError) Is(target error) bool { return target == ErrUnavailable }
-
-// KeyspaceResetError is the keyspace-loss failure with the end of the
-// fail-closed window attached, so a verifier can advise the caller when to
-// retry. It matches ErrKeyspaceReset and ErrUnavailable under errors.Is.
+// KeyspaceResetError reports that the shared backend lost its keyspace and
+// every replica is failing closed until Until, so a verifier can advise the
+// caller when to retry. It matches ErrUnavailable under errors.Is.
 type KeyspaceResetError struct {
 	Until time.Time
 }
@@ -85,7 +83,5 @@ func (e *KeyspaceResetError) Error() string {
 	return "replay cache keyspace reset; failing closed until " + e.Until.UTC().Format(time.RFC3339)
 }
 
-// Is reports a match for ErrKeyspaceReset and ErrUnavailable.
-func (*KeyspaceResetError) Is(target error) bool {
-	return target == ErrUnavailable || target == ErrKeyspaceReset
-}
+// Is reports a match for ErrUnavailable.
+func (*KeyspaceResetError) Is(target error) bool { return target == ErrUnavailable }

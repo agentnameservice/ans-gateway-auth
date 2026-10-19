@@ -297,6 +297,9 @@ func TestConfigValidate(t *testing.T) {
 		{name: "baseURL with fragment", mutate: func(c *Config) {
 			c.TransparencyLogs[0].BaseURL = "https://tl.example.com/#frag"
 		}, wantErr: "fragment"},
+		{name: "baseURL with credentials", mutate: func(c *Config) {
+			c.TransparencyLogs[0].BaseURL = "https://user:secret@tl.example.com"
+		}, wantErr: "credentials"},
 		{name: "baseURL with path", mutate: func(c *Config) {
 			c.TransparencyLogs[0].BaseURL = "https://tl.example.com/api"
 		}},
@@ -485,12 +488,12 @@ func TestConfigWarnings(t *testing.T) {
 		{
 			name:         "at the gateway budget",
 			checkTimeout: 2 * time.Second,
-			want:         []string{"checkTimeout 2s is not below the gateway's 2s ext_authz budget"},
+			want:         []string{"checkTimeout 2s is not below agentgateway's 2s ext_authz timeout"},
 		},
 		{
 			name:         "above the gateway budget",
 			checkTimeout: 3 * time.Second,
-			want:         []string{"checkTimeout 3s is not below the gateway's 2s ext_authz budget"},
+			want:         []string{"checkTimeout 3s is not below agentgateway's 2s ext_authz timeout"},
 		},
 		{
 			name: "plaintext transparency log on a non-loopback host", checkTimeout: 1500 * time.Millisecond,

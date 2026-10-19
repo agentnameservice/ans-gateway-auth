@@ -97,7 +97,7 @@ func TestMetricsReplayBackend(t *testing.T) {
 		{name: "capacity error is counted", err: replay.ErrFull, wantErrors: 1},
 		{name: "outage is counted", err: replay.ErrUnavailable, wantErrors: 1},
 		{name: "wrapped outage is counted", err: errors.Join(errors.New("set"), replay.ErrUnavailable), wantErrors: 1},
-		{name: "keyspace reset is not a backend error", err: replay.ErrKeyspaceReset},
+		{name: "keyspace reset is not a backend error", err: &replay.KeyspaceResetError{}},
 		{name: "cancellation is excluded", err: context.Canceled},
 		{name: "deadline is excluded", err: context.DeadlineExceeded},
 		{name: "wrapped deadline is excluded", err: errors.Join(errors.New("get"), context.DeadlineExceeded)},

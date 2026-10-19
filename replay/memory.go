@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
@@ -30,7 +31,7 @@ func (m *Memory) CheckAndStore(_ context.Context, key string, exp time.Time) (bo
 	start := time.Now()
 	seen, err := m.cache.CheckAndStore(key, exp)
 	if err != nil {
-		err = &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "replay cache full", Cause: ErrFull}
+		err = &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "replay cache full", Cause: fmt.Errorf("%w: %w", ErrFull, err)}
 	}
 	m.obs.ReplayBackend("check_and_store", time.Since(start), err)
 	return seen, err
@@ -39,7 +40,7 @@ func (m *Memory) CheckAndStore(_ context.Context, key string, exp time.Time) (bo
 // Stats implements Cache.
 func (m *Memory) Stats() Stats {
 	return Stats{
-		Backend:  "memory",
+		Backend:  BackendMemory,
 		Entries:  int64(m.cache.Len()),
 		Capacity: int64(m.cache.Cap()),
 		Up:       true,

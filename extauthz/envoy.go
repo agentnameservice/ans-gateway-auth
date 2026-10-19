@@ -75,7 +75,6 @@ func FromCheckRequest(req *authv3.CheckRequest) (*authz.Request, error) {
 	id, fromClient := requestID(hr, header)
 	return &authz.Request{
 		Method:              hr.GetMethod(),
-		Scheme:              strings.ToLower(hr.GetScheme()),
 		Authority:           authority,
 		Path:                hr.GetPath(),
 		Header:              header,
@@ -238,9 +237,6 @@ func removalsNotSet(removals []string, set map[string]string) []string {
 	}
 	out := make([]string, 0, len(removals))
 	for _, name := range removals {
-		if _, dup := set[http.CanonicalHeaderKey(name)]; dup {
-			continue
-		}
 		clash := false
 		for setName := range set {
 			if strings.EqualFold(setName, name) {

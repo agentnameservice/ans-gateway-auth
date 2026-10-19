@@ -13,8 +13,9 @@ import (
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 )
 
-// GatewayExtAuthzBudget is the client-side timeout agentgateway applies to
-// every ext_authz call. A checkTimeout at or above it lets the gateway give up
+// GatewayExtAuthzBudget is the fixed client-side timeout agentgateway applies
+// to every ext_authz call; Agent Router's is configurable and must exceed
+// checkTimeout as well. A checkTimeout at or above it lets the gateway give up
 // before the verifier answers.
 const GatewayExtAuthzBudget time.Duration = 2 * time.Second
 
@@ -54,7 +55,7 @@ func (c Config) Warnings() []string {
 	var warnings []string
 	if c.CheckTimeout >= GatewayExtAuthzBudget {
 		warnings = append(warnings, fmt.Sprintf(
-			"checkTimeout %s is not below the gateway's %s ext_authz budget", c.CheckTimeout, GatewayExtAuthzBudget))
+			"checkTimeout %s is not below agentgateway's %s ext_authz timeout", c.CheckTimeout, GatewayExtAuthzBudget))
 	}
 	for _, tl := range c.TransparencyLogs {
 		if u, err := url.Parse(tl.BaseURL); err == nil && u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
@@ -135,6 +136,9 @@ func validateBaseURL(raw string, allowInsecure bool) error {
 	}
 	if u.Host == "" {
 		return errors.New("host is required")
+	}
+	if u.User != nil {
+		return errors.New("credentials are not allowed in the URL")
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return errors.New("query and fragment are not allowed")

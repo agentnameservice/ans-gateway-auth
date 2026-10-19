@@ -24,6 +24,8 @@ const (
 		"# Persistence\r\naof_enabled:1\r\n# Stats\r\nevicted_keys:0\r\n"
 	infoDrift = "# Server\r\nrun_id:run-2\r\n# Memory\r\nused_memory:2048\r\nmaxmemory:4096\r\nmaxmemory_policy:allkeys-lru\r\n" +
 		"# Persistence\r\naof_enabled:0\r\n# Stats\r\nevicted_keys:3\r\n"
+	infoAOFOff = "# Server\r\nrun_id:run-1\r\n# Memory\r\nused_memory:1024\r\nmaxmemory:4096\r\nmaxmemory_policy:noeviction\r\n" +
+		"# Persistence\r\naof_enabled:0\r\n# Stats\r\nevicted_keys:0\r\n"
 	infoNoLimit  = "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n"
 	infoEvicting = "# Memory\r\nmaxmemory:4096\r\nmaxmemory_policy:volatile-lru\r\n"
 	oomMessage   = "OOM command not allowed when used memory > 'maxmemory'."
@@ -243,6 +245,7 @@ func TestNewRedisGuards(t *testing.T) {
 		{name: "healthy store", doc: infoGood},
 		{name: "no memory limit", doc: infoNoLimit, want: "maxmemory is 0"},
 		{name: "evicting policy", doc: infoEvicting, want: "requires noeviction"},
+		{name: "appendonly off", doc: infoAOFOff, want: "appendonly is off"},
 		{name: "info unavailable", err: errors.New("connection refused"), want: "info: connection refused"},
 	}
 	for _, tt := range tests {
@@ -284,7 +287,7 @@ func TestRedisCheckAndStore(t *testing.T) {
 	if seen, err := b.check(t, "jti-b", exp); err != nil || seen {
 		t.Fatalf("other key: seen=%v err=%v", seen, err)
 	}
-	if ttl := m.TTL("jti-a"); ttl < 9*time.Second || ttl > testSkew {
+	if ttl := m.TTL(jtiKeyPrefix + "jti-a"); ttl < 9*time.Second || ttl > testSkew {
 		t.Fatalf("ttl = %s, want about %s", ttl, testSkew)
 	}
 	m.FastForward(testSkew + time.Second)
@@ -346,7 +349,7 @@ func TestRedisBackendErrors(t *testing.T) {
 
 func assertKeyspaceReset(t *testing.T, err error, wantUntil time.Time) {
 	t.Helper()
-	if !errors.Is(err, ErrKeyspaceReset) || !errors.Is(err, ErrUnavailable) {
+	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want keyspace reset matching ErrUnavailable", err)
 	}
 	var kre *KeyspaceResetError
@@ -386,14 +389,16 @@ func TestRedisKeyspaceReset(t *testing.T) {
 		t.Fatalf("a present sentinel must not count as another reset: %+v", st)
 	}
 	clk.advance(testWindow/2 + time.Second)
-	if seen, err := b.check(t, "after-window", exp()); err != nil || seen {
-		t.Fatalf("after the window: seen=%v err=%v", seen, err)
+	if seen, checkErr := b.check(t, "after-window", exp()); checkErr != nil || seen {
+		t.Fatalf("after the window: seen=%v err=%v", seen, checkErr)
+	}
+	if st := b.r.Stats(); !st.KeyspaceResetUntil.IsZero() {
+		t.Fatalf("an elapsed window must not be reported: %+v", st)
 	}
 
 	m.FlushAll()
-	if _, err := b.check(t, "second-flush", exp()); !errors.Is(err, ErrKeyspaceReset) {
-		t.Fatalf("second flush: %v", err)
-	}
+	_, err = b.check(t, "second-flush", exp())
+	assertKeyspaceReset(t, err, clk.now().Add(testWindow))
 	if st := b.r.Stats(); st.KeyspaceResets != 2 {
 		t.Fatalf("stats after second flush = %+v", st)
 	}
@@ -424,17 +429,59 @@ func TestRedisFreshStoreFailsClosedForWindow(t *testing.T) {
 	}
 }
 
-func TestRedisCorruptSentinelFailsClosed(t *testing.T) {
+func TestRedisUnreadableSentinelHeals(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		value func(*clock) string
+	}{
+		{name: "garbage", value: func(*clock) string { return "garbage" }},
+		{name: "non-numeric timestamp", value: func(*clock) string { return "soon:abcd" }},
+		{name: "timestamp beyond one window ahead", value: func(clk *clock) string {
+			return strconv.FormatInt(clk.now().Add(2*testWindow).UnixMilli(), 10) + ":x"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := startMini(t)
+			clk := newClock()
+			seedOldSentinel(t, m, clk)
+			b := newBackend(t, m, clk)
+			bad := tt.value(clk)
+			if err := m.Set(sentinelKey, bad); err != nil {
+				t.Fatal(err)
+			}
+			_, err := b.check(t, "jti", clk.now().Add(testSkew))
+			assertKeyspaceReset(t, err, clk.now().Add(testWindow))
+			if got, err := m.Get(sentinelKey); err != nil || got == bad {
+				t.Fatalf("sentinel not replaced: %q, %v", got, err)
+			}
+			if got := b.log.count(); got != 1 {
+				t.Fatalf("logs = %d, want one unreadable-sentinel line", got)
+			}
+			clk.advance(testWindow + time.Second)
+			if seen, err := b.check(t, "jti-2", clk.now().Add(testSkew)); err != nil || seen {
+				t.Fatalf("after the window: seen=%v err=%v", seen, err)
+			}
+		})
+	}
+}
+
+func TestNewRedisReplacesUnreadableSentinel(t *testing.T) {
 	t.Parallel()
 	m := startMini(t)
 	clk := newClock()
-	seedOldSentinel(t, m, clk)
-	b := newBackend(t, m, clk)
 	if err := m.Set(sentinelKey, "garbage"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := b.check(t, "jti", clk.now().Add(testSkew))
-	assertKeyspaceReset(t, err, clk.now().Add(testWindow))
+	b := newBackend(t, m, clk)
+	if st := b.r.Stats(); !st.KeyspaceResetUntil.Equal(clk.now().Add(testWindow)) {
+		t.Fatalf("startup with an unreadable sentinel must open one window: %+v", st)
+	}
+	if got, err := m.Get(sentinelKey); err != nil || got == "garbage" {
+		t.Fatalf("sentinel not replaced: %q, %v", got, err)
+	}
 }
 
 func TestRedisSharedSentinel(t *testing.T) {
@@ -522,6 +569,20 @@ func TestRedisSamplerAndPolicyDrift(t *testing.T) {
 	}
 }
 
+func TestRedisAOFDriftFailsClosed(t *testing.T) {
+	t.Parallel()
+	m := startMini(t)
+	clk := newClock()
+	seedOldSentinel(t, m, clk)
+	b := newBackend(t, m, clk, withRedisSampleInterval(5*time.Millisecond))
+	b.info.set(infoAOFOff, nil)
+	waitStats(t, b.r, func(s Stats) bool { return !s.AOFEnabled })
+	_, err := b.check(t, "jti", clk.now().Add(testSkew))
+	if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "appendonly") {
+		t.Fatalf("appendonly drift must fail closed: %v", err)
+	}
+}
+
 func TestNewRedisBoundedByTimeout(t *testing.T) {
 	t.Parallel()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -575,6 +636,9 @@ func TestRedisCancelledContext(t *testing.T) {
 	_, err := b.r.CheckAndStore(ctx, "jti", clk.now().Add(testSkew))
 	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want the cancellation wrapped as unavailable", err)
+	}
+	if got := b.log.count(); got != 0 {
+		t.Fatalf("logs = %d; the caller's cancellation is not a backend failure", got)
 	}
 }
 

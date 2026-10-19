@@ -73,7 +73,7 @@ func TestFromCheckRequestMapping(t *testing.T) {
 		{
 			name: "basic fields, pseudo-headers dropped, scheme lowercased",
 			check: func(t *testing.T, r *authz.Request) {
-				if r.Method != http.MethodPost || r.Path != "/echo?x=1" || r.Authority != "127.0.0.1:8080" || r.Scheme != "http" {
+				if r.Method != http.MethodPost || r.Path != "/echo?x=1" || r.Authority != "127.0.0.1:8080" {
 					t.Fatalf("basic fields = %+v", r)
 				}
 				if got := r.Header.Get("Dpop"); got != "proof" {

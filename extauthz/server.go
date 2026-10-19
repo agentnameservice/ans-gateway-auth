@@ -32,6 +32,9 @@ const (
 	recvHeadroom = 1 << 20
 	// logFieldLimit bounds client-influenced strings in the decision log.
 	logFieldLimit = 256
+	// maxConcurrentStreams bounds the HTTP/2 streams one gateway connection
+	// may hold open; grpc-go's default is unlimited.
+	maxConcurrentStreams = 1024
 )
 
 // Decider makes the verification decision; *authz.Verifier implements it.
@@ -101,7 +104,9 @@ func NewServer(v Decider, opts ...Option) *Server {
 
 // Check implements the ext_authz Authorization service. Every fault is a
 // denial in the response, including a panic while verifying client-supplied
-// material; the only gRPC error is the caller's own cancellation.
+// material; the only gRPC error Check returns is the caller's own
+// cancellation. The transport rejects a message above the receive limit before
+// Check runs, which the gateway's failure mode must turn into a denial.
 func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
 	var resp *authv3.CheckResponse
 	var err error
@@ -198,7 +203,7 @@ func (s *Server) Register(reg grpc.ServiceRegistrar) {
 // health service to NOT_SERVING and drains in-flight checks for at most the
 // drain timeout. It returns nil after a clean shutdown.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
-	opts := []grpc.ServerOption{grpc.MaxRecvMsgSize(s.maxRecv)}
+	opts := []grpc.ServerOption{grpc.MaxRecvMsgSize(s.maxRecv), grpc.MaxConcurrentStreams(maxConcurrentStreams)}
 	if s.tls != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(s.tls)))
 	}

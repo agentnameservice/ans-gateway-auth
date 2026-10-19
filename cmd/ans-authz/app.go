@@ -98,28 +98,36 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 	if err != nil {
 		return nil, err
 	}
-
-	verifier, err := authz.NewVerifier(cfg.Config, keyring, a.cache, a.metrics, logger)
-	if err != nil {
+	if err := a.buildServer(logger); err != nil {
+		_ = a.cache.Close()
 		return nil, err
 	}
-	if err := a.metrics.RegisterStatus(keyring, a.cache); err != nil {
-		return nil, fmt.Errorf("register status metrics: %w", err)
-	}
+	return a, nil
+}
 
+// buildServer wires the verifier and the ext_authz server over the loaded
+// keys and replay cache.
+func (a *app) buildServer(logger *slog.Logger) error {
+	verifier, err := authz.NewVerifier(a.cfg.Config, a.keyring, a.cache, a.metrics, logger)
+	if err != nil {
+		return err
+	}
+	if err := a.metrics.RegisterStatus(a.keyring, a.cache); err != nil {
+		return fmt.Errorf("register status metrics: %w", err)
+	}
 	opts := []extauthz.Option{
 		extauthz.WithLogger(logger),
-		extauthz.WithMaxContentBytes(cfg.MaxContentBytes),
+		extauthz.WithMaxContentBytes(a.cfg.MaxContentBytes),
 	}
-	tlsCfg, err := serverTLS(cfg)
+	tlsCfg, err := serverTLS(a.cfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if tlsCfg != nil {
 		opts = append(opts, extauthz.WithTLS(tlsCfg))
 	}
 	a.server = extauthz.NewServer(verifier, opts...)
-	return a, nil
+	return nil
 }
 
 // serverTLS loads the gRPC listener's TLS material up front, so unusable
@@ -159,9 +167,6 @@ func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*keyStor
 		}
 	} else if err := store.DoRefresh(ctx); err != nil {
 		logger.WarnContext(ctx, "initial root-key fetch failed, continuing with pinned keys", "error", err)
-	}
-	if store.IsEmpty() {
-		return nil, false, fmt.Errorf("transparency log %q: %s serves no root keys", tl.Name, tl.BaseURL)
 	}
 	return store, true, nil
 }

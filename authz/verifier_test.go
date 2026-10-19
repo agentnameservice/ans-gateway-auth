@@ -99,11 +99,6 @@ func allowCases() []decisionCase {
 		{name: "query is not part of htu", request: func(t *testing.T, f *fixture) *Request {
 			return f.signed(t, http.MethodGet, fixtureTarget+"?x=1&y=2", nil, nil)
 		}, wantAllow: true},
-		{name: "request scheme is ignored", request: func(t *testing.T, f *fixture) *Request {
-			r := signedGet(t, f)
-			r.Scheme = "http"
-			return r
-		}, wantAllow: true},
 		{name: "default port is normalized", request: func(t *testing.T, f *fixture) *Request {
 			r := signedGet(t, f)
 			r.Authority = "api.example:443"
@@ -311,7 +306,7 @@ func policyDenyCases() []decisionCase {
 	return []decisionCase{
 		{name: "caller not in allowed ans names",
 			cfg:     func(c *Config) { c.AllowedAnsNames = []string{"ans://v1.0.0.other.example"} },
-			request: signedGet, wantStatus: http.StatusUnauthorized, wantCategory: string(pop.ErrExpectedPeerMismatch)},
+			request: signedGet, wantStatus: http.StatusForbidden, wantCategory: string(pop.ErrExpectedPeerMismatch)},
 		{name: "required context missing", cfg: requireContext, request: signedGet,
 			wantStatus: http.StatusServiceUnavailable, wantCategory: CategoryMisconfigured},
 		{name: "required context wrong value", cfg: requireContext, request: func(t *testing.T, f *fixture) *Request {
@@ -381,6 +376,12 @@ func tokenDenyCases() []decisionCase {
 			request: func(t *testing.T, f *fixture) *Request {
 				return f.signed(t, http.MethodGet, fixtureTarget, nil, func(r *http.Request) {
 					r.Header.Set("Authorization", "Bearer "+jwsToken(t, cnfClaims("someone-else")))
+				})
+			}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
+		{name: "Bearer JWS token separated by a tab", cfg: func(c *Config) { c.RequireTokenClaims = false },
+			request: func(t *testing.T, f *fixture) *Request {
+				return f.signed(t, http.MethodGet, fixtureTarget, nil, func(r *http.Request) {
+					r.Header.Set("Authorization", "Bearer\t"+jwsToken(t, cnfClaims("someone-else")))
 				})
 			}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
 		{name: "Bearer JWS token bound to the proof key is still a scheme violation", request: func(t *testing.T, f *fixture) *Request {
@@ -501,12 +502,12 @@ func TestNewVerifierErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		cfg     Config
-		keys    *Keyring
+		keys    KeyProvider
 		cache   replay.Cache
 		wantErr string
 	}{
 		{name: "invalid config", cfg: noHosts, keys: keys, cache: cache, wantErr: "trustedHosts"},
-		{name: "nil keyring", cfg: testConfig(), cache: cache, wantErr: "keyring"},
+		{name: "nil key provider", cfg: testConfig(), cache: cache, wantErr: "key provider"},
 		{name: "nil cache", cfg: testConfig(), keys: keys, wantErr: "replay cache"},
 	}
 	for _, tc := range tests {
@@ -517,6 +518,42 @@ func TestNewVerifierErrors(t *testing.T) {
 				t.Fatalf("NewVerifier() = %v, %v; want error containing %q", v, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// appearingKeys hides every kid until RefreshFor is called, and RefreshFor
+// itself reports no refresh: the shape of another caller's refresh landing
+// between this request's first lookup and its own refresh attempt.
+type appearingKeys struct {
+	inner  KeyProvider
+	hidden atomic.Bool
+}
+
+func (k *appearingKeys) Get(kid [4]byte) (*scitt.TrustedKey, error) {
+	if k.hidden.Load() {
+		return nil, &scitt.SignatureError{Type: scitt.SigErrUnknownKeyID, Kid: kid}
+	}
+	return k.inner.Get(kid)
+}
+
+func (k *appearingKeys) RefreshFor(context.Context) bool {
+	k.hidden.Store(false)
+	return false
+}
+
+func TestVerifyRetriesWhenKeyAppearedWithoutRefresh(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	keys := &appearingKeys{inner: f.keyring(t)}
+	keys.hidden.Store(true)
+	cache := replay.NewMemory(t.Context(), 10, nil)
+	t.Cleanup(func() { _ = cache.Close() })
+	v, err := NewVerifier(testConfig(), keys, cache, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := v.Verify(t.Context(), signedGet(t, f)); !d.Allowed {
+		t.Fatalf("Verify denied %+v; the key was present at the retry", d.Deny)
 	}
 }
 
@@ -644,7 +681,7 @@ func TestVerifyReplayBackendOutcomes(t *testing.T) {
 			return false, &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "down", Cause: replay.ErrUnavailable}
 		}, want: Denial{HTTPStatus: http.StatusServiceUnavailable, Category: CategoryReplayCacheUnavailable, RetryAfter: time.Second}},
 		{name: "keyspace reset", check: func(context.Context) (bool, error) {
-			return false, &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "reset", Cause: replay.ErrKeyspaceReset}
+			return false, &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "reset", Cause: &replay.KeyspaceResetError{}}
 		}, want: Denial{HTTPStatus: http.StatusServiceUnavailable, Category: CategoryReplayCacheUnavailable, RetryAfter: time.Second}},
 		{name: "full", check: func(context.Context) (bool, error) {
 			return false, &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: "full", Cause: replay.ErrFull}

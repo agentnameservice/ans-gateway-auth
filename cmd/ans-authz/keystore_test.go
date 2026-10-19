@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -106,6 +107,8 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 		{name: "first fetch adds a", serve: []string{a.line}, wantKeys: []testKey{pinned, a}},
 		{name: "log rotates to b and withdraws a", serve: []string{b.line}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}},
 		{name: "fetch failure keeps the previous snapshot", serve: nil, err: errors.New("503"), wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
+		{name: "unparseable payload keeps the previous snapshot", serve: []string{"<html>", "503 Service Unavailable"}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
+		{name: "empty payload keeps the previous snapshot", serve: []string{}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
 		{name: "log serves the pinned key only", serve: []string{pinned.line}, wantKeys: []testKey{pinned}, wantGone: []testKey{a, b}},
 	}
 	var lastRefreshed = s.LastRefreshed()
@@ -142,7 +145,14 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 	if log.calls != len(steps) {
 		t.Fatalf("fetches = %d, want %d", log.calls, len(steps))
 	}
-	if !strings.Contains(rec.String(), "root keys refreshed") {
-		t.Fatalf("key-set changes must be logged: %s", rec.String())
+	logs := rec.String()
+	if !strings.Contains(logs, "root keys refreshed") {
+		t.Fatalf("key-set changes must be logged: %s", logs)
+	}
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, fmt.Sprintf("a/%x", a.kid)) {
+		t.Fatalf("withdrawing a key must be logged at WARN naming the key: %s", logs)
+	}
+	if !strings.Contains(logs, fmt.Sprintf("b/%x", b.kid)) {
+		t.Fatalf("adding a key must be logged naming the key: %s", logs)
 	}
 }

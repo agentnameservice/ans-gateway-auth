@@ -33,7 +33,10 @@ const (
 	resetGrace = 5 * time.Second
 	// sentinelKey holds "<created_unix_ms>:<random>"; its absence proves the
 	// keyspace was lost.
-	sentinelKey         = "ans-authz:epoch"
+	sentinelKey = "ans-authz:epoch"
+	// jtiKeyPrefix namespaces the proof identifiers next to the sentinel, so a
+	// store ACL can be limited to ~ans-authz:* .
+	jtiKeyPrefix        = "ans-authz:jti:"
 	sentinelRandomBytes = 8
 	noEvictionPolicy    = "noeviction"
 	opCheckAndStore     = "check_and_store"
@@ -158,8 +161,9 @@ type Redis struct {
 }
 
 // NewRedis connects to the store, enforces its guard rails (maxmemory set,
-// maxmemory-policy noeviction), establishes the keyspace sentinel and starts
-// the INFO sampler. A fresh or flushed store opens the fail-closed window.
+// maxmemory-policy noeviction, appendonly on), establishes the keyspace
+// sentinel and starts the INFO sampler. A fresh or flushed store opens the
+// fail-closed window.
 func NewRedis(ctx context.Context, cfg RedisConfig, obs Observer, opts ...RedisOption) (*Redis, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -173,7 +177,7 @@ func NewRedis(ctx context.Context, cfg RedisConfig, obs Observer, opts ...RedisO
 		now:         time.Now,
 		window:      2*cfg.PoPSkew + resetGrace,
 		sampleEvery: RedisSampleInterval,
-		stats:       Stats{Backend: "redis"},
+		stats:       Stats{Backend: BackendRedis},
 		lastLog:     make(map[string]time.Time),
 	}
 	for _, opt := range opts {
@@ -211,8 +215,9 @@ func (r *Redis) start(ctx context.Context) error {
 	return nil
 }
 
-// checkGuards rejects a store that cannot refuse writes (maxmemory 0) or that
-// would evict replay records silently (any policy but noeviction).
+// checkGuards rejects a store that cannot refuse writes (maxmemory 0), that
+// would evict replay records silently (any policy but noeviction) or that
+// would lose them at a restart (appendonly off).
 func (r *Redis) checkGuards() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -221,6 +226,23 @@ func (r *Redis) checkGuards() error {
 	}
 	if r.stats.EvictionPolicy != noEvictionPolicy {
 		return fmt.Errorf("replay: redis: maxmemory-policy is %q; replay protection requires noeviction", r.stats.EvictionPolicy)
+	}
+	if !r.stats.AOFEnabled {
+		return errors.New("replay: redis: appendonly is off; replay records would not survive a restart")
+	}
+	return nil
+}
+
+// driftError reports a guard rail that held at startup and has since been
+// changed on the store.
+func (r *Redis) driftError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stats.EvictionPolicy != noEvictionPolicy {
+		return fmt.Errorf("maxmemory-policy drifted to %q", r.stats.EvictionPolicy)
+	}
+	if !r.stats.AOFEnabled {
+		return errors.New("appendonly drifted to off")
 	}
 	return nil
 }
@@ -237,14 +259,14 @@ func (r *Redis) CheckAndStore(ctx context.Context, key string, exp time.Time) (b
 }
 
 func (r *Redis) checkAndStore(ctx context.Context, key string, exp time.Time, now time.Time) (bool, error) {
-	if policy := r.currentPolicy(); policy != noEvictionPolicy {
-		return false, r.failure(ErrUnavailable, fmt.Errorf("maxmemory-policy drifted to %q", policy))
+	if err := r.driftError(); err != nil {
+		return false, r.failure(ErrUnavailable, err)
 	}
 	ttl := max(exp.Sub(now), minTTL)
 	var setCmd *redis.BoolCmd
 	var getCmd *redis.StringCmd
 	_, _ = r.client.Pipelined(ctx, func(p redis.Pipeliner) error {
-		setCmd = p.SetNX(ctx, key, 1, ttl)
+		setCmd = p.SetNX(ctx, jtiKeyPrefix+key, 1, ttl)
 		getCmd = p.Get(ctx, sentinelKey)
 		return nil
 	})
@@ -257,19 +279,27 @@ func (r *Redis) checkAndStore(ctx context.Context, key string, exp time.Time, no
 	sentinel, err := getCmd.Result()
 	switch {
 	case errors.Is(err, redis.Nil):
-		return false, r.keyspaceLost(ctx, now)
+		return false, r.keyspaceLost(ctx)
 	case err != nil:
 		return false, r.failure(ErrUnavailable, err)
 	}
-	if until, open := r.windowFor(sentinel, now); open {
+	window, ok := r.windowFor(sentinel, now)
+	switch {
+	case !ok:
+		until, err := r.sentinelUnreadable(ctx)
+		if err != nil {
+			return false, r.failure(ErrUnavailable, err)
+		}
 		return false, r.failClosed(until)
+	case window.open:
+		return false, r.failClosed(window.until)
 	}
 	return !setCmd.Val(), nil
 }
 
 // keyspaceLost records the loss, re-creates the sentinel and fails closed for
 // the window that the new sentinel defines.
-func (r *Redis) keyspaceLost(ctx context.Context, now time.Time) error {
+func (r *Redis) keyspaceLost(ctx context.Context) error {
 	r.mu.Lock()
 	r.stats.KeyspaceResets++
 	r.mu.Unlock()
@@ -279,12 +309,12 @@ func (r *Redis) keyspaceLost(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return r.failure(ErrUnavailable, err)
 	}
-	_ = now
 	return r.failClosed(until)
 }
 
 // ensureSentinel writes a fresh sentinel if none exists and returns the end of
-// the fail-closed window implied by the sentinel that is now in place.
+// the fail-closed window implied by the sentinel that is now in place. A
+// sentinel this version cannot read is replaced.
 func (r *Redis) ensureSentinel(ctx context.Context) (time.Time, error) {
 	now := r.now()
 	value, err := newSentinelValue(now)
@@ -301,35 +331,67 @@ func (r *Redis) ensureSentinel(ctx context.Context) (time.Time, error) {
 			return time.Time{}, fmt.Errorf("read sentinel: %w", err)
 		}
 	}
-	until, _ := r.windowFor(current, now)
+	window, ok := r.windowFor(current, now)
+	if !ok {
+		return r.sentinelUnreadable(ctx)
+	}
+	return r.recordWindow(window.until), nil
+}
+
+// sentinelUnreadable replaces a sentinel in another format, or one stamped
+// more than a window ahead of this clock, with a fresh value and opens one
+// window from now, so the store heals instead of failing closed for good.
+func (r *Redis) sentinelUnreadable(ctx context.Context) (time.Time, error) {
+	r.logLimited(ctx, "replay store sentinel is unreadable; replacing it and failing closed for the replay window",
+		slog.Duration("window", r.window))
+	now := r.now()
+	value, err := newSentinelValue(now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := r.client.Set(ctx, sentinelKey, value, 0).Err(); err != nil {
+		return time.Time{}, fmt.Errorf("replace sentinel: %w", err)
+	}
+	return r.recordWindow(now.Add(r.window)), nil
+}
+
+// sentinelWindow is a readable sentinel's fail-closed window.
+type sentinelWindow struct {
+	until time.Time
+	open  bool
+}
+
+// windowFor interprets a sentinel. The second result is false for a value in
+// another format or created more than one window ahead of now.
+func (r *Redis) windowFor(sentinel string, now time.Time) (sentinelWindow, bool) {
+	ms, _, ok := strings.Cut(sentinel, ":")
+	if !ok {
+		return sentinelWindow{}, false
+	}
+	n, err := strconv.ParseInt(ms, 10, 64)
+	if err != nil {
+		return sentinelWindow{}, false
+	}
+	created := time.UnixMilli(n)
+	if created.After(now.Add(r.window)) {
+		return sentinelWindow{}, false
+	}
+	until := created.Add(r.window)
+	return sentinelWindow{until: until, open: now.Before(until)}, true
+}
+
+// recordWindow publishes the latest window end in Stats and returns it.
+func (r *Redis) recordWindow(until time.Time) time.Time {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if until.After(r.stats.KeyspaceResetUntil) {
 		r.stats.KeyspaceResetUntil = until
 	}
-	r.mu.Unlock()
-	return until, nil
-}
-
-// windowFor reports whether the sentinel's creation time is still inside the
-// fail-closed window, and when that window ends. An unparseable sentinel is
-// treated as created now, so a corrupted value also fails closed.
-func (r *Redis) windowFor(sentinel string, now time.Time) (time.Time, bool) {
-	created := now
-	if ms, _, ok := strings.Cut(sentinel, ":"); ok {
-		if n, err := strconv.ParseInt(ms, 10, 64); err == nil {
-			created = time.UnixMilli(n)
-		}
-	}
-	until := created.Add(r.window)
-	return until, now.Before(until)
+	return until
 }
 
 func (r *Redis) failClosed(until time.Time) error {
-	r.mu.Lock()
-	if until.After(r.stats.KeyspaceResetUntil) {
-		r.stats.KeyspaceResetUntil = until
-	}
-	r.mu.Unlock()
+	r.recordWindow(until)
 	return &pop.ProofError{
 		Type:    pop.ErrReplayCacheFull,
 		Message: "replay cache keyspace reset",
@@ -339,12 +401,15 @@ func (r *Redis) failClosed(until time.Time) error {
 
 // failure wraps a backend fault as the SDK error the verifier maps, with kind
 // (ErrFull or ErrUnavailable) and the backend's own error both reachable
-// through errors.Is and errors.As.
+// through errors.Is and errors.As. Capacity and the caller's own cancellation
+// are not backend failures and are not logged.
 func (r *Redis) failure(kind, err error) error {
 	message := "replay cache unavailable"
-	if errors.Is(kind, ErrFull) {
+	switch {
+	case errors.Is(kind, ErrFull):
 		message = "replay cache full"
-	} else {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	default:
 		r.logLimited(context.Background(), "replay store call failed", slog.String("error", err.Error()))
 	}
 	return &pop.ProofError{Type: pop.ErrReplayCacheFull, Message: message, Cause: fmt.Errorf("%w: %w", kind, err)}
@@ -356,12 +421,6 @@ func newSentinelValue(now time.Time) (string, error) {
 		return "", fmt.Errorf("sentinel randomness: %w", err)
 	}
 	return strconv.FormatInt(now.UnixMilli(), 10) + ":" + hex.EncodeToString(random), nil
-}
-
-func (r *Redis) currentPolicy() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.stats.EvictionPolicy
 }
 
 // sample refreshes Stats until the backend is closed.
@@ -426,11 +485,16 @@ func infoInt(fields map[string]string, key string) int64 {
 	return n
 }
 
-// Stats implements Cache.
+// Stats implements Cache. A fail-closed window that has elapsed is reported
+// as closed.
 func (r *Redis) Stats() Stats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stats
+	st := r.stats
+	if !st.KeyspaceResetUntil.IsZero() && !r.now().Before(st.KeyspaceResetUntil) {
+		st.KeyspaceResetUntil = time.Time{}
+	}
+	return st
 }
 
 // Close stops the sampler and closes the client.
