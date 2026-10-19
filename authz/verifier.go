@@ -86,6 +86,10 @@ type Request struct {
 	Context     map[string]string
 	TokenClaims map[string]any
 	RequestID   string
+	// RequestIDFromClient marks a RequestID taken from a client-supplied
+	// header because the gateway sent none; logs label it so it is never
+	// mistaken for a gateway-minted correlation id.
+	RequestIDFromClient bool
 }
 
 // Denial describes a rejected request by a stable category. Detail is the
@@ -316,16 +320,22 @@ func (v *Verifier) authenticate(ctx context.Context, r *Request, hdrs *scitt.Hea
 }
 
 // completeTokenBinding finishes RFC 9449 section 7 token binding: a DPoP-bound
-// token's cnf.jkt must name the proof key, and a token carrying cnf must not
-// arrive under another scheme. When the presented token is itself a JWS, its
-// own cnf.jkt is compared too (unverified, so a match grants nothing on its
-// own, but a mismatch is a certain rejection), which closes the stolen-token
-// path on routes where no gateway validates the token.
+// token's cnf.jkt must name the proof key, and a token carrying cnf.jkt must
+// not arrive under another scheme (section 7.2). When the presented token is
+// itself a JWS, its own cnf.jkt is read too (unverified, so a match grants
+// nothing on its own, but a mismatch is a certain rejection). Opaque tokens
+// can only be checked through gateway-forwarded claims, which is what
+// RequireTokenClaims demands.
 func (v *Verifier) completeTokenBinding(ctx context.Context, r *Request, id *pop.CallerIdentity,
 	tok string, tokenPresented bool, authority string) *Denial {
 	if !tokenPresented {
 		if r.TokenClaims[claimConfirmation] != nil {
 			return deny(http.StatusUnauthorized, CategoryTokenBindingMismatch)
+		}
+		if _, other, found := strings.Cut(r.Header.Get(headerAuthorization), " "); found {
+			if jkt, ok := tokenThumbprint(strings.TrimSpace(other)); ok && jkt != "" {
+				return deny(http.StatusUnauthorized, CategoryTokenBindingMismatch)
+			}
 		}
 		return nil
 	}
@@ -488,13 +498,14 @@ func checkHeaderMultiplicity(h http.Header) *Denial {
 }
 
 // tokenThumbprint reads cnf.jkt from an access token that is a JWS compact
-// serialization, without verifying it. ok is false for opaque tokens.
+// serialization, without verifying it. ok is false for opaque tokens. Padding
+// is tolerated so a re-encoded payload cannot dodge the check.
 func tokenThumbprint(tok string) (string, bool) {
 	parts := strings.Split(tok, ".")
 	if len(parts) != jwsSegments {
 		return "", false
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
 	if err != nil {
 		return "", false
 	}

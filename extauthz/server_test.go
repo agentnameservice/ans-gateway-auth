@@ -440,7 +440,7 @@ func TestServerLogsDecisions(t *testing.T) {
 	}
 	record := rec.last()
 	if record["msg"] != "decision" || record["result"] != "allow" || record["ans_name"] != fixtureAnsName || record["path"] != "/echo" ||
-		record["level"] != slog.LevelInfo.String() || record["status"] != int64(200) || record["reason"] != "" {
+		record["level"] != slog.LevelInfo.String() || record["status"] != int64(200) || record["reason"] != "" || record["request_id_source"] != "none" {
 		t.Fatalf("decision log = %v", record)
 	}
 	if _, err := s.Check(context.Background(), checkRequestFrom(httptest.NewRequest(http.MethodGet, fixtureBaseURL+"/echo", nil), nil)); err != nil {
@@ -484,7 +484,7 @@ func TestServerLogsServerFaultsAtWarn(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := rec.last()
-	if record["level"] != slog.LevelWarn.String() || record["status"] != int64(503) || record["reason"] != "dial tcp: refused" {
+	if record["level"] != slog.LevelWarn.String() || record["status"] != int64(503) || record["reason"] != "dial tcp: refused" || record["request_id_source"] != "gateway" {
 		t.Fatalf("5xx decision log = %v", record)
 	}
 	for _, field := range []string{"request_id", "authority"} {

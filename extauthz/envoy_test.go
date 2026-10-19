@@ -87,8 +87,8 @@ func TestFromCheckRequestMapping(t *testing.T) {
 				if string(r.Body) != `{"a":1}` || r.Partial {
 					t.Fatalf("body = %q partial = %v", r.Body, r.Partial)
 				}
-				if r.RequestID != "req-1" {
-					t.Fatalf("RequestID = %q", r.RequestID)
+				if r.RequestID != "req-1" || !r.RequestIDFromClient {
+					t.Fatalf("RequestID = %q fromClient=%v", r.RequestID, r.RequestIDFromClient)
 				}
 				if r.TokenClaims != nil || r.Context != nil {
 					t.Fatalf("claims = %v context = %v, want nil", r.TokenClaims, r.Context)
@@ -264,8 +264,8 @@ func TestFromCheckRequestMetadata(t *testing.T) {
 			name:   "gateway request id wins over the client header",
 			mutate: func(hr *authv3.AttributeContext_HttpRequest) { hr.Id = "attr-id" },
 			check: func(t *testing.T, r *authz.Request) {
-				if r.RequestID != "attr-id" {
-					t.Fatalf("RequestID = %q", r.RequestID)
+				if r.RequestID != "attr-id" || r.RequestIDFromClient {
+					t.Fatalf("RequestID = %q fromClient=%v", r.RequestID, r.RequestIDFromClient)
 				}
 			},
 		},
@@ -276,8 +276,19 @@ func TestFromCheckRequestMetadata(t *testing.T) {
 				hr.GetHeaders()["traceparent"] = "00-trace-span-01"
 			},
 			check: func(t *testing.T, r *authz.Request) {
-				if r.RequestID != "00-trace-span-01" {
-					t.Fatalf("RequestID = %q", r.RequestID)
+				if r.RequestID != "00-trace-span-01" || !r.RequestIDFromClient {
+					t.Fatalf("RequestID = %q fromClient=%v", r.RequestID, r.RequestIDFromClient)
+				}
+			},
+		},
+		{
+			name: "no request id at all",
+			mutate: func(hr *authv3.AttributeContext_HttpRequest) {
+				delete(hr.GetHeaders(), "x-request-id")
+			},
+			check: func(t *testing.T, r *authz.Request) {
+				if r.RequestID != "" || r.RequestIDFromClient {
+					t.Fatalf("RequestID = %q fromClient=%v", r.RequestID, r.RequestIDFromClient)
 				}
 			},
 		},

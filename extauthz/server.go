@@ -160,8 +160,16 @@ func (s *Server) logDecision(ctx context.Context, r *authz.Request, d authz.Deci
 		}
 	}
 	path, _, _ := strings.Cut(r.Path, "?")
+	idSource := "gateway"
+	switch {
+	case r.RequestID == "":
+		idSource = "none"
+	case r.RequestIDFromClient:
+		idSource = "client"
+	}
 	s.logger.LogAttrs(ctx, level, "decision",
 		slog.String("request_id", truncate(r.RequestID)),
+		slog.String("request_id_source", idSource),
 		slog.String("method", truncate(r.Method)),
 		slog.String("authority", truncate(r.Authority)),
 		slog.String("path", truncate(path)),

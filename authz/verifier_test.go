@@ -48,6 +48,15 @@ func jwsToken(t *testing.T, claims map[string]any) string {
 		base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString([]byte("sig"))
 }
 
+func mustRawURLDecode(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func cnfClaims(jkt string) map[string]any {
 	return map[string]any{"cnf": map[string]any{"jkt": jkt}}
 }
@@ -138,6 +147,11 @@ func allowCases() []decisionCase {
 			r := f.signed(t, http.MethodGet, fixtureTarget, nil, withBearerToken)
 			r.TokenClaims = map[string]any{"sub": "x"}
 			return r
+		}, wantAllow: true},
+		{name: "Bearer JWS token without cnf is not sender-constrained", request: func(t *testing.T, f *fixture) *Request {
+			return f.signed(t, http.MethodGet, fixtureTarget, nil, func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+jwsToken(t, map[string]any{"sub": "x"}))
+			})
 		}, wantAllow: true},
 		{name: "receipt optional", cfg: func(c *Config) { c.RequireReceipt = false },
 			request: func(t *testing.T, f *fixture) *Request {
@@ -356,6 +370,24 @@ func tokenDenyCases() []decisionCase {
 			request: func(t *testing.T, f *fixture) *Request {
 				return f.signed(t, http.MethodGet, fixtureTarget, nil, withDPoPToken(jwsToken(t, cnfClaims("someone-else"))))
 			}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
+		{name: "padded JWS token bound to another key without forwarded claims", cfg: func(c *Config) { c.RequireTokenClaims = false },
+			request: func(t *testing.T, f *fixture) *Request {
+				tok := jwsToken(t, cnfClaims("someone-else"))
+				parts := strings.Split(tok, ".")
+				parts[1] = base64.URLEncoding.EncodeToString(mustRawURLDecode(t, parts[1]))
+				return f.signed(t, http.MethodGet, fixtureTarget, nil, withDPoPToken(strings.Join(parts, ".")))
+			}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
+		{name: "Bearer JWS token carrying cnf.jkt without forwarded claims", cfg: func(c *Config) { c.RequireTokenClaims = false },
+			request: func(t *testing.T, f *fixture) *Request {
+				return f.signed(t, http.MethodGet, fixtureTarget, nil, func(r *http.Request) {
+					r.Header.Set("Authorization", "Bearer "+jwsToken(t, cnfClaims("someone-else")))
+				})
+			}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
+		{name: "Bearer JWS token bound to the proof key is still a scheme violation", request: func(t *testing.T, f *fixture) *Request {
+			return f.signed(t, http.MethodGet, fixtureTarget, nil, func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+jwsToken(t, cnfClaims(f.signer.JKT())))
+			})
+		}, wantStatus: http.StatusUnauthorized, wantCategory: CategoryTokenBindingMismatch},
 		{name: "JWS token bound to another key despite matching forwarded claims", request: func(t *testing.T, f *fixture) *Request {
 			r := f.signed(t, http.MethodGet, fixtureTarget, nil, withDPoPToken(jwsToken(t, cnfClaims("someone-else"))))
 			r.TokenClaims = cnfClaims(f.signer.JKT())

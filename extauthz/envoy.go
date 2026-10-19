@@ -72,17 +72,19 @@ func FromCheckRequest(req *authv3.CheckRequest) (*authz.Request, error) {
 		body = []byte(hr.GetBody())
 	}
 
+	id, fromClient := requestID(hr, header)
 	return &authz.Request{
-		Method:      hr.GetMethod(),
-		Scheme:      strings.ToLower(hr.GetScheme()),
-		Authority:   authority,
-		Path:        hr.GetPath(),
-		Header:      header,
-		Body:        body,
-		Partial:     partial,
-		Context:     attrs.GetContextExtensions(),
-		TokenClaims: tokenClaims(attrs.GetMetadataContext()),
-		RequestID:   requestID(hr, header),
+		Method:              hr.GetMethod(),
+		Scheme:              strings.ToLower(hr.GetScheme()),
+		Authority:           authority,
+		Path:                hr.GetPath(),
+		Header:              header,
+		Body:                body,
+		Partial:             partial,
+		Context:             attrs.GetContextExtensions(),
+		TokenClaims:         tokenClaims(attrs.GetMetadataContext()),
+		RequestID:           id,
+		RequestIDFromClient: fromClient,
 	}, nil
 }
 
@@ -137,15 +139,18 @@ func tokenClaims(md *corev3.Metadata) map[string]any {
 }
 
 // requestID prefers the gateway's own request id; the client-supplied headers
-// are fallbacks for gateways that send none.
-func requestID(hr *authv3.AttributeContext_HttpRequest, header http.Header) string {
+// are fallbacks for gateways that send none, reported as such.
+func requestID(hr *authv3.AttributeContext_HttpRequest, header http.Header) (string, bool) {
 	if id := hr.GetId(); id != "" {
-		return id
+		return id, false
 	}
 	if id := header.Get(requestIDHeader); id != "" {
-		return id
+		return id, true
 	}
-	return header.Get(traceparentHeader)
+	if id := header.Get(traceparentHeader); id != "" {
+		return id, true
+	}
+	return "", false
 }
 
 // ToCheckResponse maps a decision to the Envoy response. Allowed decisions
