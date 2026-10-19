@@ -16,6 +16,6 @@ COPY --from=build /out/ans-authz /ans-authz
 # so probes and scrapes reach it.
 ENV ANS_AUTHZ_HTTP_LISTEN=:9192
 EXPOSE 9191 9192
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/ans-authz"]
 CMD ["--config", "/etc/ans-authz/config.yaml"]

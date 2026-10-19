@@ -23,6 +23,9 @@ import (
 
 const (
 	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 10 * time.Second
+	httpWriteTimeout      = 10 * time.Second
+	httpIdleTimeout       = 60 * time.Second
 	httpShutdownTimeout   = 5 * time.Second
 	startupBackoffInitial = 250 * time.Millisecond
 	startupBackoffMax     = 2 * time.Second
@@ -132,15 +135,14 @@ func serverTLS(cfg config.Config) (*tls.Config, error) {
 // loadKeys builds the key store for one transparency log. Pinned keys load
 // immediately; a baseURL is fetched with retries until startupTimeout, and a
 // failed fetch is fatal only when no pinned key is available either.
-func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*scitt.RefreshableKeyStore, bool, error) {
+func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*keyStore, bool, error) {
 	pinned, err := scitt.NewKeyStore(tl.RootKeys)
 	if err != nil {
 		return nil, false, fmt.Errorf("transparency log %q: root keys: %w", tl.Name, err)
 	}
 	logger := a.logger.With("tl", tl.Name)
 	if tl.BaseURL == "" {
-		store := scitt.NewRefreshableKeyStore(pinned, nil, scitt.WithRefreshLogger(logger))
-		return store, false, nil
+		return newKeyStore(tl.Name, pinned, nil, logger), false, nil
 	}
 	clientOpts := []scitt.HTTPClientOption{scitt.WithTimeout(tl.Timeout)}
 	if tl.AllowInsecure {
@@ -150,7 +152,7 @@ func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*scitt.R
 	if err != nil {
 		return nil, false, fmt.Errorf("transparency log %q: client: %w", tl.Name, err)
 	}
-	store := scitt.NewRefreshableKeyStore(pinned, client, scitt.WithRefreshLogger(logger))
+	store := newKeyStore(tl.Name, pinned, client, logger)
 	if pinned.IsEmpty() {
 		if err := retryUntil(ctx, a.cfg.StartupTimeout, store.DoRefresh); err != nil {
 			return nil, false, fmt.Errorf("transparency log %q: no root keys after %s: %w", tl.Name, a.cfg.StartupTimeout, err)
@@ -257,7 +259,13 @@ func (a *app) Start(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.Handle("GET /metrics", a.metrics.Handler())
-	a.httpSrv = &http.Server{Handler: mux, ReadHeaderTimeout: httpReadHeaderTimeout}
+	a.httpSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 
 	a.grpcDone = make(chan error, 1)
 	a.httpDone = make(chan error, 1)

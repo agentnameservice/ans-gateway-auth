@@ -280,3 +280,12 @@ func containsFold(values []string, want string) bool {
 
 const fakeRedisInfo = "# Server\r\nrun_id:fake\r\n# Memory\r\nused_memory:10\r\nmaxmemory:4096\r\nmaxmemory_policy:noeviction\r\n" +
 	"# Persistence\r\naof_enabled:1\r\n# Stats\r\nevicted_keys:0\r\n"
+
+// recordingLog captures slog output for assertions.
+type recordingLog struct{ buf syncBuffer }
+
+func (r *recordingLog) logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(&r.buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+func (r *recordingLog) String() string { return r.buf.String() }
