@@ -6,8 +6,8 @@ RFC 9449 DPoP proof bound to a transparency-logged identity certificate, carried
 receipt and a status token. The identity layer itself (domain-anchored names, the transparency
 log) is the one draft-narajala-courtney-ansv2 describes.
 
-`ans-authz` is an Envoy ext_authz verifier built and tested for agentgateway, with Agent Router
-next. Any gateway that speaks the Envoy external authorization protocol can call it, but the
+`ans-authz` is an Envoy ext_authz verifier built and tested for agentgateway and Agent Router.
+Any gateway that speaks the Envoy external authorization protocol can call it, but the
 defaults (the 2 s ext_authz budget, body forwarding, header folding) are agentgateway's; stock
 Envoy's ext_authz timeout defaults to 200 ms and must be raised above `checkTimeout`, and the
 Envoy `header_map` and partial-body paths are covered by unit tests only. The verifier checks the
@@ -23,7 +23,8 @@ agent ──DPoP + X-SCITT-Receipt + X-ANS-Status-Token──▶ gateway ──e
                                                                 X-ANS-Fingerprint, X-ANS-JKT)
 ```
 
-Recipes: [agentgateway](examples/agentgateway/README.md).
+Recipes: [agentgateway](examples/agentgateway/README.md),
+[Agent Router](examples/agent-router/README.md).
 
 ## What the verifier checks
 
@@ -175,10 +176,13 @@ startup and samples every 15 s:
 - A dedicated instance: a logical database is not an isolation boundary against `FLUSHALL`,
   `CONFIG SET` or a co-tenant's memory. The ACL needs only `+set +get +info` (plus `+select` for
   a non-zero `db`), for example
-  `ACL SETUSER ans-authz on >password ~* +set +get +info -@all`.
+  `ACL SETUSER ans-authz on >password ~ans-authz:* +set +get +info -@all` (every key the
+  verifier writes carries the `ans-authz:` prefix).
 - `appendonly yes` with `appendfsync always` (or `everysec`, accepting one second of exposure):
-  a restart that loses the keyspace is a replay window. Never restore the store from a snapshot
-  without a `FLUSHALL` first.
+  a restart that loses recent records is a replay window, so the verifier refuses to start
+  against a store without AOF and fails closed if it is switched off later. Never restore the
+  store from a snapshot without a `FLUSHALL` first; a snapshot keeps the sentinel but not the
+  records written after it.
 
 Keyspace loss is detected in the request path: a sentinel key written at first start travels
 with every check, and when it disappears (flush, restart without persistence) every replica
@@ -206,11 +210,15 @@ read access to that secret.
   `maxContentBytes` together with the gateway's body cap.
 - No ext_authz decision cache: a DPoP proof is single-use.
 - Upstreams must be reachable only through the gateway; otherwise `X-ANS-*` can be forged.
-- Keep a per-source rate limit ahead of ext_authz (the agentgateway recipes ship a
-  `localRateLimit` keyed on the source address): a caller with any valid identity can otherwise
-  fill the replay cache with distinct proofs, and the cache then fails closed for every caller
-  until the entries expire. Size it for the legitimate per-client rate and keep the capacity
-  alerts below.
+- A gateway rate limit does not protect the verifier or the replay cache. In agentgateway v1.6.0
+  `localRateLimit` runs after `extAuthz` and `authorization`, and listener policies have no rate
+  limit at all, so every request is verified and its proof identifier recorded before the limit
+  is charged; the `localRateLimit` in the recipes bounds upstream load only. A caller with any
+  valid identity can therefore fill the replay cache with distinct proofs, and the cache then
+  fails closed for every caller (`REPLAY_CACHE_FULL`) until the entries expire. Keep the
+  capacity alerts below; the decision log carries the ANS name behind every allow, which
+  identifies a flooding caller. A per-identity quota inside the verifier, applied before the
+  record is written, is planned.
 - For DPoP-bound access tokens, validate the token at the gateway with the `DPoP` scheme and
   forward its claims to the verifier (see the OAuth recipe); the CEL rule
   `has(jwt.cnf) && jwt.cnf.jkt == extauthz.jkt` is the second layer. Do not accept `Bearer` and
@@ -235,7 +243,7 @@ Alerts worth having:
 
 | Condition | Meaning |
 |---|---|
-| `replay_cache_entries / replay_cache_capacity > 0.8` for 5m, or `decisions_total{category="REPLAY_CACHE_FULL"}` rising | replay cache capacity; raise `maxEntries` (about 100 bytes per entry, size for peak RPS times `popSkew` plus 5 s) |
+| `replay_cache_entries / replay_cache_capacity > 0.8` for 5m, or `decisions_total{category="REPLAY_CACHE_FULL"}` rising | replay cache capacity, or one caller flooding distinct proofs (a gateway rate limit does not stop this; the decision log names the caller); raise `maxEntries` (about 100 bytes per entry, size for peak RPS times `popSkew` plus 5 s) |
 | `decisions_total{category="REPLAY_CACHE_UNAVAILABLE"}` rising, `replay_backend_errors_total` rising, or `replay_backend_up == 0` | replay backend outage; requests are failing closed |
 | `key_refresh_total{result="failure"}` rising with a stale `root_keys_last_refresh_timestamp_seconds` | transparency-log key rotation trouble |
 | `check_timeouts_total > 0` | the verification budget is under pressure; check the replay backend and transparency-log latency |
@@ -274,7 +282,9 @@ make run-example     # echo upstream + ans-authz + agentgateway, HTTP recipe
 The end-to-end suite needs an ANS reference checkout (`ANS_E2E_ANS_REPO`, defaulting to a
 sibling `opensource-ans` directory) with its demo stack running (registration authority on 18080,
 transparency log on 18081), or `ANS_E2E_START_STACK=1` to start it. Missing prerequisites skip the
-suite; set `ANS_E2E_REQUIRED=1` in CI so a skip fails instead. See
+suite; `ANS_E2E_REQUIRED=1` turns a skip into a failure where a stack is available. CI runs the
+unit suites, lint, govulncheck and the recipe validation; both end-to-end suites are run by the
+maintainers before a release. See
 [tests/agentgateway](tests/agentgateway). `make run-example` builds the upstream and starts the
 HTTP recipe; `make run-example EXAMPLE=mcp` starts the MCP recipe with the `examples/mcpecho`
 upstream.

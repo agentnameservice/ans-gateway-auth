@@ -35,7 +35,7 @@ trap cleanup EXIT INT TERM
 wait_for() {
   local url="$1" name="$2"
   for _ in $(seq 1 120); do
-    if curl -fsS -o /dev/null "$url"; then
+    if curl -fs -o /dev/null "$url"; then
       echo "$name ready at $url"
       return 0
     fi

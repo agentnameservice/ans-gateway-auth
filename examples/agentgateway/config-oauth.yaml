@@ -13,10 +13,9 @@ binds:
     routes:
     - name: ans-oauth
       policies:
-        # Per-source rate limit ahead of the verifier. Any caller with a valid
-        # identity can otherwise fill the replay cache (which then fails closed
-        # for everyone) by sending distinct valid proofs; size this for your
-        # legitimate per-client rate (README, "Gateway-side rules").
+        # Bounds upstream load only. In agentgateway v1.6.0 this runs after
+        # extAuthz and authorization, so it protects neither the verifier nor
+        # the replay cache (README, "Gateway-side rules").
         localRateLimit:
         - maxTokens: 200
           tokensPerFill: 100

@@ -3,9 +3,11 @@
 package agentgateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -96,6 +98,14 @@ type signingTransport struct {
 
 func (st *signingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	c := req.Clone(req.Context())
+	if req.Body != nil && req.Body != http.NoBody {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		c.Body = io.NopCloser(bytes.NewReader(body))
+	}
 	if err := pop.AttachIdentity(c, st.s.sign, st.s.scitt); err != nil {
 		return nil, err
 	}

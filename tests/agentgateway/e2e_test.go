@@ -144,6 +144,7 @@ func TestAgentgatewayHTTP(t *testing.T) {
 		{"body over the verifier cap is rejected with 413", testVerifierBodyCap},
 		{"body over the gateway cap is rejected before the verifier", testGatewayBodyCap},
 		{"dpop-bound access token passes through on a route without jwtAuth", testTokenPassthrough},
+		// Keep last: it restarts the gateway inside its subtest, and that gateway dies with it.
 		{"route without the context sentinel is misconfigured", testMissingSentinel},
 	}
 	for _, sc := range scenarios {

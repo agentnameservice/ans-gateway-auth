@@ -310,11 +310,29 @@ func startEcho(t *testing.T) {
 	t.Cleanup(func() { _ = srv.Close() })
 }
 
+// syncBuffer collects a child's output while the test goroutine may read it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // proc is a subprocess under test with its output captured for diagnostics.
 type proc struct {
 	name     string
 	cmd      *exec.Cmd
-	out      bytes.Buffer
+	out      syncBuffer
 	stopOnce sync.Once
 }
 
