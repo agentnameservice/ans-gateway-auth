@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway v1.6.0 recipe: every request on port 8080 is authenticated by
+# the ans-authz verifier over Envoy ext_authz before it reaches the upstream.
+# Validate with: agentgateway --validate-only -f examples/agentgateway/config-http.yaml
+binds:
+- port: 8080
+  listeners:
+  - protocol: HTTP
+    routes:
+    - name: ans-protected
+      policies:
+        extAuthz:
+          # The verifier service. 127.0.0.1 is the loopback-sidecar topology;
+          # a shared service needs policies.backendTLS as well (see README).
+          host: 127.0.0.1:9191
+          # Never `allow`: a verifier outage must not admit traffic.
+          failureMode:
+            denyWithStatus: 503
+          # The proof binds the request body (ans_content_digest), so the body
+          # must reach the verifier. The default cap is 0 in v1.6.0, which would
+          # reject every request with a body; set it explicitly.
+          includeRequestBody:
+            maxRequestBytes: 1048576
+            allowPartialMessage: false
+            packAsBytes: true
+          # A sentinel the verifier requires, so a route that forgets body
+          # forwarding (and this block with it) fails loudly instead of silently
+          # weakening content binding.
+          protocol:
+            grpc:
+              context:
+                ans-authz: body-forwarded
+          # No `cache`: a DPoP proof is single-use and must never be replayed
+          # from a decision cache.
+        authorization:
+          rules:
+          # Deny unless the verifier attached an identity.
+          - require: 'has(extauthz.ans_name)'
+      backends:
+      - host: 127.0.0.1:8081

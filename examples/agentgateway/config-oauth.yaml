@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway v1.6.0 recipe: ANS identity composed with an OAuth 2.0 access
+# token (RFC 9449 section 7). The token travels as `Authorization: DPoP <token>`;
+# jwtAuth validates it and forwards its claims to the verifier, which completes
+# the cnf.jkt binding against the proof key. The CEL rule is the second layer.
+# Validate with: agentgateway --validate-only -f examples/agentgateway/config-oauth.yaml
+# Pair with examples/agentgateway/ans-authz-oauth.yaml.
+binds:
+- port: 8080
+  listeners:
+  - protocol: HTTP
+    routes:
+    - name: ans-oauth
+      policies:
+        jwtAuth:
+          issuer: https://as.example.com
+          audiences: [ans-authz-example]
+          jwks:
+            # Relative to the directory agentgateway runs from, not this file.
+            # The example key is RFC 7515 Appendix A.3's ES256 key: its private
+            # half is published in the RFC, so anyone can mint tokens for this
+            # demo. Replace it with your authorization server's JWKS.
+            file: ./examples/agentgateway/jwks.rfc7515-a3.example.json
+          # The bound token arrives under the DPoP scheme, not Bearer.
+          location:
+            header:
+              name: Authorization
+              prefix: "DPoP "
+          # Keep the header so the verifier can bind the proof to the token (ath).
+          preserveToken: true
+          # A token presented as Bearer is rejected here (RFC 9449 section 7.2).
+          mode: strict
+        extAuthz:
+          host: 127.0.0.1:9191
+          failureMode:
+            denyWithStatus: 503
+          includeRequestBody:
+            maxRequestBytes: 1048576
+            allowPartialMessage: false
+            packAsBytes: true
+          protocol:
+            grpc:
+              context:
+                ans-authz: body-forwarded
+              # Forward the validated claims so the verifier compares cnf.jkt.
+              metadata:
+                ans-authz: '{"jwt_payload": jwt}'
+        authorization:
+          rules:
+          - require: 'has(extauthz.ans_name)'
+          - require: 'has(jwt.cnf) && jwt.cnf.jkt == extauthz.jkt'
+      backends:
+      - host: 127.0.0.1:8081
