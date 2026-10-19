@@ -1,0 +1,48 @@
+# ans-authz configuration for the agentgateway recipes (local development).
+#
+# Trust: the transparency logs whose root keys verify receipts and status
+# tokens. Nothing is trusted by default; list yours. `baseURL` is the log's
+# origin (the verifier fetches `<baseURL>/root-keys`); `rootKeys` pins C2SP
+# verifier lines instead of, or in addition to, fetching.
+transparencyLogs:
+- name: local-tl
+  baseURL: http://localhost:18081
+  allowInsecure: true          # plain http is for local stacks only
+  # rootKeys:
+  # - ans-local-dev+01234567+AgI...
+
+# ANS-6 section 7.7: the authorities this verifier answers for, with the scheme
+# the proof's htu is compared against. The request's own scheme and Host are
+# never trusted.
+trustedHosts:
+- http://127.0.0.1:8080        # config-http.yaml
+- http://127.0.0.1:3000        # config-mcp.yaml
+# externalAuthority: https://gw.example.com   # behind a TLS terminator that rewrites the authority
+
+# Must match the `protocol.grpc.context` sentinel in the gateway recipe.
+requiredContext:
+  key: ans-authz
+  value: body-forwarded
+
+# config-oauth.yaml validates the DPoP-bound access token at the gateway and
+# forwards its claims; the verifier must receive them to complete cnf.jkt.
+# Pair with config-oauth.yaml.
+requireTokenClaims: true
+
+# Defaults, spelled out.
+maxContentBytes: 1048576
+requireReceipt: true
+popSkew: 120s
+stripIdentityHeaders: true
+checkTimeout: 1500ms           # below agentgateway's 2s ext_authz budget
+replay:
+  type: memory                 # per-process: single replica only (ANS-6 7.6)
+  maxEntries: 100000
+grpc:
+  listen: 127.0.0.1:9191
+httpListen: 127.0.0.1:9192
+logLevel: info
+keyRefreshInterval: 24h
+startupTimeout: 30s
+readiness:
+  requireReplayBackend: true
