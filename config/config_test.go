@@ -512,6 +512,11 @@ func TestConfigWarnings(t *testing.T) {
 			mutate: func(c *Config) { c.RequiredContext = nil },
 			want:   []string{"requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests"},
 		},
+		{
+			name: "token claims not required", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) { c.RequireTokenClaims = false },
+			want:   []string{"requireTokenClaims is false; an opaque DPoP-bound access token is forwarded without its cnf.jkt check, which the upstream must then enforce (RFC 9449 section 7.1)"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

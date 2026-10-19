@@ -65,6 +65,9 @@ func (c Config) Warnings() []string {
 	if c.RequiredContext == nil {
 		warnings = append(warnings, "requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests")
 	}
+	if !c.RequireTokenClaims {
+		warnings = append(warnings, "requireTokenClaims is false; an opaque DPoP-bound access token is forwarded without its cnf.jkt check, which the upstream must then enforce (RFC 9449 section 7.1)")
+	}
 	return warnings
 }
 
