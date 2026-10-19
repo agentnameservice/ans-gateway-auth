@@ -7,6 +7,16 @@
 mcp:
   port: 3000
   policies:
+    # Per-source rate limit ahead of the verifier. Any caller with a valid
+    # identity can otherwise fill the replay cache (which then fails closed
+    # for everyone) by sending distinct valid proofs; size this for your
+    # legitimate per-client rate (README, "Gateway-side rules").
+    localRateLimit:
+    - maxTokens: 200
+      tokensPerFill: 100
+      fillInterval: 1s
+      type: requests
+      key: source.address
     extAuthz:
       host: 127.0.0.1:9191
       failureMode:
@@ -34,7 +44,9 @@ mcp:
   - name: echo
     mcp:
       host: http://127.0.0.1:3001/mcp
-  # A stdio target works too but cannot see request headers.
+  # A stdio target works too but cannot see request headers. `npx -y` resolves
+  # and runs the package's unpinned dependency tree from the npm registry with
+  # the gateway's privileges at every start; prefer a locally installed server.
   # - name: everything
   #   stdio:
   #     cmd: npx

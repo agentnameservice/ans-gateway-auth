@@ -13,6 +13,16 @@ binds:
     routes:
     - name: ans-oauth
       policies:
+        # Per-source rate limit ahead of the verifier. Any caller with a valid
+        # identity can otherwise fill the replay cache (which then fails closed
+        # for everyone) by sending distinct valid proofs; size this for your
+        # legitimate per-client rate (README, "Gateway-side rules").
+        localRateLimit:
+        - maxTokens: 200
+          tokensPerFill: 100
+          fillInterval: 1s
+          type: requests
+          key: source.address
         jwtAuth:
           issuer: https://as.example.com
           audiences: [ans-authz-example]
