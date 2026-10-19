@@ -1,0 +1,65 @@
+# ANS agent authentication and identity-based tool authorization for an MCPRoute.
+#
+# The MCPRoute's own securityPolicy must carry extAuth: the policy Agent Router generates for
+# an MCPRoute overrides any policy attached to the Gateway, and the CEL rules below trust the
+# x-ans-agent-id header only because the verifier overwrites it on every allowed request.
+# Keep the contextExtensions sentinel here too; the verifier's requiredContext fails closed
+# without it. An MCPRoute that omits the whole extAuth block is served unauthenticated and
+# nothing can detect that, so review every MCPRoute's securityPolicy.
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: MCPRoute
+metadata:
+  name: mcp-ans
+  namespace: default
+spec:
+  parentRefs:
+    - name: envoy-ai-gateway   # your Gateway's name
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  securityPolicy:
+    extAuth:
+      grpc:
+        backendRefs:
+          - name: ans-authz
+            port: 9191
+        backendSettings:
+          circuitBreaker:
+            maxParallelRequests: 64
+      bodyToExtAuth:
+        maxRequestBytes: 1048576
+      contextExtensions:
+        - name: ans-authz
+          type: Value
+          value: body-forwarded
+      failOpen: false
+      timeout: 2s
+      statusOnError: 503
+    # First matching rule decides and nothing matching is denied; a CEL evaluation error denies
+    # the whole request, hence the `in` guard. Only the listed agent may call `sum`; every other
+    # tool is open to any verified agent.
+    authorization:
+      defaultAction: Deny
+      rules:
+        - target:
+            tools:
+              - backend: tools
+                tool: sum
+          cel: '"x-ans-agent-id" in request.headers && request.headers["x-ans-agent-id"] == "demo-agent-1"'
+          action: Allow
+        - target:
+            tools:
+              - backend: tools
+                tool: sum
+          action: Deny
+        - cel: '"x-ans-agent-id" in request.headers && request.headers["x-ans-agent-id"] != ""'
+          action: Allow
+  backendRefs:
+    - name: tools   # a Service running your MCP server
+      port: 1063
+      path: "/mcp"
+      # The MCP proxy forwards only listed headers to backends; this is how the verified
+      # identity reaches the tool server (see networkpolicy.yaml for who may reach it).
+      forwardHeaders:
+        - name: X-ANS-Name
+        - name: X-ANS-Agent-Id

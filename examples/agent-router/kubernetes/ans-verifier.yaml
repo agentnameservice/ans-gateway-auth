@@ -1,0 +1,148 @@
+# ANS verifier (ans-authz) for Agent Router on Kubernetes.
+#
+# One Deployment per externally visible authority. The replay cache is per process, so this
+# ships a single replica (ANS-6 section 7.6); see the commented HA variant at the end, which
+# needs the redis replay backend and a highly available Redis. Apply this file first and wait
+# for the pod to be Ready before attaching a SecurityPolicy: the gateway fails closed.
+#
+# Replace: the transparency log, the trustedHosts authority and the image digest. Config
+# changes take effect only after `kubectl rollout restart deployment/ans-authz`, which is a
+# short fail-closed window; a rotated dev root key therefore needs a restart too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ans-authz
+  namespace: default
+data:
+  # Same keys as examples/agent-router/ans-authz.yaml (a test keeps them in sync) with exactly
+  # these overrides: the transparency log and the cluster-facing authority in trustedHosts, both
+  # listeners on the pod address (the verifier defaults to loopback, which a pod cannot expose),
+  # and allowInsecureListen because the NetworkPolicy keeps the plaintext gRPC hop inside the
+  # cluster. Prefer grpc.tls when a certificate is available.
+  config.yaml: |
+    transparencyLogs:
+      - name: tl
+        baseURL: https://transparency.example.com
+    trustedHosts:
+      - https://gateway.example.com
+    maxContentBytes: 1048576
+    requireReceipt: true
+    stripIdentityHeaders: true
+    requireTokenClaims: false
+    requiredContext:
+      key: ans-authz
+      value: body-forwarded
+    extraIdentityHeaders:
+      x-ai-eg-mcp-subject: agent_id
+    grpc:
+      listen: 0.0.0.0:9191
+      allowInsecureListen: true
+    httpListen: 0.0.0.0:9192
+    replay:
+      type: memory
+      maxEntries: 100000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ans-authz
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ans-authz
+spec:
+  # Exactly one replica: two in-memory replay caches behind one Service would each accept a
+  # replayed proof once. Recreate keeps a rollout from running two at the same time, at the
+  # cost of a short fail-closed window (pod restart + readiness + endpoint propagation). Every
+  # node drain or preemption costs the same window; give the pod a high priorityClassName.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ans-authz
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ans-authz
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ans-authz
+          image: ghcr.io/agentnameservice/ans-authz@sha256:REPLACE_WITH_THE_RELEASE_DIGEST
+          args: ["--config", "/etc/ans-authz/config.yaml"]
+          ports:
+            - name: grpc
+              containerPort: 9191
+            - name: http
+              containerPort: 9192
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 3
+          # Memory is about 64Mi + 3 x maxContentBytes x maxParallelRequests: each in-flight
+          # check holds the wire buffer plus the decoded body. 1 MiB x 64 (the SecurityPolicies'
+          # circuit breaker) fits in 256Mi with headroom to the limit; raise both together.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ans-authz
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: ans-authz
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ans-authz
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ans-authz
+spec:
+  selector:
+    app.kubernetes.io/name: ans-authz
+  ports:
+    - name: grpc
+      port: 9191
+      targetPort: grpc
+      appProtocol: kubernetes.io/h2c
+    - name: http
+      port: 9192
+      targetPort: http
+# ---
+# HA variant (requires the verifier's redis replay backend and a Redis that is itself highly
+# available; a store outage is a fail-closed 503). Replace the ConfigMap's replay block with
+#     replay:
+#       type: redis
+#       redis:
+#         addr: redis.default.svc:6379
+#         passwordEnv: ANS_AUTHZ_REDIS_PASSWORD
+#         tls: true
+# then set replicas: 2 and strategy RollingUpdate {maxUnavailable: 0, maxSurge: 1}, add a
+# PodDisruptionBudget with minAvailable: 1, and keep the preStop sleep so endpoints drain.

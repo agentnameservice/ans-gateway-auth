@@ -1,0 +1,59 @@
+# Access logging that shows authentication outcomes.
+#
+# Agent Router's documented access-log formats only match requests that carry the headers its
+# processor sets after routing, and ext_authz rejects a request before that, so denials,
+# verifier errors and size rejections leave no trace without a sink of their own. Reference
+# this EnvoyProxy from your Gateway's spec.infrastructure.parametersRef, or merge the second
+# sink into the EnvoyProxy you already use.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: ans-accesslog
+  namespace: default
+spec:
+  telemetry:
+    accessLog:
+      settings:
+        - matches:
+            - "request.headers['x-ai-eg-model'] != '' && response.code < 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              gen_ai.request.model: "%REQ(X-AI-EG-MODEL)%"
+              gen_ai.provider.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:backend_name)%"
+              ans.name: "%REQ(X-ANS-NAME)%"
+              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              response_code: "%RESPONSE_CODE%"
+              duration: "%DURATION%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+              upstream_host: "%UPSTREAM_HOST%"
+        # 401 identity rejected (ext_authz_denied, agent id empty), 403 authorization rule
+        # (rbac_access_denied, agent id set), 413 request_payload_too_large,
+        # 500 response_payload_too_large, 503 ext_authz_error.
+        - matches:
+            - "response.code >= 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              event: "rejected"
+              response_code: "%RESPONSE_CODE%"
+              response_code_details: "%RESPONSE_CODE_DETAILS%"
+              response_flags: "%RESPONSE_FLAGS%"
+              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              authority: "%REQ(:AUTHORITY)%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              duration: "%DURATION%"
+              upstream_cluster: "%UPSTREAM_CLUSTER%"
+              downstream_remote_address: "%DOWNSTREAM_REMOTE_ADDRESS%"

@@ -1,0 +1,204 @@
+# Agent Router standalone (`aigw run`) with ANS agent authentication on an LLM route.
+#
+# Every request to the Gateway is checked by an external authorizer (Envoy ext_authz over
+# gRPC) that verifies RFC 9449 DPoP proofs together with the SCITT receipt and status token
+# of the Agent Name Service (IETF draft-narajala-courtney-ansv2, ANS-6 Method B). The
+# authorizer sets X-ANS-Name, X-ANS-Agent-Id, X-ANS-Fingerprint and X-ANS-JKT on allowed
+# requests, and the SecurityPolicy's authorization rule then admits only listed agent ids.
+#
+# Run:  aigw run examples/agent-router/standalone/aigw-ans-llm.yaml
+# Env:  AIGW_PORT (1975), UPSTREAM_PORT (11434), ANS_AUTHZ_PORT (9191),
+#       ANS_MAX_BODY (1048576), ANS_ALLOWED_AGENT_ID (demo-agent-1)
+#
+# AIGW_PORT must match the verifier's trustedHosts entry, and ANS_MAX_BODY must not exceed the
+# verifier's maxContentBytes (examples/agent-router/ans-authz.yaml). ANS_MAX_BODY is also the
+# response buffer ceiling for every route on this Gateway (Envoy applies the ext_authz body cap
+# to the stream's buffer limit), so size it for the largest response the gateway holds.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: aigw-run
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: aigw-run
+  namespace: default
+spec:
+  gatewayClassName: aigw-run
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: ${AIGW_PORT:-1975}
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: envoy-ai-gateway
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy-ai-gateway
+  namespace: default
+spec:
+  logging:
+    level:
+      default: error
+  telemetry:
+    accessLog:
+      settings:
+        - matches:
+            - "request.headers['x-ai-eg-model'] != '' && response.code < 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              gen_ai.request.model: "%REQ(X-AI-EG-MODEL)%"
+              gen_ai.provider.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:backend_name)%"
+              ans.name: "%REQ(X-ANS-NAME)%"
+              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              response_code: "%RESPONSE_CODE%"
+              duration: "%DURATION%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+              upstream_host: "%UPSTREAM_HOST%"
+        # Denials, verifier errors and size rejections are issued by ext_authz before the
+        # AI processor runs, so they carry no x-ai-eg-model header and need their own sink.
+        # ans.agent_id is empty for 401s (nothing was verified) and set for 403s and later failures.
+        - matches:
+            - "response.code >= 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              event: "rejected"
+              response_code: "%RESPONSE_CODE%"
+              response_code_details: "%RESPONSE_CODE_DETAILS%"
+              response_flags: "%RESPONSE_FLAGS%"
+              ans.agent_id: "%REQ(X-ANS-AGENT-ID)%"
+              authority: "%REQ(:AUTHORITY)%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              duration: "%DURATION%"
+              upstream_cluster: "%UPSTREAM_CLUSTER%"
+              downstream_remote_address: "%DOWNSTREAM_REMOTE_ADDRESS%"
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: aigw-run
+  namespace: default
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  rules:
+    - matches:
+        - headers:
+            - type: RegularExpression
+              name: x-ai-eg-model
+              value: .*
+      backendRefs:
+        - name: openai
+          namespace: default
+      timeouts:
+        request: 120s
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: openai
+  namespace: default
+spec:
+  endpoints:
+    - ip:
+        address: 127.0.0.1
+        port: ${UPSTREAM_PORT:-11434}
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: openai
+  namespace: default
+spec:
+  timeouts:
+    request: 3m
+  schema:
+    name: OpenAI
+  backendRef:
+    name: openai
+    kind: Backend
+    group: gateway.envoyproxy.io
+    namespace: default
+  # Third-party upstreams do not need the verified identity. Uncomment to keep it inside the
+  # gateway; the DPoP proof, receipt and status token are already stripped by the verifier.
+  # headerMutation:
+  #   remove: [X-ANS-Name, X-ANS-Agent-Id, X-ANS-Fingerprint, X-ANS-JKT, X-Ai-Eg-Mcp-Subject]
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: ans-verifier
+  namespace: default
+spec:
+  endpoints:
+    - ip:
+        address: 127.0.0.1
+        port: ${ANS_AUTHZ_PORT:-9191}
+  appProtocols:
+    - gateway.envoyproxy.io/h2c
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: ans-auth
+  namespace: default
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aigw-run
+  extAuth:
+    grpc:
+      backendRefs:
+        - group: gateway.envoyproxy.io
+          kind: Backend
+          name: ans-verifier
+      # Bounds the request bodies the verifier holds at once: memory is about
+      # 3 x ANS_MAX_BODY x maxParallelRequests on top of the verifier's baseline.
+      backendSettings:
+        circuitBreaker:
+          maxParallelRequests: 64
+    bodyToExtAuth:
+      maxRequestBytes: ${ANS_MAX_BODY:-1048576}
+    contextExtensions:
+      - name: ans-authz
+        type: Value
+        value: body-forwarded
+    failOpen: false
+    timeout: 2s
+    # A verifier outage must look like an outage (503), not like a policy denial (403).
+    statusOnError: 503
+  # Verification proves who the caller is; this rule decides who may use the route.
+  authorization:
+    defaultAction: Deny
+    rules:
+      - name: allow-listed-agents
+        action: Allow
+        principal:
+          headers:
+            - name: x-ans-agent-id
+              values:
+                - "${ANS_ALLOWED_AGENT_ID:-demo-agent-1}"

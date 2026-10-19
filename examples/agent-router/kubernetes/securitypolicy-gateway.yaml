@@ -1,0 +1,55 @@
+# ANS agent authentication for every AIGatewayRoute on a Gateway.
+#
+# Attaches Envoy Gateway's external authorization to the Gateway itself, so each HTTPRoute that
+# Agent Router generates from an AIGatewayRoute is covered. MCPRoutes declare their own
+# securityPolicy and are NOT covered by a Gateway-scoped policy; use mcproute-ans.yaml.
+#
+# Roll out safely: apply ans-verifier.yaml first and wait for Ready, then attach this policy to
+# one HTTPRoute (targetRefs kind HTTPRoute, the AIGatewayRoute's name) as a canary before
+# targeting the Gateway. To roll back, swap in a deny-all authorization rather than deleting
+# the policy: a deleted policy serves the routes unauthenticated.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: ans-auth
+  namespace: default
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: envoy-ai-gateway   # your Gateway's name
+  extAuth:
+    grpc:
+      backendRefs:
+        - name: ans-authz
+          port: 9191
+      # Bounds the bodies the verifier holds at once; its memory limit in ans-verifier.yaml is
+      # sized from this value and maxRequestBytes. Requests above the bound queue in Envoy.
+      backendSettings:
+        circuitBreaker:
+          maxParallelRequests: 64
+    # Also the response buffer ceiling for every route on this Gateway (Envoy applies the
+    # ext_authz body cap to the stream's buffer limit). Size it for the largest response the
+    # gateway holds; keep it at or below the verifier's maxContentBytes.
+    bodyToExtAuth:
+      maxRequestBytes: 1048576
+    contextExtensions:
+      - name: ans-authz
+        type: Value
+        value: body-forwarded
+    failOpen: false
+    timeout: 2s
+    # A verifier outage must look like an outage (503), not like a policy denial (403).
+    statusOnError: 503
+  # Verification proves who the caller is; this rule decides who may use the routes.
+  # The verifier overwrites x-ans-agent-id on every allowed request.
+  authorization:
+    defaultAction: Deny
+    rules:
+      - name: allow-listed-agents
+        action: Allow
+        principal:
+          headers:
+            - name: x-ans-agent-id
+              values:
+                - demo-agent-1

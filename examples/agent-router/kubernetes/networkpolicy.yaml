@@ -1,0 +1,91 @@
+# Network boundaries for the ANS verifier and the Agent Router data plane.
+#
+# Requires a CNI that enforces NetworkPolicy. Adjust the namespaces (Envoy Gateway runs its
+# proxies in envoy-gateway-system by default; the monitoring namespace is yours) and the Gateway
+# name in the owning-gateway labels, which Envoy Gateway stamps on the proxy pods it manages.
+#
+# 1. Only this Gateway's Envoy proxy pods may reach the verifier's gRPC port; only monitoring
+#    may scrape its HTTP port (kubelet probes are exempt from NetworkPolicy on common CNIs).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ans-authz
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ans-authz
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: envoy-ai-gateway   # your Gateway
+              gateway.envoyproxy.io/owning-gateway-namespace: default
+      ports:
+        - port: 9191
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9192
+---
+# 2. This Gateway's Envoy pods also run Agent Router's processor, whose MCP proxy (9856) trusts
+#    the headers it receives because Envoy's ext_authz already ran. Only the listener ports are
+#    open to clients; Envoy's stats (19001) and the processor's admin and metrics port (1064) are
+#    open to monitoring only; 9856 is reachable from nowhere outside the pod. Envoy Gateway maps
+#    a Gateway listener port below 1024 to container port +10000 (80 -> 10080, 443 -> 10443);
+#    higher listener ports keep their number. List every listener you expose.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-router-envoy-ingress
+  namespace: envoy-gateway-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: envoy
+      gateway.envoyproxy.io/owning-gateway-name: envoy-ai-gateway   # your Gateway
+      gateway.envoyproxy.io/owning-gateway-namespace: default
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: 10080
+        - port: 10443
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 19001
+        - port: 1064
+---
+# 3. The MCP tool server receives the verified identity as plain headers, so only this
+#    Gateway's Envoy pods may reach it; adjust the selector to your tool server's labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-tools-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tools
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: envoy-ai-gateway   # your Gateway
+              gateway.envoyproxy.io/owning-gateway-namespace: default
+      ports:
+        - port: 1063
