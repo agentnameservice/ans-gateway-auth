@@ -6,10 +6,20 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 
 	"github.com/agentnameservice/ans-gateway-auth/config"
+	"github.com/agentnameservice/ans-gateway-auth/testidentity"
+)
+
+const (
+	// rootKeyPlaceholder is what the ConfigMap ships in place of the log's root keys; the
+	// verifier refuses it, so a deployment cannot start without pinned keys.
+	rootKeyPlaceholder = "REPLACE_WITH_THE_LOG_ROOT_KEY_LINE"
+	// distrolessNonroot is the uid and gid of the distroless nonroot user the image runs as.
+	distrolessNonroot = 65532
 )
 
 // These tests need no gateway: they keep the shipped Agent Router recipes loadable and
@@ -70,21 +80,7 @@ func TestKubernetesConfigMapMatchesShippedConfig(t *testing.T) {
 	dir := recipesDir(t)
 	shipped := loadVerifierConfig(t, filepath.Join(dir, "ans-authz.yaml"))
 
-	var configMapYAML string
-	for _, doc := range yamlDocs(t, filepath.Join(dir, "kubernetes", "ans-verifier.yaml")) {
-		if doc["kind"] == "ConfigMap" {
-			data, _ := doc["data"].(map[string]any)
-			configMapYAML, _ = data["config.yaml"].(string)
-		}
-	}
-	if configMapYAML == "" {
-		t.Fatal("kubernetes/ans-verifier.yaml has no ConfigMap with data.config.yaml")
-	}
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(configMapYAML), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	k8s := loadVerifierConfig(t, path)
+	k8s := loadVerifierConfig(t, writeConfigMapConfig(t, dir))
 
 	if k8s.GRPC.Listen != "0.0.0.0:9191" || !k8s.GRPC.AllowInsecureListen || k8s.HTTPListen != "0.0.0.0:9192" {
 		t.Errorf("ConfigMap listeners = grpc %q (insecure %v), http %q; want pod-wide 9191 and 9192", k8s.GRPC.Listen, k8s.GRPC.AllowInsecureListen, k8s.HTTPListen)
@@ -98,6 +94,106 @@ func TestKubernetesConfigMapMatchesShippedConfig(t *testing.T) {
 	if !reflect.DeepEqual(shipped, k8s) {
 		t.Errorf("ConfigMap config drifted from examples/agent-router/ans-authz.yaml beyond the documented overrides:\nshipped: %+v\nconfigmap: %+v", shipped, k8s)
 	}
+}
+
+// TestVerifierDeploymentHardening pins the Deployment settings the security review relies on:
+// numeric non-root ids the kubelet can verify, a locked-down container, and a startup probe
+// that outlasts the verifier's own startup retries so the kubelet never restarts it mid-fetch.
+func TestVerifierDeploymentHardening(t *testing.T) {
+	t.Parallel()
+	dir := recipesDir(t)
+	var deployment map[string]any
+	for _, doc := range yamlDocs(t, filepath.Join(dir, "kubernetes", "ans-verifier.yaml")) {
+		if doc["kind"] == "Deployment" {
+			deployment = doc
+		}
+	}
+	if deployment == nil {
+		t.Fatal("kubernetes/ans-verifier.yaml has no Deployment")
+	}
+	podSpec := dig(t, deployment, "spec", "template", "spec")
+	podSec := dig(t, podSpec, "securityContext")
+	if podSec["runAsNonRoot"] != true || podSec["runAsUser"] != distrolessNonroot || podSec["runAsGroup"] != distrolessNonroot {
+		t.Errorf("pod securityContext = %v, want runAsNonRoot with runAsUser and runAsGroup %d", podSec, distrolessNonroot)
+	}
+	if dig(t, podSec, "seccompProfile")["type"] != "RuntimeDefault" {
+		t.Errorf("pod seccompProfile = %v, want RuntimeDefault", podSec["seccompProfile"])
+	}
+
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("containers = %d, want the verifier alone", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	sec := dig(t, container, "securityContext")
+	drops, _ := dig(t, sec, "capabilities")["drop"].([]any)
+	if sec["allowPrivilegeEscalation"] != false || sec["readOnlyRootFilesystem"] != true || len(drops) != 1 || drops[0] != "ALL" {
+		t.Errorf("container securityContext = %v, want no privilege escalation, a read-only root and all capabilities dropped", sec)
+	}
+
+	probePath := func(name string) string {
+		path, _ := dig(t, dig(t, container, name), "httpGet")["path"].(string)
+		return path
+	}
+	if got := probePath("readinessProbe"); got != "/readyz" {
+		t.Errorf("readinessProbe path = %q, want /readyz", got)
+	}
+	if got := probePath("livenessProbe"); got != "/healthz" {
+		t.Errorf("livenessProbe path = %q, want /healthz", got)
+	}
+	if got := probePath("startupProbe"); got != "/readyz" {
+		t.Errorf("startupProbe path = %q, want /readyz", got)
+	}
+	startup := dig(t, container, "startupProbe")
+	period, _ := startup["periodSeconds"].(int)
+	failures, _ := startup["failureThreshold"].(int)
+	budget := time.Duration(period*failures) * time.Second
+	k8s := loadVerifierConfig(t, writeConfigMapConfig(t, dir))
+	// One startupTimeout per transparency log fetched without pinned keys, one more for the
+	// HA variant's Redis connect.
+	if need := k8s.StartupTimeout * time.Duration(len(k8s.TransparencyLogs)+1); budget < need {
+		t.Errorf("startupProbe allows %s, want at least %s (startupTimeout %s x %d)", budget, need, k8s.StartupTimeout, len(k8s.TransparencyLogs)+1)
+	}
+}
+
+// writeConfigMapConfig materialises the ConfigMap's config.yaml with a provisioned root key in
+// place of the placeholder, so config.Load accepts it.
+func writeConfigMapConfig(t *testing.T, dir string) string {
+	t.Helper()
+	var configMapYAML string
+	for _, doc := range yamlDocs(t, filepath.Join(dir, "kubernetes", "ans-verifier.yaml")) {
+		if doc["kind"] == "ConfigMap" {
+			data, _ := doc["data"].(map[string]any)
+			configMapYAML, _ = data["config.yaml"].(string)
+		}
+	}
+	if configMapYAML == "" {
+		t.Fatal("kubernetes/ans-verifier.yaml has no ConfigMap with data.config.yaml")
+	}
+	if !strings.Contains(configMapYAML, rootKeyPlaceholder) {
+		t.Fatalf("ConfigMap must pin the log's root keys next to baseURL, shipped as %q", rootKeyPlaceholder)
+	}
+	p, err := testidentity.Provision("ans://v1.0.0.recipes.example", "recipes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err = os.WriteFile(path, []byte(strings.Replace(configMapYAML, rootKeyPlaceholder, p.RootKeyC2SP, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func dig(t *testing.T, m map[string]any, keys ...string) map[string]any {
+	t.Helper()
+	for _, k := range keys {
+		next, ok := m[k].(map[string]any)
+		if !ok {
+			t.Fatalf("%q is missing or not a mapping", k)
+		}
+		m = next
+	}
+	return m
 }
 
 // TestRecipesCarryTheAuthorizerContract checks every extAuth block in the recipes for the

@@ -49,7 +49,7 @@ e2e: agentgateway-bin
 		$(GO) test -tags e2e -count=1 -timeout 15m $(E2E_FLAGS) ./tests/agentgateway/...
 
 # Agent Router suite (tests/agentrouter). AIGW_BIN must point at an aigw
-# binary; tests/agentrouter/README.md says how to build or download it.
+# binary; examples/agent-router/README.md ("Tests") says how to build or download it.
 e2e-agentrouter: build
 	@test -n "$(AIGW_BIN)" || { echo "AIGW_BIN is required (path to the aigw binary)" >&2; exit 2; }
 	AIGW_BIN=$(AIGW_BIN) $(GO) test -tags e2e -count=1 -p 1 -timeout 25m $(E2E_FLAGS) ./tests/agentrouter/...

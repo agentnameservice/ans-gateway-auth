@@ -23,6 +23,9 @@ const (
 	gatewayPort  = 1975
 	spikeAgentID = "demo-agent-1"
 	startTimeout = 4 * time.Minute
+	// defaultEnvoyVersion is the Envoy release pinned by Agent Router v1.2.0's .envoy-version
+	// file, the version these recipes were written against.
+	defaultEnvoyVersion = "1.39.2"
 )
 
 // Ports aigw run binds besides the Gateway listener: extension server, admin, MCP proxy and
@@ -171,9 +174,15 @@ func (p *process) running() bool {
 }
 
 // startAigw runs `aigw run --debug <config>` with the given environment on top of the
-// current one. State lives under the test's temp dir; the runtime dir, which holds a Unix
-// socket, uses a short path under /tmp to stay within the socket path limit; the data dir keeps
-// its default so the Envoy binary func-e downloads is cached between runs.
+// current one. Config and state live under the test's temp dir, so a run neither reads nor
+// writes the user's aigw directories; the runtime dir, which holds a Unix socket, uses a short
+// path under /tmp to stay within the socket path limit; the data dir keeps its default so the
+// Envoy binary func-e downloads is cached between runs.
+//
+// aigw run passes func-e no Envoy version. func-e then takes $ENVOY_VERSION, else the config
+// home's envoy-version file, else the newest release in its archive, which Agent Router has not
+// tested and which costs a network lookup on every start. With a fresh config home the suite
+// pins defaultEnvoyVersion unless the caller sets ENVOY_VERSION.
 func startAigw(t *testing.T, bin, configPath string, env map[string]string) *process {
 	t.Helper()
 	runtimeDir, err := os.MkdirTemp("/tmp", "aigw-e2e-") //nolint:usetesting // t.TempDir paths exceed the Unix socket path limit on macOS
@@ -181,12 +190,20 @@ func startAigw(t *testing.T, bin, configPath string, env map[string]string) *pro
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	configHome := filepath.Join(t.TempDir(), "config")
+	if err := os.MkdirAll(configHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(bin, "run", "--debug", configPath)
 	cmd.Env = append(os.Environ(),
 		"DISABLE_PPROF=1",
+		"AIGW_CONFIG_HOME="+configHome,
 		"AIGW_STATE_HOME="+filepath.Join(t.TempDir(), "state"),
 		"AIGW_RUNTIME_DIR="+runtimeDir,
 	)
+	if os.Getenv("ENVOY_VERSION") == "" {
+		cmd.Env = append(cmd.Env, "ENVOY_VERSION="+defaultEnvoyVersion)
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

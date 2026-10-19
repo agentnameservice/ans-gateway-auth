@@ -101,11 +101,13 @@ Gateway plumbing and the access-log sinks appear in both. `AIGW_PORT` must match
 
 Apply order matters because the gateway fails closed:
 
-1. `kubernetes/ans-verifier.yaml` after editing the ConfigMap (transparency log, `trustedHosts`,
-   image digest), then wait for `kubectl rollout status deployment/ans-authz` and a 200 from
-   `/readyz`. Config changes take effect only after `kubectl rollout restart`, a short fail-closed
-   window, so Kubernetes deployments should point at a real transparency log rather than hourly
-   development keys.
+1. `kubernetes/ans-verifier.yaml` after editing the ConfigMap (transparency log with its pinned
+   root keys, `trustedHosts`) and the image (no pipeline publishes one yet: `make docker` builds
+   it for your registry), then wait for `kubectl rollout status deployment/ans-authz` and a 200
+   from `/readyz`. Config changes take effect only after `kubectl rollout restart`, a short
+   fail-closed window, so Kubernetes deployments should point at a real transparency log rather
+   than hourly development keys. Keep the log's keys pinned next to `baseURL`: a verifier with
+   only a URL exits after `startupTimeout` when the log is down and crash-loops.
 2. `kubernetes/networkpolicy.yaml` and `kubernetes/envoyproxy-accesslog.yaml`.
 3. A canary: `kubernetes/securitypolicy-gateway.yaml` with `targetRefs` pointed at one HTTPRoute
    (the name of one AIGatewayRoute) and a client that already signs.
@@ -181,6 +183,9 @@ a rate limit so unauthenticated traffic cannot exhaust the gateway before it is 
   and `request.mcp.tool`. Guard header access with `in`, since an evaluation error denies the
   request.
 - MCP backends receive only the headers listed in `forwardHeaders`.
+- Headers are the only carrier: neither Envoy Gateway's authorization principals nor the MCP
+  proxy's CEL can read ext_authz dynamic metadata, which is why every route that authorizes on
+  `x-ans-agent-id` must itself carry `extAuth` (caveat j).
 - The verifier sets `x-ai-eg-mcp-subject` to the agent id (`extraIdentityHeaders`), which Agent
   Router's MCP proxy uses to bind a session to the agent that created it; another agent
   presenting that session id is rejected. The header is Agent Router's internal contract between
@@ -198,8 +203,10 @@ a rate limit so unauthenticated traffic cannot exhaust the gateway before it is 
   ran in Envoy; under `aigw run` it listens on all interfaces and answers unsigned requests that
   carry the route header. On Kubernetes `networkpolicy.yaml` closes it to other pods; under
   `aigw run`, run on a trusted host.
-- (e) The Envoy-to-verifier gRPC hop is plaintext unless `grpc.tls` is configured on the verifier.
-  Keep it inside the pod or behind the NetworkPolicy.
+- (e) The Envoy-to-verifier gRPC hop is plaintext unless `grpc.tls` is configured on the verifier,
+  and an on-path host inside the cluster could then answer Check calls with forged identities.
+  Keep it inside the pod or behind the NetworkPolicy, or apply the TLS variant commented at the
+  end of `kubernetes/ans-verifier.yaml` (verifier certificate plus a `BackendTLSPolicy`).
 - (f) Non-UTF-8 request bodies are rejected: Envoy Gateway forwards the body as a protobuf string
   and the verifier's decoder refuses invalid UTF-8, which fails closed. JSON bodies are unaffected.
 - (g) The identity headers (`X-ANS-*` and `x-ai-eg-mcp-subject`) reach the upstream. Remove them
@@ -223,4 +230,7 @@ with a stub authorizer, then signed, unsigned, replayed, tampered, wrong-authori
 missing-receipt, unauthorized, oversize-response and verifier-outage requests on the LLM route,
 tool rules, forwarded headers, forged headers and session binding on the MCP route, and the
 documented MCP-proxy bypass. `AIGW_BIN` is required: build it with `go build -o bin/aigw ./cmd/aigw`
-in an Agent Router checkout, or use a release binary.
+in an Agent Router checkout, or use a release binary. The suite gives `aigw` its own config and
+state directories and runs Envoy 1.39.2, the release Agent Router v1.2.0 pins, unless
+`ENVOY_VERSION` says otherwise; the first run downloads that Envoy into `~/.local/share/aigw`
+(or `AIGW_DATA_HOME`) and later runs reuse it.

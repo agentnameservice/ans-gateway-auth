@@ -127,15 +127,20 @@ func TestMCPRoute_DPoP(t *testing.T) {
 			_ = sess.Close()
 			t.Fatal("unsigned client connected")
 		}
-		if !strings.Contains(err.Error(), "401") {
+		// The go-sdk reports a rejected initialize by HTTP status text, not status code.
+		if msg := err.Error(); !strings.Contains(msg, http.StatusText(http.StatusUnauthorized)) && !strings.Contains(msg, "401") {
 			t.Errorf("unsigned connect error = %v, want a 401", err)
 		}
 	})
 
 	t.Run("forged identity without a proof is challenged", func(t *testing.T) {
 		req := mcpRawRequest(t, gatewayURL(mcpEndpoint), toolsListBody, map[string]string{"X-ANS-Agent-Id": agentAID, "X-ANS-Name": agentAName})
-		if res := send(t, req); res.Status != http.StatusUnauthorized {
+		res := send(t, req)
+		if res.Status != http.StatusUnauthorized {
 			t.Fatalf("status %d, body %.300s", res.Status, res.Body)
+		}
+		if got := res.Header.Get("WWW-Authenticate"); !strings.HasPrefix(got, "DPoP") {
+			t.Errorf("WWW-Authenticate = %q, want the DPoP challenge on the MCP route", got)
 		}
 	})
 }

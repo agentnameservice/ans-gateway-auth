@@ -5,9 +5,9 @@
 # needs the redis replay backend and a highly available Redis. Apply this file first and wait
 # for the pod to be Ready before attaching a SecurityPolicy: the gateway fails closed.
 #
-# Replace: the transparency log, the trustedHosts authority and the image digest. Config
-# changes take effect only after `kubectl rollout restart deployment/ans-authz`, which is a
-# short fail-closed window; a rotated dev root key therefore needs a restart too.
+# Replace: the transparency log and its pinned root keys, the trustedHosts authority and the
+# image. Config changes take effect only after `kubectl rollout restart deployment/ans-authz`,
+# which is a short fail-closed window; a rotated dev root key therefore needs a restart too.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -18,11 +18,17 @@ data:
   # these overrides: the transparency log and the cluster-facing authority in trustedHosts, both
   # listeners on the pod address (the verifier defaults to loopback, which a pod cannot expose),
   # and allowInsecureListen because the NetworkPolicy keeps the plaintext gRPC hop inside the
-  # cluster. Prefer grpc.tls when a certificate is available.
+  # cluster. Prefer grpc.tls when a certificate is available (TLS variant at the end).
   config.yaml: |
     transparencyLogs:
       - name: tl
         baseURL: https://transparency.example.com
+        # The log's current root keys (C2SP lines from its /root-keys endpoint). With keys
+        # pinned, a restart during a log outage starts on them and refreshes later; with only
+        # baseURL it exits after startupTimeout and crash-loops. The verifier refuses to start
+        # until this placeholder is replaced; `ans-authz --check --config` shows the error.
+        rootKeys:
+          - "REPLACE_WITH_THE_LOG_ROOT_KEY_LINE"
     trustedHosts:
       - https://gateway.example.com
     maxContentBytes: 1048576
@@ -68,10 +74,17 @@ spec:
       terminationGracePeriodSeconds: 15
       securityContext:
         runAsNonRoot: true
+        # The image runs as distroless nonroot; the numeric ids let the kubelet verify
+        # runAsNonRoot, which a user name in the image cannot.
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: ans-authz
+          # No pipeline publishes this image yet. Build it from this repository with
+          # `make docker IMAGE=<registry>/ans-authz:<tag>`, push it to your registry and pin
+          # the digest here.
           image: ghcr.io/agentnameservice/ans-authz@sha256:REPLACE_WITH_THE_RELEASE_DIGEST
           args: ["--config", "/etc/ans-authz/config.yaml"]
           ports:
@@ -79,6 +92,16 @@ spec:
               containerPort: 9191
             - name: http
               containerPort: 9192
+          # Nothing listens until trust material is loaded: each transparency log without
+          # pinned keys is retried for startupTimeout (30 s by default), then the Redis connect
+          # in the HA variant for the same. 90 s covers two such waits; raise it with
+          # startupTimeout. Liveness starts only after this probe succeeds.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 18
           readinessProbe:
             httpGet:
               path: /readyz
@@ -144,5 +167,54 @@ spec:
 #         addr: redis.default.svc:6379
 #         passwordEnv: ANS_AUTHZ_REDIS_PASSWORD
 #         tls: true
-# then set replicas: 2 and strategy RollingUpdate {maxUnavailable: 0, maxSurge: 1}, add a
-# PodDisruptionBudget with minAvailable: 1, and keep the preStop sleep so endpoints drain.
+# and give the container the password from a Secret:
+#           env:
+#             - name: ANS_AUTHZ_REDIS_PASSWORD
+#               valueFrom:
+#                 secretKeyRef:
+#                   name: ans-authz-redis
+#                   key: password
+# passwordEnv names any variable in the pod's environment, so whoever can write the ConfigMap
+# can point it, and the Redis address, at any secret the pod carries: grant write access to
+# the ConfigMap to no one who may not read the Secret. Then set replicas: 2 and strategy
+# RollingUpdate {maxUnavailable: 0, maxSurge: 1}, add a PodDisruptionBudget with
+# minAvailable: 1, and keep the preStop sleep so endpoints drain.
+#
+# ---
+# TLS variant: Envoy verifies the verifier's certificate, so no on-path host inside the
+# cluster can answer Check calls with forged identities. Give the verifier a serving
+# certificate for ans-authz.default.svc in a kubernetes.io/tls Secret (cert-manager issues
+# one from a Certificate with that dnsName), mount it and replace the ConfigMap's grpc block:
+#     grpc:
+#       listen: 0.0.0.0:9191
+#       tls:
+#         certFile: /etc/ans-authz/tls/tls.crt
+#         keyFile: /etc/ans-authz/tls/tls.key
+#         # clientCAFile: /etc/ans-authz/tls/ca.crt   # with EnvoyProxy spec.backendTLS.clientCertificateRef, for mTLS
+#           volumeMounts:
+#             - name: tls
+#               mountPath: /etc/ans-authz/tls
+#               readOnly: true
+#       volumes:
+#         - name: tls
+#           secret:
+#             secretName: ans-authz-tls
+# and tell Envoy Gateway to speak TLS to the Service (every SecurityPolicy and MCPRoute that
+# references it inherits this):
+#     apiVersion: gateway.networking.k8s.io/v1
+#     kind: BackendTLSPolicy
+#     metadata:
+#       name: ans-authz
+#       namespace: default
+#     spec:
+#       targetRefs:
+#         - group: ""
+#           kind: Service
+#           name: ans-authz
+#           sectionName: grpc
+#       validation:
+#         hostname: ans-authz.default.svc
+#         caCertificateRefs:
+#           - group: ""
+#             kind: ConfigMap
+#             name: ans-authz-ca   # ca.crt of the issuer that signed the serving certificate
