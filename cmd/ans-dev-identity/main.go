@@ -41,6 +41,9 @@ func runWith(args []string, stdout, stderr io.Writer, provision provisionFunc) i
 	agentID := fs.String("agent-id", "", "the agent id recorded in the status token (required)")
 	force := fs.Bool("force", false, "overwrite an existing bundle")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
 		return exitUsage
 	}
 	if *out == "" || *ansName == "" || *agentID == "" {

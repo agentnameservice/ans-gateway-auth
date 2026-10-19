@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
@@ -33,6 +34,7 @@ const (
 	modeDir     fs.FileMode = 0o700
 	modePrivate fs.FileMode = 0o600
 	modePublic  fs.FileMode = 0o644
+	modeOthers  fs.FileMode = 0o077
 
 	pemPKCS8 = "PRIVATE KEY"
 	pemSEC1  = "EC PRIVATE KEY"
@@ -43,7 +45,11 @@ const (
 // key, agent.crt as a PEM certificate, and receipt.cose and status.cose as raw
 // COSE_Sign1 bytes, then validates them with New.
 func Load(dir string) (*Bundle, error) {
-	key, err := loadKey(filepath.Join(dir, FileKey))
+	keyPath := filepath.Join(dir, FileKey)
+	if err := checkPrivate(keyPath); err != nil {
+		return nil, err
+	}
+	key, err := loadKey(keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +66,22 @@ func Load(dir string) (*Bundle, error) {
 		return nil, err
 	}
 	return New(key, certDER, receipt, status)
+}
+
+// checkPrivate refuses a private key other users can read, as ssh does. The
+// check has no meaning on Windows, whose permission bits are not POSIX.
+func checkPrivate(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("identity: %w", err)
+	}
+	if perm := info.Mode().Perm(); perm&modeOthers != 0 {
+		return fmt.Errorf("identity: %s mode %04o is readable by other users; chmod 600 it", path, perm)
+	}
+	return nil
 }
 
 // LoadRootKeys reads root-keys.c2sp from a bundle directory into a key store,
@@ -233,8 +255,8 @@ func (b *Bundle) files(o *writeOptions) ([]fileSpec, error) {
 }
 
 // writeFile creates path exclusively (removing an existing entry first when
-// force is set, which replaces a symlink rather than following it) and sets
-// the mode on the descriptor so umask cannot widen it.
+// force is set, which replaces a symlink rather than following it). The mode
+// is an upper bound: umask may narrow it, never widen it.
 func writeFile(path string, data []byte, mode fs.FileMode, force bool) error {
 	if force {
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -246,10 +268,6 @@ func writeFile(path string, data []byte, mode fs.FileMode, force bool) error {
 		if errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("%w: %s", ErrExists, path)
 		}
-		return fmt.Errorf("identity: %w", err)
-	}
-	if err := f.Chmod(mode); err != nil {
-		_ = f.Close()
 		return fmt.Errorf("identity: %w", err)
 	}
 	if _, err := f.Write(data); err != nil {

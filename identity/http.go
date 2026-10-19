@@ -58,6 +58,9 @@ func (b *Bundle) Sign(ctx context.Context, method, rawURL string, body []byte, o
 // before handing the clone to base (http.DefaultTransport when nil). The
 // caller's request is never modified; its body is buffered once so the proof
 // binds the content digest and base can rewind the clone's body on a retry.
+// Redirect policy belongs to the http.Client: every hop the client follows is
+// signed afresh for its own URL and carries the receipt and status token, so
+// restrict CheckRedirect to hosts that may see them.
 func (b *Bundle) Transport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport

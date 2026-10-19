@@ -22,6 +22,7 @@ spec:
       grpc:
         backendRefs:
           - name: ans-authz
+            namespace: ans-authz   # ReferenceGrant in ans-verifier.yaml
             port: 9191
         backendSettings:
           circuitBreaker:

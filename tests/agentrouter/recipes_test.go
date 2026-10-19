@@ -1,6 +1,8 @@
 package agentrouter
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +25,8 @@ const (
 	// replayResetGrace is the SDK's replay-retention grace the verifier adds to 2 x popSkew when
 	// it fails closed after a Redis keyspace loss; the recipe's startup quarantine must match.
 	replayResetGrace = 5 * time.Second
+	// verifierNamespace is the dedicated namespace whose label selector is the trust anchor.
+	verifierNamespace = "ans-authz"
 )
 
 // These tests need no gateway: they keep the shipped Agent Router recipes loadable and
@@ -115,6 +119,9 @@ func TestVerifierDeploymentHardening(t *testing.T) {
 		t.Fatal("kubernetes/ans-verifier.yaml has no Deployment")
 	}
 	podSpec := dig(t, deployment, "spec", "template", "spec")
+	if podSpec["automountServiceAccountToken"] != false {
+		t.Error("pod must set automountServiceAccountToken: false; the verifier never calls the API server")
+	}
 	podSec := dig(t, podSpec, "securityContext")
 	if podSec["runAsNonRoot"] != true || podSec["runAsUser"] != distrolessNonroot || podSec["runAsGroup"] != distrolessNonroot {
 		t.Errorf("pod securityContext = %v, want runAsNonRoot with runAsUser and runAsGroup %d", podSec, distrolessNonroot)
@@ -158,13 +165,75 @@ func TestVerifierDeploymentHardening(t *testing.T) {
 		t.Errorf("startupProbe allows %s, want at least %s (startupTimeout %s x %d)", budget, need, k8s.StartupTimeout, len(k8s.TransparencyLogs)+1)
 	}
 	// The memory replay cache dies with the process: the new pod must stay out of the Service
-	// until every proof the previous one could have accepted has expired.
+	// until every proof the previous one could have accepted has expired, including proofs
+	// accepted while a replaced pod was still terminating.
 	if k8s.PoPSkew <= 0 {
 		t.Fatal("loaded config has no popSkew default")
 	}
+	grace, _ := podSpec["terminationGracePeriodSeconds"].(int)
 	delay, _ := startup["initialDelaySeconds"].(int)
-	if quarantine, want := time.Duration(delay)*time.Second, 2*k8s.PoPSkew+replayResetGrace; quarantine < want {
-		t.Errorf("startupProbe.initialDelaySeconds = %s, want at least 2 x popSkew + %s (%s)", quarantine, replayResetGrace, want)
+	want := 2*k8s.PoPSkew + replayResetGrace + time.Duration(grace)*time.Second
+	if quarantine := time.Duration(delay) * time.Second; quarantine < want {
+		t.Errorf("startupProbe.initialDelaySeconds = %s, want at least 2 x popSkew + %s + terminationGracePeriodSeconds (%s)", quarantine, replayResetGrace, want)
+	}
+}
+
+// TestVerifierIsReferencedAcrossNamespaces pins the namespace boundary the recipe relies on: the
+// verifier's objects live in their own namespace, every extAuth backendRef names it, and the
+// ReferenceGrant that lets the gateway's policies cross into it is present.
+func TestVerifierIsReferencedAcrossNamespaces(t *testing.T) {
+	t.Parallel()
+	dir := recipesDir(t)
+	grant := false
+	for _, doc := range yamlDocs(t, filepath.Join(dir, "kubernetes", "ans-verifier.yaml")) {
+		meta := dig(t, doc, "metadata")
+		switch doc["kind"] {
+		case "Namespace":
+			if meta["name"] != verifierNamespace {
+				t.Errorf("Namespace %v, want %s", meta["name"], verifierNamespace)
+			}
+		case "ConfigMap", "Deployment", "Service":
+			if meta["namespace"] != verifierNamespace {
+				t.Errorf("%s %v is in namespace %v, want %s", doc["kind"], meta["name"], meta["namespace"], verifierNamespace)
+			}
+		case "ReferenceGrant":
+			grant = meta["namespace"] == verifierNamespace && grantsService(t, doc)
+		}
+	}
+	if !grant {
+		t.Errorf("kubernetes/ans-verifier.yaml needs a ReferenceGrant in %s that lets SecurityPolicies reference the ans-authz Service", verifierNamespace)
+	}
+	for _, f := range []string{"securitypolicy-gateway.yaml", "mcproute-ans.yaml"} {
+		for _, doc := range yamlDocs(t, filepath.Join(dir, "kubernetes", f)) {
+			walk(doc, func(key string, value map[string]any) {
+				if key == "extAuth" {
+					requireVerifierNamespace(t, f, value)
+				}
+			})
+		}
+	}
+}
+
+func grantsService(t *testing.T, grant map[string]any) bool {
+	t.Helper()
+	targets, _ := dig(t, grant, "spec")["to"].([]any)
+	for _, target := range targets {
+		m, _ := target.(map[string]any)
+		if m["kind"] == "Service" && m["name"] == "ans-authz" {
+			return true
+		}
+	}
+	return false
+}
+
+func requireVerifierNamespace(t *testing.T, file string, extAuth map[string]any) {
+	t.Helper()
+	refs, _ := dig(t, extAuth, "grpc")["backendRefs"].([]any)
+	for _, r := range refs {
+		ref, _ := r.(map[string]any)
+		if ref["name"] == "ans-authz" && ref["namespace"] != verifierNamespace {
+			t.Errorf("%s: extAuth backendRef ans-authz must name namespace %s", file, verifierNamespace)
+		}
 	}
 }
 
@@ -283,21 +352,26 @@ func checkExtAuth(t *testing.T, file string, ext map[string]any) {
 
 func yamlDocs(t *testing.T, path string) []map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
 	var docs []map[string]any
-	for _, chunk := range strings.Split(string(raw), "\n---") {
+	for {
 		var doc map[string]any
-		if err := yaml.Unmarshal([]byte(chunk), &doc); err != nil {
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return docs
+		}
+		if err != nil {
 			t.Fatalf("%s: %v", path, err)
 		}
 		if len(doc) > 0 {
 			docs = append(docs, doc)
 		}
 	}
-	return docs
 }
 
 func walk(node any, visit func(key string, value map[string]any)) {

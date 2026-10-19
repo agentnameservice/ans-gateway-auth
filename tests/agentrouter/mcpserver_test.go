@@ -74,6 +74,12 @@ func (ts *toolServer) record(req *mcp.CallToolRequest) {
 	ts.headers = append(ts.headers, req.Extra.Header.Clone())
 }
 
+func (ts *toolServer) callCount() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return len(ts.headers)
+}
+
 func (ts *toolServer) lastHeaders() http.Header {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()

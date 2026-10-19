@@ -35,6 +35,18 @@ func assertMode(t *testing.T, path string, want fs.FileMode) {
 	}
 }
 
+// assertPublicMode accepts 0644 narrowed by any umask: owner read-write, nothing wider.
+func assertPublicMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&^modePublic != 0 || perm&modePrivate != modePrivate {
+		t.Fatalf("%s mode = %o, want 0644 or narrower with owner read-write", path, perm)
+	}
+}
+
 func assertAbsent(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); err == nil {
@@ -72,7 +84,7 @@ func TestWriteLoadRoundTrip(t *testing.T) {
 	assertMode(t, filepath.Join(dir, identity.FileKey), modePrivate)
 	assertMode(t, filepath.Join(dir, identity.FileReceipt), modePrivate)
 	assertMode(t, filepath.Join(dir, identity.FileStatus), modePrivate)
-	assertMode(t, filepath.Join(dir, identity.FileCert), modePublic)
+	assertPublicMode(t, filepath.Join(dir, identity.FileCert))
 	assertAbsent(t, filepath.Join(dir, identity.FileRootKeys))
 
 	got, err := identity.Load(dir)
@@ -91,7 +103,7 @@ func TestWriteOptionalFiles(t *testing.T) {
 	}
 
 	rootKeys := filepath.Join(dir, identity.FileRootKeys)
-	assertMode(t, rootKeys, modePublic)
+	assertPublicMode(t, rootKeys)
 	lines, err := os.ReadFile(rootKeys)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -227,6 +239,9 @@ func TestWriteErrors(t *testing.T) {
 			bundle: p.Bundle,
 			dir: func(t *testing.T) string {
 				t.Helper()
+				if os.Geteuid() == 0 {
+					t.Skip("root ignores directory permissions")
+				}
 				dir := t.TempDir()
 				if err := os.Chmod(dir, 0o500); err != nil {
 					t.Fatalf("Chmod: %v", err)
@@ -304,6 +319,12 @@ func TestLoadErrors(t *testing.T) {
 			}
 		}, wantErr: identity.FileKey},
 		{name: "missing key", mutate: remove(identity.FileKey), wantErr: identity.FileKey},
+		{name: "key readable by others", mutate: func(t *testing.T, dir string) {
+			t.Helper()
+			if err := os.Chmod(filepath.Join(dir, identity.FileKey), modePublic); err != nil {
+				t.Fatalf("Chmod: %v", err)
+			}
+		}, wantErr: "readable by other users"},
 		{name: "missing certificate", mutate: remove(identity.FileCert), wantErr: identity.FileCert},
 		{name: "missing receipt", mutate: remove(identity.FileReceipt), wantErr: identity.FileReceipt},
 		{name: "missing status token", mutate: remove(identity.FileStatus), wantErr: identity.FileStatus},

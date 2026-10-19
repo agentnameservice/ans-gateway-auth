@@ -68,7 +68,7 @@ func TestMCPRoute_DPoP(t *testing.T) {
 				t.Errorf("tools/list lacks %s; got %v", want, names)
 			}
 		}
-		callTool(ctx, t, sess, "tools__echo", map[string]any{"text": "hi"}, true)
+		callTool(ctx, t, env.tools, sess, "tools__echo", map[string]any{"text": "hi"}, true)
 		h := env.tools.lastHeaders()
 		if h == nil {
 			t.Fatal("backend recorded no tool call")
@@ -79,19 +79,19 @@ func TestMCPRoute_DPoP(t *testing.T) {
 		if got := h.Get("X-Ans-Agent-Id"); got != agentAID {
 			t.Errorf("backend X-Ans-Agent-Id = %q, want %q", got, agentAID)
 		}
-		callTool(ctx, t, sess, "tools__sum", map[string]any{"a": 2, "b": 3}, true)
+		callTool(ctx, t, env.tools, sess, "tools__sum", map[string]any{"a": 2, "b": 3}, true)
 	})
 
 	t.Run("tool rules admit a verified agent and reserve sum for the listed one", func(t *testing.T) {
 		sess := connectMCP(ctx, t, env.ids.b.Bundle.Transport(nil))
-		callTool(ctx, t, sess, "tools__echo", map[string]any{"text": "hi"}, true)
-		callTool(ctx, t, sess, "tools__sum", map[string]any{"a": 2, "b": 3}, false)
+		callTool(ctx, t, env.tools, sess, "tools__echo", map[string]any{"text": "hi"}, true)
+		callTool(ctx, t, env.tools, sess, "tools__sum", map[string]any{"a": 2, "b": 3}, false)
 	})
 
 	t.Run("forged agent id header does not satisfy the rule", func(t *testing.T) {
 		forging := headerInjector{base: env.ids.b.Bundle.Transport(nil), header: "X-ANS-Agent-Id", value: agentAID}
 		sess := connectMCP(ctx, t, forging)
-		callTool(ctx, t, sess, "tools__sum", map[string]any{"a": 1, "b": 1}, false)
+		callTool(ctx, t, env.tools, sess, "tools__sum", map[string]any{"a": 1, "b": 1}, false)
 	})
 
 	t.Run("another agent cannot resume a session", func(t *testing.T) {
@@ -203,14 +203,23 @@ func toolNames(ctx context.Context, t *testing.T, sess *mcp.ClientSession) map[s
 	return names
 }
 
-func callTool(ctx context.Context, t *testing.T, sess *mcp.ClientSession, name string, args map[string]any, wantAllowed bool) {
+// callTool calls a tool and checks the outcome at the backend as well as at the client: an
+// allowed call must reach the tool server exactly once, and a denied call must never reach it,
+// so a timeout or a verifier outage cannot pass as a denial.
+func callTool(ctx context.Context, t *testing.T, tools *toolServer, sess *mcp.ClientSession, name string, args map[string]any, wantAllowed bool) {
 	t.Helper()
+	before := tools.callCount()
 	_, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	reached := tools.callCount() - before
 	switch {
 	case wantAllowed && err != nil:
 		t.Fatalf("%s: %v", name, err)
+	case wantAllowed && reached != 1:
+		t.Fatalf("%s: the backend recorded %d calls, want 1", name, reached)
 	case !wantAllowed && err == nil:
 		t.Fatalf("%s was allowed; the rule should deny it", name)
+	case !wantAllowed && reached != 0:
+		t.Fatalf("%s was denied to the client but reached the backend %d time(s)", name, reached)
 	case !wantAllowed:
 		t.Logf("%s denied as expected: %v", name, err)
 	}

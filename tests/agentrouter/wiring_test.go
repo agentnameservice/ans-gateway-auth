@@ -4,6 +4,7 @@ package agentrouter
 
 import (
 	"bytes"
+	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,12 +34,12 @@ func TestStandaloneWiring(t *testing.T) {
 		"ANS_ALLOWED_AGENT_ID": spikeAgentID,
 	})
 	waitUntil(t, proc, "gateway to route a chat completion", func() error {
-		return probe(chatRequest(t, chatBody, nil), 200)
+		return probe(chatRequest(t, chatBody, nil), http.StatusOK)
 	})
 
 	t.Run("allow forwards body and sets identity headers", func(t *testing.T) {
 		res := send(t, chatRequest(t, chatBody, nil))
-		if res.Status != 200 {
+		if res.Status != http.StatusOK {
 			t.Fatalf("status %d, body %s", res.Status, res.Body)
 		}
 		up := upstream.lastRequest()
@@ -58,17 +59,17 @@ func TestStandaloneWiring(t *testing.T) {
 		if check == nil {
 			t.Fatal("stub saw no check request")
 		}
-		http := check.GetAttributes().GetRequest().GetHttp()
-		if got := http.GetBody(); got != string(chatBody) {
+		attrs := check.GetAttributes().GetRequest().GetHttp()
+		if got := attrs.GetBody(); got != string(chatBody) {
 			t.Errorf("check body = %q, want %q", got, chatBody)
 		}
-		if got := http.GetMethod(); got != "POST" {
+		if got := attrs.GetMethod(); got != http.MethodPost {
 			t.Errorf("check method = %q", got)
 		}
-		if got := http.GetPath(); got != "/v1/chat/completions" {
+		if got := attrs.GetPath(); got != "/v1/chat/completions" {
 			t.Errorf("check path = %q", got)
 		}
-		if got := http.GetHost(); got != "127.0.0.1:"+strconv.Itoa(gatewayPort) {
+		if got := attrs.GetHost(); got != "127.0.0.1:"+strconv.Itoa(gatewayPort) {
 			t.Errorf("check host = %q", got)
 		}
 		if got := check.GetAttributes().GetContextExtensions()["ans-authz"]; got != "body-forwarded" {
@@ -78,7 +79,7 @@ func TestStandaloneWiring(t *testing.T) {
 
 	t.Run("client-supplied identity header is overwritten", func(t *testing.T) {
 		res := send(t, chatRequest(t, chatBody, map[string]string{"X-ANS-Agent-Id": "attacker", "X-ANS-Spike": "forged"}))
-		if res.Status != 200 {
+		if res.Status != http.StatusOK {
 			t.Fatalf("status %d, body %s", res.Status, res.Body)
 		}
 		up := upstream.lastRequest()
@@ -95,7 +96,7 @@ func TestStandaloneWiring(t *testing.T) {
 		defer stub.setMode(stubAllowWithIdentity)
 		before := upstream.count()
 		res := send(t, chatRequest(t, chatBody, nil))
-		if res.Status != 403 {
+		if res.Status != http.StatusForbidden {
 			t.Fatalf("status %d, want 403; body %s", res.Status, res.Body)
 		}
 		if upstream.count() != before {
@@ -107,7 +108,7 @@ func TestStandaloneWiring(t *testing.T) {
 		stub.setMode(stubDeny)
 		defer stub.setMode(stubAllowWithIdentity)
 		res := send(t, chatRequest(t, chatBody, nil))
-		if res.Status != 401 {
+		if res.Status != http.StatusUnauthorized {
 			t.Fatalf("status %d, want 401; body %s", res.Status, res.Body)
 		}
 		if got := res.Header.Get("WWW-Authenticate"); got != `DPoP algs="ES256"` {
@@ -122,7 +123,7 @@ func TestStandaloneWiring(t *testing.T) {
 		before := len(stubRequests(stub))
 		big := []byte(`{"model":"test-model","messages":[{"role":"user","content":"` + strings.Repeat("x", maxBody) + `"}]}`)
 		res := send(t, chatRequest(t, big, nil))
-		if res.Status != 413 {
+		if res.Status != http.StatusRequestEntityTooLarge {
 			t.Fatalf("status %d, want 413; body %s", res.Status, res.Body)
 		}
 		if got := len(stubRequests(stub)); got != before {
@@ -133,7 +134,7 @@ func TestStandaloneWiring(t *testing.T) {
 	t.Run("verifier outage is reported as 503", func(t *testing.T) {
 		stub.Stop()
 		res := send(t, chatRequest(t, chatBody, nil))
-		if res.Status != 503 {
+		if res.Status != http.StatusServiceUnavailable {
 			t.Fatalf("status %d, want 503; body %s", res.Status, res.Body)
 		}
 	})

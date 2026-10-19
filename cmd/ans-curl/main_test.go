@@ -22,12 +22,13 @@ import (
 )
 
 type seen struct {
-	mu     sync.Mutex
-	method string
-	body   []byte
-	auth   string
-	extra  string
-	count  int
+	mu      sync.Mutex
+	method  string
+	body    []byte
+	auth    string
+	extra   string
+	count   int
+	chunked bool
 }
 
 // newProtectedServer runs an upstream behind the SDK's own DPoP middleware trusting the given
@@ -48,6 +49,7 @@ func newProtectedServer(t *testing.T, rootKey string) (*httptest.Server, *seen) 
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
 		s.method, s.body, s.auth, s.extra = r.Method, body, r.Header.Get("Authorization"), r.Header.Get("X-Extra")
+		s.chunked = len(r.TransferEncoding) > 0
 		s.count++
 		s.mu.Unlock()
 		w.Header().Set("X-Upstream", "yes")
@@ -326,5 +328,55 @@ func TestRunDoesNotFollowRedirects(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "302 Found") || !strings.Contains(out, "Location: "+target.URL+"/elsewhere") {
 		t.Errorf("stdout should show the redirect response itself:\n%s", out)
+	}
+}
+
+func TestRunHelpExitsZero(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"--help"}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("exit %d, want %d", got, exitOK)
+	}
+	if !strings.Contains(stderr.String(), "Usage") {
+		t.Errorf("stderr lacks usage text: %q", stderr.String())
+	}
+}
+
+func TestCleartextWarning(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"http://127.0.0.1:1975/v1/chat/completions", ""},
+		{"http://[::1]:1975/mcp", ""},
+		{"http://localhost:1975/mcp", ""},
+		{"https://gateway.example/v1", ""},
+		{"http://gateway.example:1975/v1", "gateway.example:1975"},
+	}
+	for _, tc := range tests {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := cleartextWarning(u)
+		if (tc.want == "" && got != "") || (tc.want != "" && !strings.Contains(got, tc.want)) {
+			t.Errorf("cleartextWarning(%s) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestRunPostWithoutBodyIsNotChunked(t *testing.T) {
+	t.Parallel()
+	dir, p := writeBundle(t, true)
+	srv, s := newProtectedServer(t, p.RootKeyC2SP)
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"--identity", dir, "-X", "POST", srv.URL + "/empty"}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("exit %d: %s", got, stderr.String())
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.method != http.MethodPost || s.chunked || len(s.body) != 0 {
+		t.Errorf("upstream saw method %s, chunked %v, body %q; want a POST with Content-Length 0", s.method, s.chunked, s.body)
 	}
 }

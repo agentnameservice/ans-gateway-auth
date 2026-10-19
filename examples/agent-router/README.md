@@ -37,15 +37,15 @@ policies.
 | `ans-authz.yaml` | Verifier configuration shared by both recipes; loadable as shipped against the local ANS demo stack |
 | `standalone/aigw-ans-llm.yaml` | `aigw run` config: an LLM route behind the verifier plus an authorization rule |
 | `standalone/aigw-ans-mcp.yaml` | `aigw run` config: an MCP route with identity-based tool rules and header forwarding |
-| `kubernetes/ans-verifier.yaml` | ConfigMap, Deployment (one replica), Service for `ans-authz` |
-| `kubernetes/networkpolicy.yaml` | Who may reach the verifier, the Envoy pods' internal ports, and the MCP tool server |
+| `kubernetes/ans-verifier.yaml` | Namespace, ConfigMap, Deployment (one replica), Service and ReferenceGrant for `ans-authz` |
+| `kubernetes/networkpolicy.yaml` | Who may reach the verifier and what it may reach, the Envoy pods' internal ports, and the MCP tool server |
 | `kubernetes/securitypolicy-gateway.yaml` | Gateway-wide authentication plus an authorization rule for AIGatewayRoutes |
 | `kubernetes/mcproute-ans.yaml` | An MCPRoute with authentication, identity-based tool rules and header forwarding |
 | `kubernetes/envoyproxy-accesslog.yaml` | Access-log sinks that record rejections |
 
 ## Standalone quick start (`aigw run`)
 
-Prerequisites: `aigw` (Agent Router v1.2.0 or later), Go 1.25+, and this repository.
+Prerequisites: `aigw` (Agent Router v1.2.0 or later), Go 1.26+, and this repository.
 
 ```bash
 go build -o bin/ans-authz ./cmd/ans-authz
@@ -103,11 +103,13 @@ Apply order matters because the gateway fails closed:
 
 1. `kubernetes/ans-verifier.yaml` after editing the ConfigMap (transparency log with its pinned
    root keys, `trustedHosts`) and the image (no pipeline publishes one yet: `make docker` builds
-   it for your registry), then wait for `kubectl rollout status deployment/ans-authz` and a 200
-   from `/readyz`. Config changes take effect only after `kubectl rollout restart`, a short
-   fail-closed window, so Kubernetes deployments should point at a real transparency log rather
-   than hourly development keys. Keep the log's keys pinned next to `baseURL`: a verifier with
-   only a URL exits after `startupTimeout` when the log is down and crash-loops.
+   it for your registry), then wait for `kubectl -n ans-authz rollout status deployment/ans-authz`
+   and a 200 from `/readyz`. Config changes take effect only after `kubectl rollout restart`, a
+   short fail-closed window, so Kubernetes deployments should point at a real transparency log
+   rather than hourly development keys. Keep the log's keys pinned next to `baseURL`: a verifier
+   with only a URL exits after `startupTimeout` when the log is down and crash-loops. The verifier
+   gets its own namespace because the Service's label selector is the trust anchor: whoever can
+   create pods there can answer Envoy's checks, so keep that right with the deployer.
 2. `kubernetes/networkpolicy.yaml` and `kubernetes/envoyproxy-accesslog.yaml`.
 3. A canary: `kubernetes/securitypolicy-gateway.yaml` with `targetRefs` pointed at one HTTPRoute
    (the name of one AIGatewayRoute) and a client that already signs.
@@ -130,16 +132,17 @@ externally visible authority to share it, so:
 | Topology | Replay protection | Use when |
 |---|---|---|
 | One local process (`aigw run`) | complete | development and tests |
-| One Deployment, `replicas: 1` | complete, including across restarts: the startup quarantine (2 × `popSkew` + 5 s, 245 s) outlasts every proof the previous pod accepted, so each rollout, drain or preemption is a fail-closed window of that length | the default |
+| One Deployment, `replicas: 1` | complete, including across restarts: the startup quarantine (2 × `popSkew` + 5 s + `terminationGracePeriodSeconds`, 260 s) outlasts every proof the previous pod accepted, so each rollout, drain or preemption is a fail-closed window of that length | the default |
 | Sidecar per Envoy pod | complete only with one Envoy replica and the same startup quarantine | single-replica gateways |
 | Several replicas with the `redis` replay backend | complete; a Redis outage is a fail-closed 503, so run Redis highly available | high availability |
 
 Do not scale the memory-backed Deployment: two in-memory caches each accept a replayed proof
 once, and the cache dies with the process, so `ans-verifier.yaml` keeps a restarted pod out of the
-Service for 2 × `popSkew` + 5 s (the startup probe's `initialDelaySeconds`, the window the verifier
-itself applies after a Redis keyspace loss), a fail-closed 503 window in which every proof the
-previous pod accepted expires. That holds only under `Recreate`, which stops the old pod before the
-new one starts; a surge rollout overlaps them and needs the Redis variant. Consistent-hash load balancing on the `DPoP` header does not help, because Envoy hashes the
+Service for 2 × `popSkew` + 5 s plus `terminationGracePeriodSeconds` (the startup probe's
+`initialDelaySeconds`: the first part is the window the verifier itself applies after a Redis
+keyspace loss, the grace period covers a replaced pod that still answers while it terminates), a
+fail-closed 503 window in which every proof the previous pod accepted expires. `Recreate` keeps
+rollouts from overlapping; a surge rollout overlaps the pods and needs the Redis variant. Consistent-hash load balancing on the `DPoP` header does not help, because Envoy hashes the
 headers of its own gRPC `Check` call, which never carries the client's `DPoP` header. Give the
 single replica a high `priorityClassName`; a PodDisruptionBudget with one replica only blocks
 drains. `replay.maxEntries` bounds the proofs remembered for the 120 s skew window and fails

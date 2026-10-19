@@ -41,6 +41,12 @@ func TestRun(t *testing.T) {
 			wantStderr: "flag provided but not defined",
 		},
 		{
+			name:       "help",
+			args:       func(string) []string { return []string{"--help"} },
+			wantExit:   exitOK,
+			wantStderr: "Usage",
+		},
+		{
 			name: "invalid ans name",
 			args: func(dir string) []string {
 				return []string{"--out", dir, "--ans-name", "not-an-ans-name", "--agent-id", "a"}

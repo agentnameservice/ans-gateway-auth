@@ -22,6 +22,7 @@ spec:
     grpc:
       backendRefs:
         - name: ans-authz
+          namespace: ans-authz   # ReferenceGrant in ans-verifier.yaml
           port: 9191
       # Bounds the bodies the verifier holds at once; its memory limit in ans-verifier.yaml is
       # sized from this value and maxRequestBytes. Requests above the bound queue in Envoy.

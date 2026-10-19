@@ -11,7 +11,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -58,7 +60,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	opts, code := parseArgs(args, stderr)
-	if code != exitOK {
+	if code != exitOK || opts == nil {
 		return code
 	}
 	bundle, err := identity.Load(opts.dir)
@@ -82,6 +84,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "ans-curl:", err)
 		return exitFailure
+	}
+	if warn := cleartextWarning(req.URL); warn != "" {
+		fmt.Fprintln(stderr, "ans-curl: warning:", warn) //nolint:gosec // G705: plain-text output, not HTML
 	}
 	if err := bundle.Attach(req); err != nil {
 		fmt.Fprintln(stderr, "ans-curl:", err)
@@ -108,6 +113,9 @@ func parseArgs(args []string, stderr io.Writer) (*options, int) {
 	fs.DurationVar(&o.timeout, "timeout", defaultTimeout, "request timeout")
 	fs.Var(&o.headers, "H", "extra request header, repeatable (Name: value)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, exitOK
+		}
 		return nil, exitUsage
 	}
 	if o.dir == "" || fs.NArg() != 1 {
@@ -145,6 +153,19 @@ func buildRequest(o *options, body []byte) (*http.Request, error) {
 
 // sendAll sends the signed request once, or twice byte-for-byte when replay is set, so the
 // second response shows the verifier rejecting the reused proof.
+// cleartextWarning names the exposure of sending the proof, receipt and status token over
+// plain HTTP to anything but loopback.
+func cleartextWarning(u *url.URL) string {
+	if u.Scheme != "http" {
+		return ""
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); (ip != nil && ip.IsLoopback()) || host == "localhost" {
+		return ""
+	}
+	return "sending the DPoP proof, receipt and status token in cleartext to " + u.Host
+}
+
 // noRedirect keeps the one signed request single, as curl does without -L: following a
 // redirect would resend a proof bound to the original URL and carry the identity headers to
 // whatever host the redirect names.
@@ -161,7 +182,10 @@ func sendAll(client *http.Client, req *http.Request, body []byte, replay bool, o
 			fmt.Fprintln(out, "--- replaying the identical signed request ---")
 		}
 		attempt := req.Clone(req.Context())
-		attempt.Body = io.NopCloser(bytes.NewReader(body))
+		attempt.Body = http.NoBody
+		if len(body) > 0 {
+			attempt.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		if err := printResponse(client, attempt, out); err != nil {
 			return err
 		}
