@@ -188,6 +188,8 @@ func TestNewAppKeyLoading(t *testing.T) {
 	good := rootKeysServer(t, 200, tr.line+"\n")
 	failing := rootKeysServer(t, 500, "")
 	empty := rootKeysServer(t, 200, "\n")
+	other := newTrust(t)
+	redirecting := redirectServer(t, rootKeysServer(t, 200, other.line+"\n").URL+"/root-keys")
 	tests := []struct {
 		name           string
 		tl             string
@@ -199,6 +201,8 @@ func TestNewAppKeyLoading(t *testing.T) {
 		{name: "remote failure falls back to pinned keys", tl: remoteTLWithPin(failing.URL, tr.line), wantRefreshers: 1},
 		{name: "remote failure without pins is fatal", tl: remoteTL(failing.URL), wantErr: "no root keys after"},
 		{name: "remote without keys is fatal", tl: remoteTL(empty.URL), wantErr: "no root keys after"},
+		{name: "redirect without pins is fatal", tl: remoteTL(redirecting.URL), wantErr: "no root keys after"},
+		{name: "redirect is not followed and pinned keys stay the only trust", tl: remoteTLWithPin(redirecting.URL, tr.line), wantRefreshers: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

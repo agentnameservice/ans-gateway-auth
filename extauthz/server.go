@@ -54,11 +54,12 @@ type ServerTLS struct {
 type Server struct {
 	authv3.UnimplementedAuthorizationServer
 
-	decider Decider
-	logger  *slog.Logger
-	tls     *tls.Config
-	maxRecv int
-	drain   time.Duration
+	decider         Decider
+	logger          *slog.Logger
+	tls             *tls.Config
+	maxRecv         int
+	drain           time.Duration
+	claimsNamespace string
 }
 
 // Option configures a Server.
@@ -82,6 +83,16 @@ func WithMaxContentBytes(n int64) Option {
 	return func(s *Server) { s.maxRecv = int(n) + recvHeadroom }
 }
 
+// WithTokenClaimsNamespace names the filter_metadata namespace forwarded
+// access-token claims are read from; the default is MetadataNamespace.
+func WithTokenClaimsNamespace(ns string) Option {
+	return func(s *Server) {
+		if ns != "" {
+			s.claimsNamespace = ns
+		}
+	}
+}
+
 // WithDrainTimeout bounds the graceful stop at shutdown.
 func WithDrainTimeout(d time.Duration) Option {
 	return func(s *Server) { s.drain = d }
@@ -91,10 +102,11 @@ func WithDrainTimeout(d time.Duration) Option {
 // Observer; the server is transport only.
 func NewServer(v Decider, opts ...Option) *Server {
 	s := &Server{
-		decider: v,
-		logger:  slog.New(slog.DiscardHandler),
-		maxRecv: int(authz.DefaultMaxContentBytes) + recvHeadroom,
-		drain:   DefaultDrainTimeout,
+		decider:         v,
+		logger:          slog.New(slog.DiscardHandler),
+		maxRecv:         int(authz.DefaultMaxContentBytes) + recvHeadroom,
+		claimsNamespace: MetadataNamespace,
+		drain:           DefaultDrainTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -129,7 +141,7 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 
 func (s *Server) check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
 	start := time.Now()
-	r, err := FromCheckRequest(req)
+	r, err := FromCheckRequest(req, s.claimsNamespace)
 	if err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "malformed CheckRequest", slog.String("error", err.Error()))
 		return ToCheckResponse(authz.Decision{Deny: &authz.Denial{

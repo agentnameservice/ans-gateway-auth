@@ -209,7 +209,7 @@ func TestKeyringRefreshForCooldowns(t *testing.T) {
 		t.Fatalf("Status() has %d entries, want 1", len(status))
 	}
 	st := status[0]
-	if st.Name != "tl" || st.LastError != "boom" {
+	if st.Name != "tl" || st.LastError == nil || st.LastError.Error() != "boom" {
 		t.Fatalf("Status() = %+v, want name tl and the last failure message", st)
 	}
 	if st.LastFailure == nil || !st.LastFailure.Equal(start) {
@@ -394,7 +394,7 @@ func TestKeyringRefreshForSourceTimeout(t *testing.T) {
 		t.Fatalf("observer saw %+v, want one deadline-exceeded refresh", refreshes)
 	}
 	st := k.Status()[0]
-	if st.LastFailure == nil || st.LastError == "" || st.LastSuccess != nil {
+	if st.LastFailure == nil || st.LastError == nil || st.LastSuccess != nil {
 		t.Fatalf("Status() = %+v, want a failure and no success", st)
 	}
 }
@@ -421,7 +421,7 @@ func TestKeyringRefreshForGainsKey(t *testing.T) {
 		t.Fatalf("Get() after refresh = %v, %v", tk, err)
 	}
 	st := k.Status()[0]
-	if st.Keys != 1 || st.LastSuccess == nil || st.LastFailure != nil || st.LastError != "" {
+	if st.Keys != 1 || st.LastSuccess == nil || st.LastFailure != nil || st.LastError != nil {
 		t.Fatalf("Status() = %+v, want 1 key and a clean success", st)
 	}
 	refreshes := obs.refreshRecords()
@@ -476,7 +476,7 @@ func TestKeyringRefreshForPartialFailure(t *testing.T) {
 	if status[0].LastSuccess == nil || status[0].LastFailure != nil {
 		t.Fatalf("good status = %+v", status[0])
 	}
-	if status[1].LastSuccess != nil || status[1].LastFailure == nil || status[1].LastError != "down" {
+	if status[1].LastSuccess != nil || status[1].LastFailure == nil || status[1].LastError == nil || status[1].LastError.Error() != "down" {
 		t.Fatalf("bad status = %+v", status[1])
 	}
 	if status[2].LastSuccess != nil || status[2].LastFailure != nil {

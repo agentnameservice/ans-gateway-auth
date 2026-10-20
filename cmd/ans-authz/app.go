@@ -118,6 +118,7 @@ func (a *app) buildServer(logger *slog.Logger) error {
 	opts := []extauthz.Option{
 		extauthz.WithLogger(logger),
 		extauthz.WithMaxContentBytes(a.cfg.MaxContentBytes),
+		extauthz.WithTokenClaimsNamespace(a.cfg.GRPC.TokenClaimsNamespace),
 	}
 	tlsCfg, err := serverTLS(a.cfg)
 	if err != nil {
@@ -140,6 +141,18 @@ func serverTLS(cfg config.Config) (*tls.Config, error) {
 	return extauthz.ServerTLS{CertFile: t.CertFile, KeyFile: t.KeyFile, ClientCAFile: t.ClientCAFile}.Config()
 }
 
+// trustAnchorClient fetches root keys without following redirects: the
+// configured URL is the trust anchor, so a 3xx from it (a hijacked log, a
+// compromised CDN) must fail the fetch rather than move it to another host.
+func trustAnchorClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 // loadKeys builds the key store for one transparency log. Pinned keys load
 // immediately; a baseURL is fetched with retries until startupTimeout, and a
 // failed fetch is fatal only when no pinned key is available either.
@@ -152,7 +165,7 @@ func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*keyStor
 	if tl.BaseURL == "" {
 		return newKeyStore(tl.Name, pinned, nil, logger), false, nil
 	}
-	clientOpts := []scitt.HTTPClientOption{scitt.WithTimeout(tl.Timeout)}
+	clientOpts := []scitt.HTTPClientOption{scitt.WithHTTPClient(trustAnchorClient(tl.Timeout))}
 	if tl.AllowInsecure {
 		clientOpts = append(clientOpts, scitt.WithAllowInsecureTransport())
 	}
@@ -345,12 +358,15 @@ type replayStatus struct {
 	KeyspaceResetUntil *time.Time `json:"keyspaceResetUntil,omitempty"`
 }
 
+// keyStatus names only the class of the last fetch failure: the listener is
+// unauthenticated, and the error text carries hostnames and addresses, which
+// the log keeps.
 type keyStatus struct {
-	Name        string     `json:"name"`
-	Keys        int        `json:"keys"`
-	LastSuccess *time.Time `json:"lastSuccess,omitempty"`
-	LastFailure *time.Time `json:"lastFailure,omitempty"`
-	LastError   string     `json:"lastError,omitempty"`
+	Name          string     `json:"name"`
+	Keys          int        `json:"keys"`
+	LastSuccess   *time.Time `json:"lastSuccess,omitempty"`
+	LastFailure   *time.Time `json:"lastFailure,omitempty"`
+	LastErrorKind string     `json:"lastErrorKind,omitempty"`
 }
 
 func replayStatusOf(st replay.Stats) replayStatus {
@@ -369,13 +385,17 @@ func replayStatusOf(st replay.Stats) replayStatus {
 func keyStatusOf(sources []authz.SourceStatus) []keyStatus {
 	out := make([]keyStatus, 0, len(sources))
 	for _, s := range sources {
-		out = append(out, keyStatus{Name: s.Name, Keys: s.Keys, LastSuccess: s.LastSuccess, LastFailure: s.LastFailure, LastError: s.LastError})
+		out = append(out, keyStatus{Name: s.Name, Keys: s.Keys, LastSuccess: s.LastSuccess, LastFailure: s.LastFailure, LastErrorKind: errorKind(s.LastError)})
 	}
 	return out
 }
 
 // readyz is 200 only while serving with keys for every transparency log and,
-// when required, a reachable replay backend.
+// when required, a reachable replay backend. It stays 200 during a
+// keyspace-reset fail-closed window on purpose: that event is store-wide, so
+// taking every replica out of the Service would leave no endpoints where fast
+// 503s with Retry-After serve clients better. A single replica that cannot
+// reach the store is what requireReplayBackend removes from rotation.
 func (a *app) readyz(w http.ResponseWriter, _ *http.Request) {
 	r := readiness{Replay: replayStatusOf(a.cache.Stats()), TransparencyLogs: keyStatusOf(a.keyring.Status())}
 	switch lifecycle(a.state.Load()) {

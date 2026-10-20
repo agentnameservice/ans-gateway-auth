@@ -51,6 +51,7 @@ func (s *keyStore) DoRefresh(ctx context.Context) error {
 	}
 	lines, err := s.client.FetchRootKeys(ctx)
 	if err != nil {
+		s.logger.WarnContext(ctx, "root-key fetch failed", "error", err)
 		return fmt.Errorf("fetch root keys: %w", err)
 	}
 	merged, result := s.pinned.MergeFrom(lines)

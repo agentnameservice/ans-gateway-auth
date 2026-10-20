@@ -114,6 +114,7 @@ replay: {type: memory, maxEntries: 100000}
 #   redis: {addr: replay-redis:6379, passwordEnv: ANS_AUTHZ_REDIS_PASSWORD, tls: true, timeout: 500ms}
 grpc:
   listen: 127.0.0.1:9191
+  tokenClaimsNamespace: ans-authz   # the only filter_metadata namespace read for forwarded token claims
   # tls: {certFile: ..., keyFile: ..., clientCAFile: ...}   # required for a non-loopback listener; loaded at startup, rotation needs a restart
   # allowInsecureListen: true                               # only inside a mesh that provides mutual TLS
 httpListen: 127.0.0.1:9192
@@ -178,6 +179,8 @@ startup and samples every 15 s:
   a non-zero `db`), for example
   `ACL SETUSER ans-authz on >password ~ans-authz:* +set +get +info -@all` (every key the
   verifier writes carries the `ans-authz:` prefix).
+- `tls: true` for any store that is not on loopback: proof identifiers and the keyspace sentinel
+  otherwise travel in plaintext, which the verifier warns about at startup.
 - `appendonly yes` with `appendfsync always` (or `everysec`, accepting one second of exposure):
   a restart that loses recent records is a replay window, so the verifier refuses to start
   against a store without AOF and fails closed if it is switched off later. Never restore the
@@ -219,6 +222,12 @@ read access to that secret.
   capacity alerts below; the decision log carries the ANS name behind every allow, which
   identifies a flooding caller. A per-identity quota inside the verifier, applied before the
   record is written, is planned.
+- The verifier reads forwarded token claims from one `filter_metadata` namespace,
+  `grpc.tokenClaimsNamespace` (default `ans-authz`, the one the recipes' `protocol.grpc.metadata`
+  writes), and never falls back to `envoy.filters.http.jwt_authn`: every filter in the chain can
+  write there, so with `requireTokenClaims: true` a forged `cnf.jkt` in that namespace would pass
+  the binding check. A gateway whose JWT filter can only write that namespace must name it
+  explicitly, and the verifier warns about the trust it implies at startup.
 - For DPoP-bound access tokens, validate the token at the gateway with the `DPoP` scheme and
   forward its claims to the verifier (see the OAuth recipe); the CEL rule
   `has(jwt.cnf) && jwt.cnf.jkt == extauthz.jkt` is the second layer. Do not accept `Bearer` and
@@ -263,7 +272,14 @@ header fields, and client-influenced fields are truncated.
 
 `/readyz` returns 200 only while serving with root keys for every transparency log and, when
 `readiness.requireReplayBackend` is set, a reachable replay backend; it is 503 while starting and
-from the moment shutdown begins. On `SIGTERM` the health service flips to `NOT_SERVING`, in-flight
+from the moment shutdown begins. It stays 200 during a keyspace-reset fail-closed window on
+purpose: that event is store-wide, so taking every replica out of the Service would leave no
+endpoints where fast 503s with `Retry-After` serve clients better; a single replica that cannot
+reach the store is what `requireReplayBackend` removes from rotation. Per-log status carries the
+class of the last fetch failure as `lastErrorKind` (`timeout`, `dns_error`, `tls_error`,
+`connection_error`, `http_error`, `other`); the error text, with hostnames, stays in the log. The
+root-key fetch never follows a redirect: the configured URL is the trust anchor, and a 3xx from it
+fails the fetch. On `SIGTERM` the health service flips to `NOT_SERVING`, in-flight
 checks drain for up to ten seconds, then the process exits. The HTTP listener binds only after the
 trust material is loaded, which can take up to `startupTimeout` per transparency log, so give the
 container a startup probe on `/readyz` whose `failureThreshold x periodSeconds` covers that, or pin

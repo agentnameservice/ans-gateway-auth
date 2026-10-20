@@ -25,6 +25,9 @@ const (
 	DefaultKeyRefreshInterval     time.Duration = 24 * time.Hour
 	DefaultStartupTimeout         time.Duration = 30 * time.Second
 	DefaultTransparencyLogTimeout time.Duration = time.Second
+	// DefaultTokenClaimsNamespace is the filter_metadata namespace the gateway
+	// recipes write validated access-token claims to.
+	DefaultTokenClaimsNamespace = "ans-authz"
 )
 
 // Replay backend types.
@@ -98,6 +101,9 @@ type GRPCConfig struct {
 	// AllowInsecureListen admits a plaintext non-loopback listener, for
 	// deployments where a mesh provides mutual TLS.
 	AllowInsecureListen bool `yaml:"allowInsecureListen"`
+	// TokenClaimsNamespace is the filter_metadata namespace forwarded
+	// access-token claims are read from; no other namespace is consulted.
+	TokenClaimsNamespace string `yaml:"tokenClaimsNamespace"`
 }
 
 // TLSConfig names the server certificate and, for mutual TLS, the client CA.
@@ -129,7 +135,7 @@ func Default() Config {
 	return Config{
 		Config:             authz.DefaultConfig(),
 		Replay:             ReplayConfig{Type: ReplayTypeMemory, MaxEntries: DefaultReplayMaxEntries},
-		GRPC:               GRPCConfig{Listen: DefaultGRPCListen},
+		GRPC:               GRPCConfig{Listen: DefaultGRPCListen, TokenClaimsNamespace: DefaultTokenClaimsNamespace},
 		HTTPListen:         DefaultHTTPListen,
 		LogLevel:           DefaultLogLevel,
 		KeyRefreshInterval: DefaultKeyRefreshInterval,

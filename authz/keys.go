@@ -50,13 +50,13 @@ type SourceStatus struct {
 	Keys        int
 	LastSuccess *time.Time
 	LastFailure *time.Time
-	LastError   string
+	LastError   error
 }
 
 type sourceState struct {
 	lastSuccess time.Time
 	lastFailure time.Time
-	lastError   string
+	lastError   error
 }
 
 // refreshRun is one in-flight fetch; ok is written before done is closed. all
@@ -332,7 +332,7 @@ func (k *Keyring) record(targets []int, results []error) bool {
 	for _, i := range targets {
 		if err := results[i]; err != nil {
 			k.states[i].lastFailure = now
-			k.states[i].lastError = err.Error()
+			k.states[i].lastError = err
 			continue
 		}
 		ok = true

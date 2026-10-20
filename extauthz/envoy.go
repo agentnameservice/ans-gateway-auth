@@ -24,14 +24,13 @@ import (
 )
 
 const (
-	// MetadataNamespace is the filter_metadata namespace the gateway recipe
-	// uses to forward validated access-token claims
-	// (protocol.grpc.metadata: {ans-authz: '{"jwt_payload": jwt}'}).
+	// MetadataNamespace is the default filter_metadata namespace for forwarded
+	// access-token claims, the one the gateway recipes write
+	// (protocol.grpc.metadata: {ans-authz: '{"jwt_payload": jwt}'}). No other
+	// namespace is read: Envoy's jwt_authn namespace can be written by any
+	// filter in the chain.
 	MetadataNamespace = "ans-authz"
-	// CompatMetadataNamespace is the Envoy jwt_authn namespace agentgateway
-	// fills when no explicit metadata expression is configured.
-	CompatMetadataNamespace = "envoy.filters.http.jwt_authn"
-	jwtPayloadKey           = "jwt_payload"
+	jwtPayloadKey     = "jwt_payload"
 
 	partialBodyHeader = "X-Envoy-Auth-Partial-Body"
 	requestIDHeader   = "X-Request-Id"
@@ -49,7 +48,7 @@ var ErrMalformedCheckRequest = errors.New("extauthz: CheckRequest has no HTTP re
 // FromCheckRequest maps an Envoy CheckRequest to the transport-neutral
 // request. The scheme is carried for logging only; the verifier never trusts
 // it.
-func FromCheckRequest(req *authv3.CheckRequest) (*authz.Request, error) {
+func FromCheckRequest(req *authv3.CheckRequest, claimsNamespace string) (*authz.Request, error) {
 	attrs := req.GetAttributes()
 	hr := attrs.GetRequest().GetHttp()
 	if hr == nil {
@@ -81,7 +80,7 @@ func FromCheckRequest(req *authv3.CheckRequest) (*authz.Request, error) {
 		Body:                body,
 		Partial:             partial,
 		Context:             attrs.GetContextExtensions(),
-		TokenClaims:         tokenClaims(attrs.GetMetadataContext()),
+		TokenClaims:         tokenClaims(attrs.GetMetadataContext(), claimsNamespace),
 		RequestID:           id,
 		RequestIDFromClient: fromClient,
 	}, nil
@@ -125,14 +124,12 @@ func pseudoHeader(hr *authv3.AttributeContext_HttpRequest, name string) string {
 	return hr.GetHeaders()[name]
 }
 
-// tokenClaims returns the validated access-token claims the gateway forwarded,
-// from the recipe's explicit namespace first, else the jwt_authn namespace.
-func tokenClaims(md *corev3.Metadata) map[string]any {
-	for _, ns := range []string{MetadataNamespace, CompatMetadataNamespace} {
-		payload := md.GetFilterMetadata()[ns].GetFields()[jwtPayloadKey]
-		if s := payload.GetStructValue(); s != nil {
-			return s.AsMap()
-		}
+// tokenClaims returns the validated access-token claims the gateway forwarded
+// in the configured namespace, and nothing from any other.
+func tokenClaims(md *corev3.Metadata, namespace string) map[string]any {
+	payload := md.GetFilterMetadata()[namespace].GetFields()[jwtPayloadKey]
+	if s := payload.GetStructValue(); s != nil {
+		return s.AsMap()
 	}
 	return nil
 }

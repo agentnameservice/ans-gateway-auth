@@ -40,6 +40,9 @@ replay:
   maxEntries: 100000
 grpc:
   listen: 127.0.0.1:9191
+  # Forwarded token claims are read from this filter_metadata namespace only,
+  # the one config-oauth.yaml writes with protocol.grpc.metadata.
+  tokenClaimsNamespace: ans-authz
 httpListen: 127.0.0.1:9192
 logLevel: info
 keyRefreshInterval: 24h

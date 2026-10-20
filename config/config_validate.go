@@ -19,6 +19,10 @@ import (
 // before the verifier answers.
 const GatewayExtAuthzBudget time.Duration = 2 * time.Second
 
+// envoyJWTAuthnNamespace is where Envoy's jwt_authn filter writes payloads; any
+// filter in the chain can write there too.
+const envoyJWTAuthnNamespace = "envoy.filters.http.jwt_authn"
+
 // Validate reports the first configuration error, starting with the authz
 // policy rules.
 func (c Config) Validate() error {
@@ -69,7 +73,22 @@ func (c Config) Warnings() []string {
 	if !c.RequireTokenClaims {
 		warnings = append(warnings, "requireTokenClaims is false; an opaque DPoP-bound access token is forwarded without its cnf.jkt check, which the upstream must then enforce (RFC 9449 section 7.1)")
 	}
+	if c.GRPC.TokenClaimsNamespace == envoyJWTAuthnNamespace {
+		warnings = append(warnings, "grpc.tokenClaimsNamespace is envoy.filters.http.jwt_authn, which every filter in the chain can write; forwarded cnf.jkt claims are only as trustworthy as that chain")
+	}
+	if r := c.Replay.Redis; c.Replay.Type == ReplayTypeRedis && r != nil && !r.TLS && !isLoopbackHost(hostOf(r.Addr)) {
+		warnings = append(warnings, fmt.Sprintf(
+			"replay.redis.tls is false for non-loopback %s; proof identifiers and the keyspace sentinel travel in plaintext", r.Addr))
+	}
 	return warnings
+}
+
+// hostOf strips the port from a host:port address.
+func hostOf(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 func (c Config) validateTransparencyLogs() error {
@@ -191,6 +210,9 @@ func (g GRPCConfig) validate() error {
 	host, err := validateListen("grpc.listen", g.Listen)
 	if err != nil {
 		return err
+	}
+	if g.TokenClaimsNamespace == "" {
+		return errors.New("config: grpc.tokenClaimsNamespace is required")
 	}
 	if g.TLS != nil {
 		return g.TLS.validate()

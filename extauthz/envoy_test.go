@@ -60,7 +60,7 @@ func TestFromCheckRequestRejectsMissingHTTP(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := FromCheckRequest(tt.req); !errors.Is(err, ErrMalformedCheckRequest) {
+			if _, err := FromCheckRequest(tt.req, MetadataNamespace); !errors.Is(err, ErrMalformedCheckRequest) {
 				t.Fatalf("err = %v, want ErrMalformedCheckRequest", err)
 			}
 		})
@@ -188,6 +188,21 @@ func TestFromCheckRequestMapping(t *testing.T) {
 	})
 }
 
+func TestFromCheckRequestConfiguredClaimsNamespace(t *testing.T) {
+	t.Parallel()
+	const ns = "envoy.filters.http.jwt_authn"
+	claims := structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{"sub": structpb.NewStringValue("x")}})
+	req := httpRequest(nil)
+	req.GetAttributes().MetadataContext = claimsMetadata(ns, claims)
+	r, err := FromCheckRequest(req, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.TokenClaims["sub"] != "x" {
+		t.Fatalf("TokenClaims = %v, want the claims from the configured namespace", r.TokenClaims)
+	}
+}
+
 type mappingCase struct {
 	name   string
 	mutate func(*authv3.AttributeContext_HttpRequest)
@@ -204,7 +219,7 @@ func runMappingCases(t *testing.T, tests []mappingCase) {
 			if tt.attrs != nil {
 				tt.attrs(req.GetAttributes())
 			}
-			r, err := FromCheckRequest(req)
+			r, err := FromCheckRequest(req, MetadataNamespace)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -241,11 +256,13 @@ func TestFromCheckRequestMetadata(t *testing.T) {
 			},
 		},
 		{
-			name:  "claims from the compat namespace",
-			attrs: func(a *authv3.AttributeContext) { a.MetadataContext = claimsMetadata(CompatMetadataNamespace, jkt) },
+			name: "claims in another namespace are ignored",
+			attrs: func(a *authv3.AttributeContext) {
+				a.MetadataContext = claimsMetadata("envoy.filters.http.jwt_authn", jkt)
+			},
 			check: func(t *testing.T, r *authz.Request) {
-				if r.TokenClaims == nil {
-					t.Fatal("TokenClaims = nil")
+				if r.TokenClaims != nil {
+					t.Fatalf("TokenClaims = %v, want nil", r.TokenClaims)
 				}
 			},
 		},

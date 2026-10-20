@@ -182,9 +182,17 @@ func TestAgentgatewayOAuth(t *testing.T) {
 		expect(t, resp, respBody, http.StatusUnauthorized, "TOKEN_BINDING_MISMATCH")
 	})
 
-	// agentgateway forwards validated claims in the jwt_authn namespace even
-	// without an explicit metadata expression, so "claims not forwarded" only
-	// happens when the route validates no token at all.
+	// agentgateway also fills Envoy's jwt_authn namespace when no metadata
+	// expression is configured; the verifier reads only its configured
+	// namespace, so a route without the expression is as misconfigured as one
+	// that validates no token at all.
+	t.Run("claims outside the configured namespace are a misconfiguration", func(t *testing.T) {
+		gw.stop()
+		gw = startGateway(t, e, writeFile(t, dir, "config-oauth-no-metadata.yaml", mustReplace(t, recipe, metadataBlock, "")))
+		resp, respBody := do(t, s.request(t, http.MethodPost, base+"/echo", body, withAuth("DPoP", boundToken())))
+		expect(t, resp, respBody, http.StatusServiceUnavailable, "MISCONFIGURED")
+	})
+
 	t.Run("bound token without gateway validation is a misconfiguration", func(t *testing.T) {
 		gw.stop()
 		gw = startGateway(t, e, writeFile(t, dir, "config-oauth-no-jwtauth.yaml", withoutJWTAuth(t, recipe)))

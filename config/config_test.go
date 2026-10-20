@@ -81,7 +81,7 @@ func TestDefault(t *testing.T) {
 	want := Config{
 		Config:             authz.DefaultConfig(),
 		Replay:             ReplayConfig{Type: "memory", MaxEntries: 100000},
-		GRPC:               GRPCConfig{Listen: "127.0.0.1:9191"},
+		GRPC:               GRPCConfig{Listen: "127.0.0.1:9191", TokenClaimsNamespace: DefaultTokenClaimsNamespace},
 		HTTPListen:         "127.0.0.1:9192",
 		LogLevel:           "info",
 		KeyRefreshInterval: 24 * time.Hour,
@@ -168,7 +168,7 @@ readiness:
 			{Name: "pinned", RootKeys: []string{rootKey}, Timeout: time.Second},
 		},
 		Replay:             ReplayConfig{Type: "memory", MaxEntries: 5000},
-		GRPC:               GRPCConfig{Listen: ":9191", TLS: &TLSConfig{CertFile: files.cert, KeyFile: files.key, ClientCAFile: files.ca}},
+		GRPC:               GRPCConfig{Listen: ":9191", TLS: &TLSConfig{CertFile: files.cert, KeyFile: files.key, ClientCAFile: files.ca}, TokenClaimsNamespace: DefaultTokenClaimsNamespace},
 		HTTPListen:         "0.0.0.0:9192",
 		LogLevel:           "debug",
 		KeyRefreshInterval: time.Hour,
@@ -300,6 +300,9 @@ func TestConfigValidate(t *testing.T) {
 		{name: "baseURL with credentials", mutate: func(c *Config) {
 			c.TransparencyLogs[0].BaseURL = "https://user:secret@tl.example.com"
 		}, wantErr: "credentials"},
+		{name: "empty token claims namespace", mutate: func(c *Config) {
+			c.GRPC.TokenClaimsNamespace = ""
+		}, wantErr: "tokenClaimsNamespace"},
 		{name: "baseURL with path", mutate: func(c *Config) {
 			c.TransparencyLogs[0].BaseURL = "https://tl.example.com/api"
 		}},
@@ -519,6 +522,33 @@ func TestConfigWarnings(t *testing.T) {
 			name: "token claims not required", checkTimeout: 1500 * time.Millisecond,
 			mutate: func(c *Config) { c.RequireTokenClaims = false },
 			want:   []string{"requireTokenClaims is false; an opaque DPoP-bound access token is forwarded without its cnf.jkt check, which the upstream must then enforce (RFC 9449 section 7.1)"},
+		},
+		{
+			name: "jwt_authn claims namespace", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) { c.GRPC.TokenClaimsNamespace = "envoy.filters.http.jwt_authn" },
+			want:   []string{"grpc.tokenClaimsNamespace is envoy.filters.http.jwt_authn, which every filter in the chain can write; forwarded cnf.jkt claims are only as trustworthy as that chain"},
+		},
+		{
+			name: "plaintext redis on a non-loopback host", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.Replay.Type = ReplayTypeRedis
+				c.Replay.Redis = &RedisConfig{Addr: "replay-redis:6379"}
+			},
+			want: []string{"replay.redis.tls is false for non-loopback replay-redis:6379; proof identifiers and the keyspace sentinel travel in plaintext"},
+		},
+		{
+			name: "plaintext redis on loopback is fine", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.Replay.Type = ReplayTypeRedis
+				c.Replay.Redis = &RedisConfig{Addr: "127.0.0.1:6379"}
+			},
+		},
+		{
+			name: "redis with tls is fine", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.Replay.Type = ReplayTypeRedis
+				c.Replay.Redis = &RedisConfig{Addr: "replay-redis:6379", TLS: true}
+			},
 		},
 	}
 	for _, tc := range tests {

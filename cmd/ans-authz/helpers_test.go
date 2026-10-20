@@ -76,6 +76,16 @@ func rootKeysServer(t *testing.T, status int, body string) *httptest.Server {
 	return srv
 }
 
+// redirectServer answers every request with a 302 to target.
+func redirectServer(t *testing.T, target string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func writeConfig(t *testing.T, yaml string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ans-authz.yaml")

@@ -149,7 +149,7 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 	if !strings.Contains(logs, "root keys refreshed") {
 		t.Fatalf("key-set changes must be logged: %s", logs)
 	}
-	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, fmt.Sprintf("a/%x", a.kid)) {
+	if !strings.Contains(logs, `level=WARN msg="root keys refreshed"`) || !strings.Contains(logs, fmt.Sprintf("a/%x", a.kid)) {
 		t.Fatalf("withdrawing a key must be logged at WARN naming the key: %s", logs)
 	}
 	if !strings.Contains(logs, fmt.Sprintf("b/%x", b.kid)) {
