@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
@@ -74,6 +75,44 @@ func newServer(t *testing.T, keys scitt.KeyLookup) (*httptest.Server, *recorder)
 	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv, rec
+}
+
+// newRedirectingServer is newServer with two routes behind the middleware: /old
+// answers with a same-host redirect to /new, which records the caller.
+func newRedirectingServer(t *testing.T, keys scitt.KeyLookup) (*httptest.Server, *recorder) {
+	t.Helper()
+	rec := &recorder{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/old", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/new", http.StatusFound)
+	})
+	mux.HandleFunc("/new", func(w http.ResponseWriter, r *http.Request) {
+		id, ok := pop.CallerFromContext(r.Context())
+		if !ok {
+			http.Error(w, "no caller in context", http.StatusInternalServerError)
+			return
+		}
+		rec.add(id, nil)
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewUnstartedServer(nil)
+	authenticate := pop.Middleware(keys, pop.NewMemoryReplayCache(t.Context(), 0),
+		pop.WithTrustedHosts(srv.Listener.Addr().String()),
+		pop.WithMiddlewareLogger(slog.New(slog.DiscardHandler)))
+	srv.Config.Handler = authenticate(mux)
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, rec
+}
+
+// newRedirector starts a plain server that redirects every request to target.
+func newRedirector(t *testing.T, target string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func newRequest(t *testing.T, method, rawURL string, body io.Reader) *http.Request {
@@ -399,5 +438,69 @@ func TestHeaders(t *testing.T) {
 	}
 	if h := (&identity.Bundle{}).Headers(); len(h) != 0 {
 		t.Fatalf("empty bundle Headers = %v, want none", h)
+	}
+}
+
+func TestClientStopsAtRedirect(t *testing.T) {
+	p := provision(t)
+	protected, rec := newServer(t, p.KeyLookup)
+	redirector := newRedirector(t, protected.URL+"/mcp")
+
+	base := &http.Client{Timeout: 7 * time.Second}
+	client := p.Bundle.Client(base)
+	if client.Timeout != base.Timeout || base.Transport != nil || base.CheckRedirect != nil {
+		t.Fatal("Client must copy base's settings without modifying base")
+	}
+	if status := do(t, client, newRequest(t, http.MethodGet, redirector.URL+"/start", nil)); status != http.StatusFound {
+		t.Fatalf("status = %d, want the redirect itself (%d)", status, http.StatusFound)
+	}
+	if n := rec.count(); n != 0 {
+		t.Fatalf("the redirect target received %d signed request(s), want none", n)
+	}
+	if status := do(t, p.Bundle.Client(nil), newRequest(t, http.MethodGet, protected.URL+"/mcp", nil)); status != http.StatusOK {
+		t.Fatalf("direct request through Client(nil): status = %d, want %d", status, http.StatusOK)
+	}
+	assertRecorded(t, rec, 1, "")
+}
+
+func TestTransportRefusesCrossHostRedirect(t *testing.T) {
+	p := provision(t)
+	protected, rec := newServer(t, p.KeyLookup)
+	redirector := newRedirector(t, protected.URL+"/mcp")
+
+	client := &http.Client{Transport: p.Bundle.Transport(nil)}
+	resp, err := client.Do(newRequest(t, http.MethodGet, redirector.URL+"/start", nil))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("the transport followed a cross-host redirect with identity headers")
+	}
+	if !strings.Contains(err.Error(), "refusing to follow a redirect") {
+		t.Fatalf("error = %v, want the transport's redirect refusal", err)
+	}
+	if n := rec.count(); n != 0 {
+		t.Fatalf("the redirect target received %d signed request(s), want none", n)
+	}
+}
+
+func TestTransportFollowsSameHostRedirect(t *testing.T) {
+	p := provision(t)
+	srv, rec := newRedirectingServer(t, p.KeyLookup)
+	client := &http.Client{Transport: p.Bundle.Transport(nil)}
+	if status := do(t, client, newRequest(t, http.MethodGet, srv.URL+"/old", nil)); status != http.StatusOK {
+		t.Fatalf("status = %d, want %d after a same-host redirect", status, http.StatusOK)
+	}
+	assertRecorded(t, rec, 1, "")
+}
+
+func TestTransportRefusesSchemeDowngrade(t *testing.T) {
+	p := provision(t)
+	base := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("the base transport must not be reached")
+		return nil, errors.New("unreachable")
+	})
+	hop := newRequest(t, http.MethodGet, "http://gateway.example/mcp", nil)
+	hop.Response = &http.Response{Request: newRequest(t, http.MethodGet, "https://gateway.example/mcp", nil)}
+	if _, err := p.Bundle.Transport(base).RoundTrip(hop); err == nil || !strings.Contains(err.Error(), "refusing to follow a redirect") {
+		t.Fatalf("error = %v, want the transport's redirect refusal", err)
 	}
 }

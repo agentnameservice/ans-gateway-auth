@@ -45,6 +45,10 @@ data:
     maxContentBytes: 1048576
     requireReceipt: true
     stripIdentityHeaders: true
+    # WARNING: Envoy Gateway forwards no validated JWT claims, so a DPoP-bound access token
+    # is passed on without its cnf.jkt binding being checked here; the upstream MUST enforce
+    # token binding (RFC 9449 section 7.1). Set to true only when the gateway forwards
+    # validated token claims to the verifier.
     requireTokenClaims: false
     requiredContext:
       key: ans-authz

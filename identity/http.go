@@ -58,14 +58,30 @@ func (b *Bundle) Sign(ctx context.Context, method, rawURL string, body []byte, o
 // before handing the clone to base (http.DefaultTransport when nil). The
 // caller's request is never modified; its body is buffered once so the proof
 // binds the content digest and base can rewind the clone's body on a retry.
-// Redirect policy belongs to the http.Client: every hop the client follows is
-// signed afresh for its own URL and carries the receipt and status token, so
-// restrict CheckRedirect to hosts that may see them.
+// A redirect hop the http.Client follows is signed afresh for its own URL and
+// carries the receipt and status token, so the transport refuses hops to a
+// different scheme or host; Client goes further and follows no redirect at all.
 func (b *Bundle) Transport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	return &transport{bundle: b, base: base}
+}
+
+// Client returns a copy of base (a zero http.Client when nil) that signs every
+// request through Transport and stops at the first response instead of
+// following redirects, so a 3xx can never carry a fresh proof, the receipt or
+// the status token to another URL. Callers that must follow redirects set their
+// own CheckRedirect on the returned client; Transport still refuses hops to a
+// different scheme or host.
+func (b *Bundle) Client(base *http.Client) *http.Client {
+	c := http.Client{}
+	if base != nil {
+		c = *base
+	}
+	c.Transport = b.Transport(c.Transport)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
 }
 
 type transport struct {
@@ -74,6 +90,9 @@ type transport struct {
 }
 
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := sameOrigin(req); err != nil {
+		return nil, err
+	}
 	clone := req.Clone(req.Context())
 	if req.Body != nil && req.Body != http.NoBody {
 		content, err := io.ReadAll(req.Body)
@@ -87,4 +106,19 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return t.base.RoundTrip(clone)
+}
+
+// sameOrigin rejects a redirect hop whose scheme or host differs from the
+// request that was redirected. http.Client sets req.Response only on the
+// requests it creates while following a redirect.
+func sameOrigin(req *http.Request) error {
+	if req.Response == nil || req.Response.Request == nil || req.Response.Request.URL == nil {
+		return nil
+	}
+	from := req.Response.Request.URL
+	if req.URL.Scheme == from.Scheme && req.URL.Host == from.Host {
+		return nil
+	}
+	return fmt.Errorf("identity: refusing to follow a redirect from %s://%s to %s://%s with identity headers",
+		from.Scheme, from.Host, req.URL.Scheme, req.URL.Host)
 }

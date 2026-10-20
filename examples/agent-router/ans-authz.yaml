@@ -34,8 +34,10 @@ requireReceipt: true
 stripIdentityHeaders: true
 
 # Envoy Gateway forwards no validated JWT claims to ext_authz, so the cnf.jkt binding of a
-# DPoP-bound access token is not enforced at this hop (RFC 9449 section 7.1). These recipes
-# consume no access tokens; an upstream that does must verify the binding itself.
+# DPoP-bound access token is not enforced at this hop: a bound token presented here is passed
+# on unchecked, and the upstream MUST verify the binding itself (RFC 9449 section 7.1). These
+# recipes consume no access tokens. Set it to true only when the gateway forwards validated
+# token claims to the verifier.
 requireTokenClaims: false
 
 # Fails closed when a route forgets both body forwarding and this sentinel (the recipes set
