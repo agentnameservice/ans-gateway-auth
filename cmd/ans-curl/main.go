@@ -46,6 +46,7 @@ type options struct {
 	dir     string
 	method  string
 	data    string
+	dataSet bool
 	token   string
 	replay  bool
 	force   bool
@@ -118,6 +119,11 @@ func parseArgs(args []string, stderr io.Writer) (*options, int) {
 		}
 		return nil, exitUsage
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "d" {
+			o.dataSet = true
+		}
+	})
 	if o.dir == "" || fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "ans-curl: --identity <dir> and exactly one URL are required")
 		fs.Usage()
@@ -133,7 +139,7 @@ func buildRequest(o *options, body []byte) (*http.Request, error) {
 	method := o.method
 	if method == "" {
 		method = http.MethodGet
-		if body != nil {
+		if o.dataSet {
 			method = http.MethodPost
 		}
 	}

@@ -380,3 +380,37 @@ func TestRunPostWithoutBodyIsNotChunked(t *testing.T) {
 		t.Errorf("upstream saw method %s, chunked %v, body %q; want a POST with Content-Length 0", s.method, s.chunked, s.body)
 	}
 }
+
+// TestRunMethodDefaults pins the documented rule: -d selects POST even when the body it carries
+// is empty, and an explicit -X always wins.
+func TestRunMethodDefaults(t *testing.T) {
+	t.Parallel()
+	dir, p := writeBundle(t, true)
+	tests := []struct {
+		name       string
+		args       []string
+		wantMethod string
+	}{
+		{"no -d is GET", nil, http.MethodGet},
+		{"empty -d is POST", []string{"-d", ""}, http.MethodPost},
+		{"-d body is POST", []string{"-d", `{"a":1}`}, http.MethodPost},
+		{"-X wins over -d", []string{"-X", http.MethodPut, "-d", `{"a":1}`}, http.MethodPut},
+		{"-X GET with -d stays GET", []string{"-X", http.MethodGet, "-d", `{"a":1}`}, http.MethodGet},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv, s := newProtectedServer(t, p.RootKeyC2SP)
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"--identity", dir}, tc.args...)
+			if got := run(append(args, srv.URL+"/m"), &stdout, &stderr); got != exitOK {
+				t.Fatalf("exit %d: %s", got, stderr.String())
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.method != tc.wantMethod || s.chunked {
+				t.Errorf("upstream saw %s (chunked %v), want %s", s.method, s.chunked, tc.wantMethod)
+			}
+		})
+	}
+}

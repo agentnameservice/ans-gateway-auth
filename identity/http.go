@@ -91,6 +91,7 @@ type transport struct {
 
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := sameOrigin(req); err != nil {
+		closeBody(req)
 		return nil, err
 	}
 	clone := req.Clone(req.Context())
@@ -106,6 +107,14 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return t.base.RoundTrip(clone)
+}
+
+// closeBody keeps the RoundTripper contract on a request that is never sent:
+// the body is closed even though nothing read it.
+func closeBody(req *http.Request) {
+	if req.Body != nil && req.Body != http.NoBody {
+		_ = req.Body.Close()
+	}
 }
 
 // sameOrigin rejects a redirect hop whose scheme or host differs from the

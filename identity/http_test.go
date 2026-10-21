@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -502,5 +503,63 @@ func TestTransportRefusesSchemeDowngrade(t *testing.T) {
 	hop.Response = &http.Response{Request: newRequest(t, http.MethodGet, "https://gateway.example/mcp", nil)}
 	if _, err := p.Bundle.Transport(base).RoundTrip(hop); err == nil || !strings.Contains(err.Error(), "refusing to follow a redirect") {
 		t.Fatalf("error = %v, want the transport's redirect refusal", err)
+	}
+}
+
+// trackedBody records whether it was closed, so a test can check the RoundTripper contract on
+// paths where the transport never sends the request. net/http closes a redirected request's
+// body itself as well, so the check is "every body closed", not a count.
+type trackedBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *trackedBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestTransportClosesBodyOnRefusedRedirect(t *testing.T) {
+	p := provision(t)
+	protected, rec := newServer(t, p.KeyLookup)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, protected.URL+"/mcp", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	var mu sync.Mutex
+	var bodies []*trackedBody
+	open := func() io.ReadCloser {
+		b := &trackedBody{Reader: strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`)}
+		mu.Lock()
+		bodies = append(bodies, b)
+		mu.Unlock()
+		return b
+	}
+	req := newRequest(t, http.MethodPost, redirector.URL+"/start", nil)
+	req.Body = open()
+	req.GetBody = func() (io.ReadCloser, error) { return open(), nil }
+
+	client := &http.Client{Transport: p.Bundle.Transport(nil)}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("the transport followed a cross-host 307 with identity headers")
+	}
+	if !strings.Contains(err.Error(), "refusing to follow a redirect") {
+		t.Fatalf("error = %v, want the transport's redirect refusal", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("bodies opened = %d, want the original and one hop body from GetBody", len(bodies))
+	}
+	for i, b := range bodies {
+		if !b.closed.Load() {
+			t.Fatalf("body %d was never closed; the refused hop must close the body GetBody opened", i)
+		}
+	}
+	if n := rec.count(); n != 0 {
+		t.Fatalf("the redirect target received %d signed request(s), want none", n)
 	}
 }
