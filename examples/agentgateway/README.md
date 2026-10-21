@@ -75,10 +75,11 @@ protocol:
 
 The verifier (with `requireTokenClaims: true`, the default) compares the token's `cnf.jkt` with
 the proof key and rejects a mismatch, a token without `cnf`, or a request where no claims were
-forwarded. agentgateway v1.6.0 also forwards validated claims in the Envoy `jwt_authn` metadata
-namespace when no expression is configured, and the verifier reads that namespace as a fallback;
-the explicit expression is the durable form. A route that carries a DPoP-bound token but
-validates no token at all is reported as `MISCONFIGURED` (503). The CEL rule
+forwarded. The expression is required: the verifier reads claims only from the namespace named
+by its `grpc.tokenClaimsNamespace` (`ans-authz` here) and never from the Envoy `jwt_authn`
+namespace agentgateway fills on its own, so a route that validates the token but omits the
+expression is reported as `MISCONFIGURED` (503), exactly like one that validates no token at all.
+The CEL rule
 `has(jwt.cnf) && jwt.cnf.jkt == extauthz.jkt` is the second layer. A token presented as `Bearer`
 is rejected by strict `jwtAuth` before the verifier runs. The `jwks.file` path resolves against
 agentgateway's working directory. The shipped `jwks.rfc7515-a3.example.json` is the ES256 key
