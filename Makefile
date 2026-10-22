@@ -3,7 +3,7 @@ VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 
 GO          ?= go
 GOFLAGS     ?= -trimpath
 LDFLAGS     := -s -w -X main.version=$(VERSION)
-COVER_PKGS  := ./authz/... ./extauthz/... ./replay/... ./config/... ./cmd/...
+COVER_PKGS  := ./authz/... ./extauthz/... ./replay/... ./config/... ./cmd/... ./identity/... ./testidentity/...
 COVER_MIN   ?= 95
 
 # Pinned agentgateway release binary used by the e2e suite and run-example.
@@ -28,12 +28,17 @@ cover:
 
 # golangci-lint embeds its own go/types; its Go version must not be older than the
 # toolchain that produced the export data, so pin the toolchain it runs under.
+# CI lints on linux/amd64; linting for that platform locally surfaces findings
+# that constant folding on another GOOS/GOARCH would hide.
 LINT_GOTOOLCHAIN ?= go1.26.0
+LINT_GOOS        ?= linux
+LINT_GOARCH      ?= amd64
+LINT_ENV         := GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) GOOS=$(LINT_GOOS) GOARCH=$(LINT_GOARCH)
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then \
-		GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) golangci-lint run ./... && \
-		GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) golangci-lint run --build-tags e2e ./tests/...; \
+		$(LINT_ENV) golangci-lint run ./... && \
+		$(LINT_ENV) golangci-lint run --build-tags e2e ./tests/...; \
 	else echo "golangci-lint not installed, skipping"; fi
 
 agentgateway-bin:
@@ -49,7 +54,7 @@ e2e: agentgateway-bin
 		$(GO) test -tags e2e -count=1 -timeout 15m $(E2E_FLAGS) ./tests/agentgateway/...
 
 # Agent Router suite (tests/agentrouter). AIGW_BIN must point at an aigw
-# binary; tests/agentrouter/README.md says how to build or download it.
+# binary; examples/agent-router/README.md ("Tests") says how to build or download it.
 e2e-agentrouter: build
 	@test -n "$(AIGW_BIN)" || { echo "AIGW_BIN is required (path to the aigw binary)" >&2; exit 2; }
 	AIGW_BIN=$(AIGW_BIN) $(GO) test -tags e2e -count=1 -p 1 -timeout 25m $(E2E_FLAGS) ./tests/agentrouter/...

@@ -6,8 +6,8 @@ RFC 9449 DPoP proof bound to a transparency-logged identity certificate, carried
 receipt and a status token. The identity layer itself (domain-anchored names, the transparency
 log) is the one draft-narajala-courtney-ansv2 describes.
 
-`ans-authz` is an Envoy ext_authz verifier built and tested for agentgateway, with Agent Router
-next. Any gateway that speaks the Envoy external authorization protocol can call it, but the
+`ans-authz` is an Envoy ext_authz verifier built and tested for agentgateway and Agent Router.
+Any gateway that speaks the Envoy external authorization protocol can call it, but the
 defaults (the 2 s ext_authz budget, body forwarding, header folding) are agentgateway's; stock
 Envoy's ext_authz timeout defaults to 200 ms and must be raised above `checkTimeout`, and the
 Envoy `header_map` and partial-body paths are covered by unit tests only. The verifier checks the
@@ -23,7 +23,8 @@ agent ──DPoP + X-SCITT-Receipt + X-ANS-Status-Token──▶ gateway ──e
                                                                 X-ANS-Fingerprint, X-ANS-JKT)
 ```
 
-Recipes: [agentgateway](examples/agentgateway/README.md).
+Recipes: [agentgateway](examples/agentgateway/README.md),
+[Agent Router](examples/agent-router/README.md).
 
 ## What the verifier checks
 
@@ -41,8 +42,11 @@ For every request, in the order ANS-6 section 7.4 prescribes:
    digest, is fresh within `popSkew`, and carries a `jti` that has not been seen (the replay check
    runs last and fails closed when the cache is unavailable, ANS-6 section 7.6).
 6. When the request carries `Authorization: DPoP <token>`, the proof's `ath` matches the token
-   and, when the gateway forwarded the validated token claims, `cnf.jkt` matches the proof key
-   (ANS-6 sections 7.8 and 11.7). A DPoP-bound token offered as `Bearer` is rejected.
+   and `cnf.jkt` matches the proof key, read from the gateway-forwarded validated claims and,
+   when the token is a JWS, from the token itself (ANS-6 sections 7.8 and 11.7). A JWS token
+   carrying `cnf.jkt` offered as `Bearer` is rejected (RFC 9449 section 7.2). An opaque token can
+   only be checked through forwarded claims, which `requireTokenClaims` demands; with it set to
+   false the upstream owns the check for opaque tokens.
 
 An allowed request reaches the upstream with `X-ANS-Name`, `X-ANS-Agent-Id`, `X-ANS-Fingerprint`
 (hex SHA-256 of the identity certificate) and `X-ANS-JKT` set by the gateway with overwrite
@@ -92,7 +96,7 @@ otherwise.
 transparencyLogs:              # at least one; nothing is trusted by default
 - name: prod-tl
   baseURL: https://tl.example.com   # fetched at startup (retried until startupTimeout) and every keyRefreshInterval
-  rootKeys: [...]                   # C2SP verifier lines; pin these so a log outage cannot block a restart
+  rootKeys: [...]                   # C2SP verifier lines; always trusted, and they let a restart succeed during a log outage
   timeout: 1s                       # must stay below checkTimeout
 trustedHosts: [https://api.example.com]   # or externalAuthority: https://api.example.com
 requiredContext: {key: ans-authz, value: body-forwarded}
@@ -110,6 +114,7 @@ replay: {type: memory, maxEntries: 100000}
 #   redis: {addr: replay-redis:6379, passwordEnv: ANS_AUTHZ_REDIS_PASSWORD, tls: true, timeout: 500ms}
 grpc:
   listen: 127.0.0.1:9191
+  tokenClaimsNamespace: ans-authz   # the only filter_metadata namespace read for forwarded token claims
   # tls: {certFile: ..., keyFile: ..., clientCAFile: ...}   # required for a non-loopback listener; loaded at startup, rotation needs a restart
   # allowInsecureListen: true                               # only inside a mesh that provides mutual TLS
 httpListen: 127.0.0.1:9192
@@ -126,6 +131,18 @@ gRPC listener has no TLS, when TLS material does not load, or when `checkTimeout
 every fetch timeout. `--check` and startup warn when `checkTimeout` is not below the gateway's
 two-second ext_authz budget, when root keys are fetched over plaintext from a non-loopback host
 (pin `rootKeys` instead), and when `requiredContext` is unset.
+
+### Trust material
+
+A transparency log's trusted keys are the pinned `rootKeys` plus whatever its `/root-keys`
+endpoint served at the last successful fetch. Each refresh replaces the fetched set rather than
+accumulating, so a key the log withdraws stops being trusted at the next refresh (every
+`keyRefreshInterval`, or on demand when a proof names an unknown key id, bounded by cooldowns).
+Pinned keys are never dropped and fetched keys are trusted exactly like pinned ones, so the log
+endpoint's TLS identity is part of the trust chain: use `https://` with a certificate you trust,
+and treat `allowInsecure` as a loopback development setting. Status tokens are accepted up to
+ten minutes past their expiry (an SDK constant), so revocation latency at the verifier is the
+token lifetime plus ten minutes.
 
 ### Authority rule (ANS-6 section 7.7)
 
@@ -160,10 +177,15 @@ startup and samples every 15 s:
 - A dedicated instance: a logical database is not an isolation boundary against `FLUSHALL`,
   `CONFIG SET` or a co-tenant's memory. The ACL needs only `+set +get +info` (plus `+select` for
   a non-zero `db`), for example
-  `ACL SETUSER ans-authz on >password ~* +set +get +info -@all`.
+  `ACL SETUSER ans-authz on >password ~ans-authz:* +set +get +info -@all` (every key the
+  verifier writes carries the `ans-authz:` prefix).
+- `tls: true` for any store that is not on loopback: proof identifiers and the keyspace sentinel
+  otherwise travel in plaintext, which the verifier warns about at startup.
 - `appendonly yes` with `appendfsync always` (or `everysec`, accepting one second of exposure):
-  a restart that loses the keyspace is a replay window. Never restore the store from a snapshot
-  without a `FLUSHALL` first.
+  a restart that loses recent records is a replay window, so the verifier refuses to start
+  against a store without AOF and fails closed if it is switched off later. Never restore the
+  store from a snapshot without a `FLUSHALL` first; a snapshot keeps the sentinel but not the
+  records written after it.
 
 Keyspace loss is detected in the request path: a sentinel key written at first start travels
 with every check, and when it disappears (flush, restart without persistence) every replica
@@ -171,7 +193,9 @@ fails closed with `REPLAY_CACHE_UNAVAILABLE` and a `Retry-After` covering `2 x p
 the longest a proof from the lost keyspace could still be valid. A fresh store opens the same
 window once. `/readyz` reports `keyspaceResetUntil` while a window is open, and
 `ans_authz_replay_backend_keyspace_resets_total` counts the events. The password comes from the
-environment variable named by `passwordEnv`, never from the file.
+environment variable named by `passwordEnv`, never from the file; because the file chooses the
+variable and the address, grant write access to the verifier's configuration no more widely than
+read access to that secret.
 
 ## Gateway-side rules
 
@@ -189,8 +213,21 @@ environment variable named by `passwordEnv`, never from the file.
   `maxContentBytes` together with the gateway's body cap.
 - No ext_authz decision cache: a DPoP proof is single-use.
 - Upstreams must be reachable only through the gateway; otherwise `X-ANS-*` can be forged.
-- Put a rate limit in front of the route: the replay cache fails closed for every caller when it
-  is full, so a flood of valid-looking requests is a denial-of-service vector.
+- A gateway rate limit does not protect the verifier or the replay cache. In agentgateway v1.6.0
+  `localRateLimit` runs after `extAuthz` and `authorization`, and listener policies have no rate
+  limit at all, so every request is verified and its proof identifier recorded before the limit
+  is charged; the `localRateLimit` in the recipes bounds upstream load only. A caller with any
+  valid identity can therefore fill the replay cache with distinct proofs, and the cache then
+  fails closed for every caller (`REPLAY_CACHE_FULL`) until the entries expire. Keep the
+  capacity alerts below; the decision log carries the ANS name behind every allow, which
+  identifies a flooding caller. A per-identity quota inside the verifier, applied before the
+  record is written, is planned.
+- The verifier reads forwarded token claims from one `filter_metadata` namespace,
+  `grpc.tokenClaimsNamespace` (default `ans-authz`, the one the recipes' `protocol.grpc.metadata`
+  writes), and never falls back to `envoy.filters.http.jwt_authn`: every filter in the chain can
+  write there, so with `requireTokenClaims: true` a forged `cnf.jkt` in that namespace would pass
+  the binding check. A gateway whose JWT filter can only write that namespace must name it
+  explicitly, and the verifier warns about the trust it implies at startup.
 - For DPoP-bound access tokens, validate the token at the gateway with the `DPoP` scheme and
   forward its claims to the verifier (see the OAuth recipe); the CEL rule
   `has(jwt.cnf) && jwt.cnf.jkt == extauthz.jkt` is the second layer. Do not accept `Bearer` and
@@ -215,7 +252,7 @@ Alerts worth having:
 
 | Condition | Meaning |
 |---|---|
-| `replay_cache_entries / replay_cache_capacity > 0.8` for 5m, or `decisions_total{category="REPLAY_CACHE_FULL"}` rising | replay cache capacity; raise `maxEntries` (about 100 bytes per entry, size for peak RPS times `popSkew` plus 5 s) |
+| `replay_cache_entries / replay_cache_capacity > 0.8` for 5m, or `decisions_total{category="REPLAY_CACHE_FULL"}` rising | replay cache capacity, or one caller flooding distinct proofs (a gateway rate limit does not stop this; the decision log names the caller); raise `maxEntries` (about 100 bytes per entry, size for peak RPS times `popSkew` plus 5 s) |
 | `decisions_total{category="REPLAY_CACHE_UNAVAILABLE"}` rising, `replay_backend_errors_total` rising, or `replay_backend_up == 0` | replay backend outage; requests are failing closed |
 | `key_refresh_total{result="failure"}` rising with a stale `root_keys_last_refresh_timestamp_seconds` | transparency-log key rotation trouble |
 | `check_timeouts_total > 0` | the verification budget is under pressure; check the replay backend and transparency-log latency |
@@ -226,14 +263,23 @@ Alerts worth having:
 | `used_memory_bytes / maxmemory_bytes > 0.8` for 5m | store capacity |
 | `increase(replay_backend_restarts_total) > 0` | the store restarted (informational when AOF restored it) |
 
-Logs are JSON on stderr: one `decision` line per check (gateway request id, method, authority,
-path without query, result, HTTP status, category, the verifier-side reason, ANS name, duration)
-at INFO for allows and 4xx denials and at WARN for 5xx denials, plus rate-limited errors for
-misconfiguration. Header values are never logged and client-influenced fields are truncated.
+Logs are JSON on stderr: one `decision` line per check (request id with its source, gateway or
+client, method, authority, path without query, result, HTTP status, category, the verifier-side
+reason, ANS name, duration) at INFO for allows and 4xx denials and at WARN for 5xx denials, plus
+rate-limited errors for misconfiguration. Credentials, DPoP, Authorization and SCITT header
+values are never logged; the reason may quote a bounded fragment of a rejected proof's decoded
+header fields, and client-influenced fields are truncated.
 
 `/readyz` returns 200 only while serving with root keys for every transparency log and, when
 `readiness.requireReplayBackend` is set, a reachable replay backend; it is 503 while starting and
-from the moment shutdown begins. On `SIGTERM` the health service flips to `NOT_SERVING`, in-flight
+from the moment shutdown begins. It stays 200 during a keyspace-reset fail-closed window on
+purpose: that event is store-wide, so taking every replica out of the Service would leave no
+endpoints where fast 503s with `Retry-After` serve clients better; a single replica that cannot
+reach the store is what `requireReplayBackend` removes from rotation. Per-log status carries the
+class of the last fetch failure as `lastErrorKind` (`timeout`, `dns_error`, `tls_error`,
+`connection_error`, `http_error`, `other`); the error text, with hostnames, stays in the log. The
+root-key fetch never follows a redirect: the configured URL is the trust anchor, and a 3xx from it
+fails the fetch. On `SIGTERM` the health service flips to `NOT_SERVING`, in-flight
 checks drain for up to ten seconds, then the process exits. The HTTP listener binds only after the
 trust material is loaded, which can take up to `startupTimeout` per transparency log, so give the
 container a startup probe on `/readyz` whose `failureThreshold x periodSeconds` covers that, or pin
@@ -252,7 +298,9 @@ make run-example     # echo upstream + ans-authz + agentgateway, HTTP recipe
 The end-to-end suite needs an ANS reference checkout (`ANS_E2E_ANS_REPO`, defaulting to a
 sibling `opensource-ans` directory) with its demo stack running (registration authority on 18080,
 transparency log on 18081), or `ANS_E2E_START_STACK=1` to start it. Missing prerequisites skip the
-suite; set `ANS_E2E_REQUIRED=1` in CI so a skip fails instead. See
+suite; `ANS_E2E_REQUIRED=1` turns a skip into a failure where a stack is available. CI runs the
+unit suites, lint, govulncheck and the recipe validation; both end-to-end suites are run by the
+maintainers before a release. See
 [tests/agentgateway](tests/agentgateway). `make run-example` builds the upstream and starts the
 HTTP recipe; `make run-example EXAMPLE=mcp` starts the MCP recipe with the `examples/mcpecho`
 upstream.

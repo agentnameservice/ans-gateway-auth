@@ -8,7 +8,9 @@ project_name: ans-gateway-auth
 
 before:
   hooks:
-    - go mod tidy
+    # Fail the release when the module graph is not what was reviewed.
+    - go mod verify
+    - go mod tidy -diff
 
 builds:
   - id: ans-authz

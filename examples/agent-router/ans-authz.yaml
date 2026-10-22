@@ -1,0 +1,63 @@
+# ans-authz configuration for the Agent Router recipes.
+#
+# Loadable as shipped (`ans-authz --config examples/agent-router/ans-authz.yaml --check`): it
+# trusts the local ANS demo stack's transparency log on 127.0.0.1:18081. For a development
+# identity from `ans-dev-identity`, replace the transparencyLogs entry with the one the tool
+# prints (a rootKeys line); every run of the tool mints a new log key, so re-paste and restart
+# after a refresh. The loopback listeners (the defaults) are right for `aigw run`; the
+# Kubernetes ConfigMap in kubernetes/ans-verifier.yaml overrides them and trustedHosts.
+#
+# Cross-process invariants: trustedHosts must name the authority clients put in their proofs
+# (the aigw listener, AIGW_PORT), and maxContentBytes must be at least the gateway's
+# bodyToExtAuth.maxRequestBytes (ANS_MAX_BODY). Change them together.
+
+transparencyLogs:
+  - name: local-tl
+    baseURL: http://127.0.0.1:18081
+    allowInsecure: true
+  # - name: dev
+  #   rootKeys:
+  #     - "dev-tl+<kid>+<base64 SPKI>"
+
+# RFC 9449 htu is compared against this authority with this scheme; the request's own Host
+# header and scheme are never trusted. Behind TLS termination use externalAuthority instead.
+trustedHosts:
+  - http://127.0.0.1:1975
+
+# Largest request body the verifier hashes; see the README's body-size section before raising it
+# (the gateway cap is also Envoy's response buffer ceiling, and the gRPC receive limit follows).
+maxContentBytes: 1048576
+requireReceipt: true
+
+# The DPoP proof, SCITT receipt and status token are consumed here and do not reach the
+# upstream. The identity headers (X-ANS-* and extraIdentityHeaders) are set on every allow.
+stripIdentityHeaders: true
+
+# Envoy Gateway forwards no validated JWT claims to ext_authz, so the cnf.jkt binding of a
+# DPoP-bound access token is not enforced at this hop: a bound token presented here is passed
+# on unchecked, and the upstream MUST verify the binding itself (RFC 9449 section 7.1). These
+# recipes consume no access tokens. Set it to true only when the gateway forwards validated
+# token claims to the verifier.
+requireTokenClaims: false
+
+# Fails closed when a route forgets both body forwarding and this sentinel (the recipes set
+# extAuth.contextExtensions to match). A route that omits the whole extAuth block is served
+# unauthenticated and nothing here can detect it.
+requiredContext:
+  key: ans-authz
+  value: body-forwarded
+
+# Agent Router's MCP proxy binds a session to this header; setting it from the verified agent
+# id stops one agent from resuming another agent's MCP session. The header is Agent Router's
+# internal contract between its Envoy filters and its proxy, so pin the Agent Router version.
+extraIdentityHeaders:
+  x-ai-eg-mcp-subject: agent_id
+
+# Per-process replay cache: correct for one verifier instance. Several instances serving the
+# same authority must share a cache (ANS-6 section 7.6); use the redis backend for that.
+# maxEntries bounds the proofs remembered for the 120 s skew window; above it the verifier fails
+# closed with REPLAY_CACHE_FULL, so size it at peak requests per second times 240 and watch the
+# verifier's /metrics.
+replay:
+  type: memory
+  maxEntries: 100000

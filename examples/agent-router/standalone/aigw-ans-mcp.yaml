@@ -1,0 +1,177 @@
+# Agent Router standalone (`aigw run`) with ANS agent authentication on an MCP route.
+#
+# The MCPRoute's own securityPolicy carries the external authorizer (Envoy ext_authz over gRPC,
+# verifying RFC 9449 DPoP proofs plus the Agent Name Service SCITT receipt and status token)
+# together with per-tool authorization rules that read the verified identity headers. Keep
+# both on the same MCPRoute: a SecurityPolicy generated for an MCPRoute overrides any policy
+# attached to the Gateway, so a header rule on a route without extAuth would trust whatever
+# the client sends.
+#
+# Run:  aigw run examples/agent-router/standalone/aigw-ans-mcp.yaml
+# Env:  AIGW_PORT (1975), MCP_UPSTREAM_PORT (1063), ANS_AUTHZ_PORT (9191),
+#       ANS_MAX_BODY (1048576), ANS_ALLOWED_AGENT_ID (demo-agent-1)
+#
+# AIGW_PORT must match the verifier's trustedHosts entry and ANS_MAX_BODY must not exceed its
+# maxContentBytes (examples/agent-router/ans-authz.yaml).
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: aigw-run
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: aigw-run
+  namespace: default
+spec:
+  gatewayClassName: aigw-run
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: ${AIGW_PORT:-1975}
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: envoy-ai-gateway
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy-ai-gateway
+  namespace: default
+spec:
+  logging:
+    level:
+      default: error
+  telemetry:
+    accessLog:
+      settings:
+        - matches:
+            - "request.headers['x-ai-eg-mcp-backend'] != '' && response.code < 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              mcp.method.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:mcp_method)%"
+              mcp.tool.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:mcp_tool_name)%"
+              mcp.provider.name: "%DYNAMIC_METADATA(io.envoy.ai_gateway:mcp_backend)%"
+              ans.name: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:ans_name)%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              response_code: "%RESPONSE_CODE%"
+              duration: "%DURATION%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+        # ans.name and ans.agent_id come from the verifier's dynamic metadata, which only a
+        # successful check sets, never from the X-ANS-* request headers: a rejected request
+        # still carries whatever the client sent.
+        - matches:
+            - "response.code >= 400"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
+          format:
+            type: JSON
+            json:
+              event: "rejected"
+              response_code: "%RESPONSE_CODE%"
+              response_code_details: "%RESPONSE_CODE_DETAILS%"
+              response_flags: "%RESPONSE_FLAGS%"
+              ans.agent_id: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:agent_id)%"
+              authority: "%REQ(:AUTHORITY)%"
+              x-request-id: "%REQ(X-REQUEST-ID)%"
+              method: "%REQ(:METHOD)%"
+              request.path: "%REQ(:PATH)%"
+              duration: "%DURATION%"
+              upstream_cluster: "%UPSTREAM_CLUSTER%"
+              downstream_remote_address: "%DOWNSTREAM_REMOTE_ADDRESS%"
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: MCPRoute
+metadata:
+  name: mcp-ans
+  namespace: default
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  securityPolicy:
+    extAuth:
+      grpc:
+        backendRefs:
+          - group: gateway.envoyproxy.io
+            kind: Backend
+            name: ans-verifier
+        backendSettings:
+          circuitBreaker:
+            maxParallelRequests: 64
+      bodyToExtAuth:
+        maxRequestBytes: ${ANS_MAX_BODY:-1048576}
+      contextExtensions:
+        - name: ans-authz
+          type: Value
+          value: body-forwarded
+      failOpen: false
+      timeout: 2s
+      statusOnError: 503
+    # Rules are evaluated in order and the first match decides; nothing matching is denied.
+    # The verifier overwrites x-ans-agent-id on every allowed request, so the rules can trust it;
+    # the `in` guard keeps a missing header from becoming an evaluation error (which denies).
+    # Only the listed agent may call `sum`; every other tool is open to any verified agent.
+    authorization:
+      defaultAction: Deny
+      rules:
+        - target:
+            tools:
+              - backend: tools
+                tool: sum
+          cel: '"x-ans-agent-id" in request.headers && request.headers["x-ans-agent-id"] == "${ANS_ALLOWED_AGENT_ID:-demo-agent-1}"'
+          action: Allow
+        - target:
+            tools:
+              - backend: tools
+                tool: sum
+          action: Deny
+        - cel: '"x-ans-agent-id" in request.headers && request.headers["x-ans-agent-id"] != ""'
+          action: Allow
+  backendRefs:
+    - name: tools
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+      forwardHeaders:
+        - name: X-ANS-Name
+        - name: X-ANS-Agent-Id
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: tools
+  namespace: default
+spec:
+  endpoints:
+    - ip:
+        address: 127.0.0.1
+        port: ${MCP_UPSTREAM_PORT:-1063}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: ans-verifier
+  namespace: default
+spec:
+  endpoints:
+    - ip:
+        address: 127.0.0.1
+        port: ${ANS_AUTHZ_PORT:-9191}
+  appProtocols:
+    - gateway.envoyproxy.io/h2c

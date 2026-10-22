@@ -1,0 +1,272 @@
+# ANS verifier (ans-authz) for Agent Router on Kubernetes.
+#
+# One Deployment per externally visible authority. The replay cache is per process, so this
+# ships a single replica (ANS-6 section 7.6); see the commented HA variant at the end, which
+# needs the redis replay backend and a highly available Redis. Apply this file first and wait
+# for the pod to be Ready before attaching a SecurityPolicy: the gateway fails closed.
+#
+# Replace: the transparency log and its pinned root keys, the trustedHosts authority and the
+# image. Config changes take effect only after
+# `kubectl -n ans-authz rollout restart deployment/ans-authz`, which is a short fail-closed
+# window; a rotated dev root key therefore needs a restart too.
+#
+# Everything lives in the dedicated ans-authz namespace, and the Service's label selector there
+# is the trust anchor: a pod created in it with the ans-authz label answers Envoy's Check calls,
+# and in the TLS variant a Secret there holds the serving key. Grant pod-create and secret-read
+# in this namespace to the deployer only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ans-authz
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ans-authz
+  namespace: ans-authz
+data:
+  # Same keys as examples/agent-router/ans-authz.yaml (a test keeps them in sync) with exactly
+  # these overrides: the transparency log and the cluster-facing authority in trustedHosts, both
+  # listeners on the pod address (the verifier defaults to loopback, which a pod cannot expose),
+  # and allowInsecureListen because the NetworkPolicy keeps the plaintext gRPC hop inside the
+  # cluster. Prefer grpc.tls when a certificate is available (TLS variant at the end).
+  config.yaml: |
+    transparencyLogs:
+      - name: tl
+        baseURL: https://transparency.example.com
+        # The log's current root keys (C2SP lines from its /root-keys endpoint). With keys
+        # pinned, a restart during a log outage starts on them and refreshes later; with only
+        # baseURL it exits after startupTimeout and crash-loops. The verifier refuses to start
+        # until this placeholder is replaced; `ans-authz --check --config` shows the error.
+        rootKeys:
+          - "REPLACE_WITH_THE_LOG_ROOT_KEY_LINE"
+    trustedHosts:
+      - https://gateway.example.com
+    maxContentBytes: 1048576
+    requireReceipt: true
+    stripIdentityHeaders: true
+    # WARNING: Envoy Gateway forwards no validated JWT claims, so a DPoP-bound access token
+    # is passed on without its cnf.jkt binding being checked here; the upstream MUST enforce
+    # token binding (RFC 9449 section 7.1). Set to true only when the gateway forwards
+    # validated token claims to the verifier.
+    requireTokenClaims: false
+    requiredContext:
+      key: ans-authz
+      value: body-forwarded
+    extraIdentityHeaders:
+      x-ai-eg-mcp-subject: agent_id
+    grpc:
+      listen: 0.0.0.0:9191
+      allowInsecureListen: true
+    httpListen: 0.0.0.0:9192
+    replay:
+      type: memory
+      maxEntries: 100000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ans-authz
+  namespace: ans-authz
+  labels:
+    app.kubernetes.io/name: ans-authz
+spec:
+  # Exactly one replica: two in-memory replay caches behind one Service would each accept a
+  # replayed proof once. Recreate stops the old pod before the new one starts during a rollout;
+  # a deleted, evicted or preempted pod is replaced by the ReplicaSet while the old one is still
+  # terminating, so the startupProbe's initialDelaySeconds below adds
+  # terminationGracePeriodSeconds to the quarantine to cover that overlap. A surge rollout
+  # (maxSurge > 0) overlaps the pods for longer and voids it; that case needs the HA variant,
+  # whose Redis sentinel covers the whole store. Each rollout, node drain or preemption is
+  # therefore a fail-closed window of about four and a half minutes; give the pod a high
+  # priorityClassName, or use the HA variant.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ans-authz
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ans-authz
+    spec:
+      terminationGracePeriodSeconds: 15
+      # The verifier never talks to the API server.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # The image runs as distroless nonroot; the numeric ids let the kubelet verify
+        # runAsNonRoot, which a user name in the image cannot.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ans-authz
+          # No pipeline publishes this image yet. Build it from this repository with
+          # `make docker IMAGE=<registry>/ans-authz:<tag>`, push it to your registry and pin
+          # the digest here.
+          image: ghcr.io/agentnameservice/ans-authz@sha256:REPLACE_WITH_THE_RELEASE_DIGEST
+          args: ["--config", "/etc/ans-authz/config.yaml"]
+          ports:
+            - name: grpc
+              containerPort: 9191
+            - name: http
+              containerPort: 9192
+          # Startup quarantine: the in-memory replay cache does not survive a restart, so a
+          # proof the previous process accepted would be accepted again until its validity
+          # window closes. The pod stays out of the Service for 2 x popSkew + 5 s (a proof may
+          # carry an iat one skew in the future, plus the SDK's retention grace; the window the
+          # verifier applies after a Redis keyspace loss) plus terminationGracePeriodSeconds,
+          # because a replaced pod may still accept proofs while it terminates: 260 s at the
+          # default 120 s skew. Envoy reports the gap as 503 ext_authz_error. Raise it with
+          # popSkew or the grace period; the HA variant needs no quarantine because its Redis
+          # cache persists.
+          # After the delay, nothing listens until trust material is loaded: each transparency
+          # log without pinned keys is retried for startupTimeout (30 s by default), then the
+          # Redis connect in the HA variant for the same. 90 s of probing covers two such
+          # waits; raise it with startupTimeout. Liveness starts only after this probe succeeds.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 260
+            periodSeconds: 5
+            failureThreshold: 18
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 3
+          # Memory is about 64Mi + 3 x maxContentBytes x maxParallelRequests: each in-flight
+          # check holds the wire buffer plus the decoded body. 1 MiB x 64 (the SecurityPolicies'
+          # circuit breaker) fits in 256Mi with headroom to the limit; raise both together.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ans-authz
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: ans-authz
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ans-authz
+  namespace: ans-authz
+  labels:
+    app.kubernetes.io/name: ans-authz
+spec:
+  selector:
+    app.kubernetes.io/name: ans-authz
+  ports:
+    - name: grpc
+      port: 9191
+      targetPort: grpc
+      appProtocol: kubernetes.io/h2c
+    - name: http
+      port: 9192
+      targetPort: http
+---
+# Lets the gateway's policies in the default namespace reference this Service: Envoy Gateway
+# requires a ReferenceGrant for a cross-namespace extAuth backendRef, and Agent Router generates
+# an MCPRoute's SecurityPolicy in the route's namespace, so one grant covers both
+# securitypolicy-gateway.yaml and mcproute-ans.yaml. Add a `from` entry per gateway namespace.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: ans-authz-from-gateway
+  namespace: ans-authz
+spec:
+  from:
+    - group: gateway.envoyproxy.io
+      kind: SecurityPolicy
+      namespace: default
+  to:
+    - group: ""
+      kind: Service
+      name: ans-authz
+# ---
+# HA variant (requires the verifier's redis replay backend and a Redis that is itself highly
+# available; a store outage is a fail-closed 503). Replace the ConfigMap's replay block with
+#     replay:
+#       type: redis
+#       redis:
+#         addr: redis.ans-authz.svc:6379
+#         passwordEnv: ANS_AUTHZ_REDIS_PASSWORD
+#         tls: true
+# and give the container the password from a Secret:
+#           env:
+#             - name: ANS_AUTHZ_REDIS_PASSWORD
+#               valueFrom:
+#                 secretKeyRef:
+#                   name: ans-authz-redis
+#                   key: password
+# passwordEnv names any variable in the pod's environment, so whoever can write the ConfigMap
+# can point it, and the Redis address, at any secret the pod carries: grant write access to
+# the ConfigMap to no one who may not read the Secret. Then set replicas: 2 and strategy
+# RollingUpdate {maxUnavailable: 0, maxSurge: 1}, add a PodDisruptionBudget with
+# minAvailable: 1, and keep the preStop sleep so endpoints drain. Drop the startupProbe's
+# initialDelaySeconds: the shared cache survives restarts.
+#
+# ---
+# TLS variant: Envoy verifies the verifier's certificate, so no on-path host inside the
+# cluster can answer Check calls with forged identities. Give the verifier a serving
+# certificate for ans-authz.ans-authz.svc in a kubernetes.io/tls Secret (cert-manager issues
+# one from a Certificate with that dnsName), mount it and replace the ConfigMap's grpc block:
+#     grpc:
+#       listen: 0.0.0.0:9191
+#       tls:
+#         certFile: /etc/ans-authz/tls/tls.crt
+#         keyFile: /etc/ans-authz/tls/tls.key
+#         # clientCAFile: /etc/ans-authz/tls/ca.crt   # with EnvoyProxy spec.backendTLS.clientCertificateRef, for mTLS
+#           volumeMounts:
+#             - name: tls
+#               mountPath: /etc/ans-authz/tls
+#               readOnly: true
+#       volumes:
+#         - name: tls
+#           secret:
+#             secretName: ans-authz-tls
+# and tell Envoy Gateway to speak TLS to the Service (every SecurityPolicy and MCPRoute that
+# references it inherits this):
+#     apiVersion: gateway.networking.k8s.io/v1
+#     kind: BackendTLSPolicy
+#     metadata:
+#       name: ans-authz
+#       namespace: ans-authz
+#     spec:
+#       targetRefs:
+#         - group: ""
+#           kind: Service
+#           name: ans-authz
+#           sectionName: grpc
+#       validation:
+#         hostname: ans-authz.ans-authz.svc
+#         caCertificateRefs:
+#           - group: ""
+#             kind: ConfigMap
+#             name: ans-authz-ca   # ca.crt of the issuer that signed the serving certificate

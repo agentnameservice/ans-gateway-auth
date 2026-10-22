@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway v1.6.0 recipe: an MCP endpoint on port 3000 whose every request
+# (initialize, tools/list, tools/call, GET /mcp, /.well-known) is authenticated
+# by the ans-authz verifier, with per-tool authorization on the verified name.
+# Validate with: agentgateway --validate-only -f examples/agentgateway/config-mcp.yaml
+mcp:
+  port: 3000
+  policies:
+    # Bounds upstream load only. In agentgateway v1.6.0 this runs after
+    # extAuthz and authorization, so it protects neither the verifier nor
+    # the replay cache (README, "Gateway-side rules").
+    localRateLimit:
+    - maxTokens: 200
+      tokensPerFill: 100
+      fillInterval: 1s
+      type: requests
+      key: source.address
+    extAuthz:
+      host: 127.0.0.1:9191
+      failureMode:
+        denyWithStatus: 503
+      # MCP over Streamable HTTP is almost entirely POST; the JSON-RPC body
+      # must reach the verifier for the proof's content binding.
+      includeRequestBody:
+        maxRequestBytes: 1048576
+        allowPartialMessage: false
+        packAsBytes: true
+      protocol:
+        grpc:
+          context:
+            ans-authz: body-forwarded
+    authorization:
+      rules:
+      - require: 'has(extauthz.ans_name)'
+    # Per-tool rules read the verified identity. Replace the name with the
+    # caller you want to admit; `mcp.tool` is only present on tools/call.
+    mcpAuthorization:
+      rules:
+      - 'extauthz.ans_name == "ans://v1.0.0.caller.example" && mcp.tool.name == "echo"'
+  targets:
+  # An HTTP target receives the X-ANS-* identity headers the verifier adds.
+  - name: echo
+    mcp:
+      host: http://127.0.0.1:3001/mcp
+  # A stdio target works too but cannot see request headers. `npx -y` resolves
+  # and runs the package's unpinned dependency tree from the npm registry with
+  # the gateway's privileges at every start; prefer a locally installed server.
+  # - name: everything
+  #   stdio:
+  #     cmd: npx
+  #     args: ["-y", "@modelcontextprotocol/server-everything@2026.6.1"]
