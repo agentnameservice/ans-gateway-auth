@@ -324,10 +324,11 @@ upstream.
 
 ## Contributing
 
-Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, the
-Developer Certificate of Origin sign-off and the Conventional Commits format releases are cut
-from, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations. Report security
-issues privately as described in [SECURITY.md](SECURITY.md).
+This repository follows [ANS governance](https://github.com/agentnameservice/governance/blob/main/GOVERNANCE.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
+[MAINTAINERS.md](MAINTAINERS.md) for the repository's Maintainers.
+The [Code of Conduct](CODE_OF_CONDUCT.md) applies to participation;
+report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 
 ## License
 
