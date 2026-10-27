@@ -8,7 +8,7 @@ require (
 	github.com/agentnameservice/ans-sdk-go v0.1.20
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
-	github.com/modelcontextprotocol/go-sdk v1.7.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/redis/go-redis/v9 v9.22.0
 	go.yaml.in/yaml/v3 v3.0.5
