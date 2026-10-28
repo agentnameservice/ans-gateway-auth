@@ -1,2 +1,2 @@
 # Review routing; merge permissions are managed separately.
-* @agentnameservice/ans-gateway-auth-maintainers @agentnameservice/tsc-owners
+* @agentnameservice/ans-gateway-auth-maintainers @agentnameservice/tsc @agentnameservice/tsc-owners
