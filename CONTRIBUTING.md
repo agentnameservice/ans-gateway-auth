@@ -103,6 +103,13 @@ breaking changes.
 Commits that do not follow this format are ignored by the release automation and will
 not appear in the changelog or trigger a version bump.
 
+Pull requests are squash-merged, so the pull request title becomes the subject of the
+commit that lands on `main` and is the line the release automation reads. Title every
+pull request in this format; the branch commits survive only in the squash commit body.
+A merged pull request whose title missed the format can be repaired without rewriting
+history by editing its description to add a `BEGIN_COMMIT_OVERRIDE` ... `END_COMMIT_OVERRIDE`
+block listing the intended commit messages separated by blank lines.
+
 ## Code Review
 
 Any open source project relies heavily on code review to improve software
