@@ -95,8 +95,13 @@ const (
 	instanceTokenTyp = "instance+jwt"
 	dpopTyp          = "dpop+jwt"
 	algES256         = "ES256"
-	// instanceMaxTTL is the longest lifetime an instance token may claim.
-	instanceMaxTTL int64 = 900
+	// instanceMaxTTL is the longest lifetime an instance token may claim:
+	// 5 minutes, so a stolen key plus token stops working within 5 minutes
+	// of its issuer refusing to renew it (ans-spec issue 90). Renewal happens
+	// at the issuer; this verifier never accepts an expired token.
+	instanceMaxTTL int64 = 300
+	// instanceMaxSidLen bounds sid, the issuer's session id.
+	instanceMaxSidLen = 128
 	// instanceIATSkew is how far an instance token's iat may lead our clock.
 	instanceIATSkew int64 = 120
 	// statusIATSkew is how far a status token's iat may lead our clock.
@@ -159,6 +164,8 @@ type instanceClaims struct {
 	hasScope                    bool
 	act                         json.RawMessage
 	authorizationDetails        json.RawMessage
+	// sid is the issuer's session id; empty when the token carries none.
+	sid string
 }
 
 // instanceToken is a parsed, not yet verified, instance token.
@@ -380,7 +387,26 @@ func decodeInstanceClaims(payload map[string]json.RawMessage) (instanceClaims, e
 	if c.authorizationDetails != nil && !bytes.HasPrefix(bytes.TrimSpace(c.authorizationDetails), []byte("[")) {
 		return c, refuse(codeBadToken, CategoryMalformedProof, "authorization_details must be a list")
 	}
+	if raw, present := payload["sid"]; present {
+		if json.Unmarshal(raw, &c.sid) != nil || !validSid(c.sid) {
+			return c, refuse(codeBadToken, CategoryMalformedProof, "sid must be 1-128 printable characters")
+		}
+	}
 	return c, checkAct(c.act, c.jkt)
+}
+
+// validSid reports whether s is a session id as the issuer mints one: 1 to
+// 128 printable ASCII characters, no space (src/instance_token.py _valid_sid).
+func validSid(s string) bool {
+	if s == "" || len(s) > instanceMaxSidLen {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '!' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // checkAct enforces RFC 8693 actor claims one hop deep: act, when present,

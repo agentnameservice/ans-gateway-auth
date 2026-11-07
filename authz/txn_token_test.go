@@ -146,7 +146,9 @@ func checkRandomIDs(t *testing.T, claims map[string]any, randomTxn bool) {
 // exact claim set. act is always the single hop {"sub":"instance:<cnf.jkt>"}:
 // for a child (whose act already names that key) and for a parent alike. The
 // parent instance of a child is not named. exp is iat + ttl, below the
-// instance token's own exp.
+// instance token's own exp. sid, the issuer's session id, is copied when the
+// instance token carries one and absent otherwise, so an upstream's audit
+// line can name the session an issuer later revokes.
 func TestTxnTokenInstanceModeClaims(t *testing.T) {
 	t.Parallel()
 	iv := loadInstanceVectors(t)
@@ -154,19 +156,29 @@ func TestTxnTokenInstanceModeClaims(t *testing.T) {
 	for _, vec := range iv.Vectors {
 		byName[vec.Name] = vec
 	}
-	for _, name := range []string{"valid", "valid_child_with_act"} {
+	for _, name := range []string{"valid", "valid_child_with_act", "valid_with_sid"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			vec := byName[name]
+			vec, ok := byName[name]
+			if !ok {
+				t.Fatalf("no vector %q", name)
+			}
 			e := vec.Expect
-			want, err := json.Marshal(map[string]any{
+			wantClaims := map[string]any{
 				"iss": testTxnIssuer, "aud": testTxnAudience, "iat": iv.Now, "exp": iv.Now + 60,
 				"txn": testRequestID, "sub": e.Sub, "act": map[string]string{"sub": "instance:" + e.JKT},
 				"cnf": map[string]string{"jkt": e.JKT}, "scope": e.Scope,
 				"authorization_details": e.AuthorizationDetails,
 				"ans_issuer":            map[string]string{"host": e.Iss, "ans_name": e.AnsName, "cert_fp": e.Fingerprint},
 				"rctx":                  map[string]string{"method": "POST", "path": "/mcp"},
-			})
+			}
+			if e.Sid != "" {
+				wantClaims["sid"] = e.Sid
+			}
+			if name == "valid_with_sid" && e.Sid != "sess-test-0001" {
+				t.Fatalf("vector sid = %q, want sess-test-0001", e.Sid)
+			}
+			want, err := json.Marshal(wantClaims)
 			if err != nil {
 				t.Fatal(err)
 			}

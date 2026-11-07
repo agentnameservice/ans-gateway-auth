@@ -166,7 +166,7 @@ of the issuer's own identity certificate. With `instanceMode.enabled`, such a ca
 
 | Header | Value |
 |---|---|
-| `Authorization` | `DPoP <instance token>`: a compact JWS whose header is exactly `{"alg":"ES256","typ":"instance+jwt","x5c":[<issuer identity cert>]}`, with claims `iss`, `ans_name`, `aud`, `sub`, `scope`, `authorization_details`, `iat`, `exp` (at most 900 s after `iat`), `jti`, `cnf.jkt` and, for a child, `act` |
+| `Authorization` | `DPoP <instance token>`: a compact JWS whose header is exactly `{"alg":"ES256","typ":"instance+jwt","x5c":[<issuer identity cert>]}`, with claims `iss`, `ans_name`, `aud`, `sub`, `scope`, `authorization_details`, `iat`, `exp` (at most 300 s after `iat`; the instance renews it at its issuer, never here), `jti`, `cnf.jkt`, optionally `sid` (the issuer's session id, copied into the transaction token) and, for a child, `act` |
 | `DPoP` | a proof whose header carries a bare P-256 `jwk` (no `x5c`), with `htm`, `htu`, `iat`, `jti`, `ath` and `ans_content_digest` |
 | `X-ANS-Status-Token` | the issuer's TL status token |
 
@@ -291,6 +291,7 @@ The header is `{"alg":"ES256","typ":"txntoken+jwt","kid":<RFC 7638 thumbprint>}`
 | `sub` | the user (`sub` of the instance token); in certificate mode, the caller's ANS name |
 | `act` | instance mode only: the single hop `{"sub":"instance:<cnf.jkt>"}`, the key that signed the request. A child instance token's own `act` must already name that key (otherwise `act_mismatch`). The parent instance a child was minted from is not named: delegation is one hop, and a child token carries no parent key |
 | `cnf.jkt` | the key that signed the request's DPoP proof |
+| `sid` | instance mode only, when the instance token carries one: the issuer's session id, so an upstream's audit line names the session the issuer may later revoke |
 | `scope`, `authorization_details` | copied from the instance token when present |
 | `ans_issuer` | instance mode only: `{host, ans_name, cert_fp}`, the issuer and the SHA-256 of its identity certificate |
 | `rctx` | `{method, path}` of the request, without the query |

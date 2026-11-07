@@ -228,15 +228,18 @@ type txnConfirmation struct {
 // txnClaims is the verified context. Optional members are omitted, never
 // sent empty.
 type txnClaims struct {
-	Iss                  string            `json:"iss"`
-	Aud                  string            `json:"aud"`
-	Iat                  int64             `json:"iat"`
-	Exp                  int64             `json:"exp"`
-	Jti                  string            `json:"jti"`
-	Txn                  string            `json:"txn"`
-	Sub                  string            `json:"sub"`
-	Act                  json.RawMessage   `json:"act,omitempty"`
-	Cnf                  txnConfirmation   `json:"cnf"`
+	Iss string          `json:"iss"`
+	Aud string          `json:"aud"`
+	Iat int64           `json:"iat"`
+	Exp int64           `json:"exp"`
+	Jti string          `json:"jti"`
+	Txn string          `json:"txn"`
+	Sub string          `json:"sub"`
+	Act json.RawMessage `json:"act,omitempty"`
+	Cnf txnConfirmation `json:"cnf"`
+	// Sid is the issuer's session id from an instance token, so an
+	// upstream's audit can name the session its issuer may later revoke.
+	Sid                  string            `json:"sid,omitempty"`
 	Scope                *string           `json:"scope,omitempty"`
 	AuthorizationDetails json.RawMessage   `json:"authorization_details,omitempty"`
 	AnsIssuer            *txnIssuer        `json:"ans_issuer,omitempty"`
@@ -302,7 +305,7 @@ func instanceTxnClaims(it *instanceToken) (txnClaims, error) {
 	}
 	fp := sha256.Sum256(it.certDER)
 	claims := txnClaims{
-		Sub: c.sub, Act: act, Cnf: txnConfirmation{JKT: c.jkt},
+		Sub: c.sub, Act: act, Cnf: txnConfirmation{JKT: c.jkt}, Sid: c.sid,
 		AuthorizationDetails: c.authorizationDetails,
 		AnsIssuer:            &txnIssuer{Host: c.iss, AnsName: c.ansName, CertFP: hex.EncodeToString(fp[:])},
 		notAfter:             c.exp,

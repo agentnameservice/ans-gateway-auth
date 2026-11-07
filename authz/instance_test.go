@@ -65,6 +65,7 @@ type instanceExpect struct {
 	Scope                string          `json:"scope"`
 	Act                  json.RawMessage `json:"act"`
 	AuthorizationDetails json.RawMessage `json:"authorizationDetails"`
+	Sid                  string          `json:"sid"`
 }
 
 func loadInstanceVectors(t *testing.T) *instanceVectors {
