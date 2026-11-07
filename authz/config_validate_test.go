@@ -51,6 +51,33 @@ func TestConfigValidate(t *testing.T) {
 		{name: "extra identity headers colliding by case", mutate: func(c *Config) {
 			c.ExtraIdentityHeaders = map[string]string{"x-caller": "agent_id", "X-Caller": "ans_name"}
 		}, wantErr: "collides"},
+		{name: "instance mode with issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3}
+		}},
+		{name: "instance mode off ignores its other fields", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{AllowedIssuers: []string{"Not A Host"}}
+		}},
+		{name: "instance mode without issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true}
+		}, wantErr: "instanceMode.allowedIssuers"},
+		{name: "instance issuer not lowercase", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"Issuer.example.test"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance issuer as a URL", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"https://issuer.example.test"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance issuer with a port", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test:443"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance expected aud as a URL", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				ExpectedAud: "https://gw.example.com"}
+		}, wantErr: "instanceMode.expectedAud"},
+		{name: "instance cap negative", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxInstancesPerSub: -1}
+		}, wantErr: "maxInstancesPerSub"},
 		{name: "neither trusted hosts nor external authority", mutate: func(c *Config) {
 			c.TrustedHosts = nil
 		}, wantErr: "trustedHosts or externalAuthority"},
