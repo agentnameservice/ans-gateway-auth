@@ -67,18 +67,30 @@ func reservedTxnHeaders() []string {
 	return append(names, instanceHeaders...)
 }
 
+// headerName is the header the token travels in. An empty Header means
+// DefaultTxnHeader, so a Config built by hand (not from DefaultConfig) still
+// validates as it did before transaction tokens existed, and the verifier
+// still strips a client-sent Txn-Token when minting is off.
+func (tt TransactionToken) headerName() string {
+	if tt.Header == "" {
+		return DefaultTxnHeader
+	}
+	return tt.Header
+}
+
 func (tt TransactionToken) validate(extra map[string]string) error {
-	if !validHeaderName(tt.Header) {
-		return fmt.Errorf("authz: transactionToken.header %q is not a valid header name", tt.Header)
+	header := tt.headerName()
+	if !validHeaderName(header) {
+		return fmt.Errorf("authz: transactionToken.header %q is not a valid header name", header)
 	}
 	for _, name := range reservedTxnHeaders() {
-		if strings.EqualFold(name, tt.Header) {
-			return fmt.Errorf("authz: transactionToken.header %q collides with %s", tt.Header, name)
+		if strings.EqualFold(name, header) {
+			return fmt.Errorf("authz: transactionToken.header %q collides with %s", header, name)
 		}
 	}
 	for name := range extra {
-		if strings.EqualFold(name, tt.Header) {
-			return fmt.Errorf("authz: transactionToken.header %q collides with extraIdentityHeaders %q", tt.Header, name)
+		if strings.EqualFold(name, header) {
+			return fmt.Errorf("authz: transactionToken.header %q collides with extraIdentityHeaders %q", header, name)
 		}
 	}
 	if !tt.Enabled {
@@ -207,7 +219,7 @@ func (m *TxnMinter) KeyID() string { return m.kid }
 func (m *TxnMinter) JWKS() []byte { return m.jwks }
 
 // HeaderName is the header the token travels in.
-func (m *TxnMinter) HeaderName() string { return m.cfg.Header }
+func (m *TxnMinter) HeaderName() string { return m.cfg.headerName() }
 
 // txnIssuer is the ANS issuer behind an instance-mode caller.
 type txnIssuer struct {
@@ -331,7 +343,7 @@ func (v *Verifier) attachTxn(d Decision, r *Request, claims txnClaims) Decision 
 		return d
 	}
 	if v.txn == nil {
-		d.RemoveHeaders = append(d.RemoveHeaders, strings.ToLower(v.cfg.TransactionToken.Header))
+		d.RemoveHeaders = append(d.RemoveHeaders, strings.ToLower(v.cfg.TransactionToken.headerName()))
 		return d
 	}
 	tok, err := v.txn.mint(claims, r, v.now())

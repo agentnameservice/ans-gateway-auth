@@ -185,9 +185,15 @@ func TestConfigValidate(t *testing.T) {
 			c.TransactionToken = validTxn()
 			c.TransactionToken.TTL = 500 * time.Millisecond
 		}, wantErr: "whole number of seconds"},
-		{name: "transaction token header empty", mutate: func(c *Config) {
+		// An empty header means DefaultTxnHeader, so Config literals written
+		// before transaction tokens existed still validate.
+		{name: "transaction token header empty uses the default", mutate: func(c *Config) {
 			c.TransactionToken.Header = ""
-		}, wantErr: "transactionToken.header"},
+		}},
+		{name: "transaction token header empty collides with an extra header", mutate: func(c *Config) {
+			c.TransactionToken.Header = ""
+			c.ExtraIdentityHeaders = map[string]string{"Txn-Token": "agent_id"}
+		}, wantErr: "collides"},
 		{name: "transaction token header invalid", mutate: func(c *Config) {
 			c.TransactionToken.Header = "Txn Token"
 		}, wantErr: "transactionToken.header"},
@@ -324,5 +330,17 @@ func TestHeaderFieldChecks(t *testing.T) {
 		if got := validHeaderValue(tc.value); got != tc.ok {
 			t.Errorf("validHeaderValue(%q) = %v, want %v", tc.value, got, tc.ok)
 		}
+	}
+}
+
+// TestConfigValidateZeroTransactionToken holds the library contract from
+// main: a Config built by hand, not from DefaultConfig, still validates when
+// transaction tokens are off, so importers' existing literals keep working.
+func TestConfigValidateZeroTransactionToken(t *testing.T) {
+	t.Parallel()
+	c := Config{TrustedHosts: []string{"https://gw.example.com"}, PoPSkew: DefaultPoPSkew,
+		MaxContentBytes: DefaultMaxContentBytes, CheckTimeout: DefaultCheckTimeout}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() on a Config with a zero TransactionToken = %v, want nil", err)
 	}
 }

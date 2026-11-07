@@ -78,7 +78,9 @@ func (v *Verifier) checkProofClaims(r *Request, payload map[string]json.RawMessa
 	case !ok:
 		return nil, refuse(codeBadDPoP, CategoryMalformedProof, "missing iat")
 	}
-	if skew := int64(v.cfg.PoPSkew / time.Second); now-iat > skew || iat-now > skew {
+	// Compare against the window's bounds rather than subtracting iat: for an
+	// iat near the int64 minimum, now-iat wraps negative and would read as fresh.
+	if skew := int64(v.cfg.PoPSkew / time.Second); iat < now-skew || iat > now+skew {
 		return nil, refuse(codeClockSkew, CategoryProofStale, fmt.Sprintf("proof iat %d is %+ds from now", iat, iat-now))
 	}
 	if !strings.EqualFold(jsonString(payload["htm"]), r.Method) {

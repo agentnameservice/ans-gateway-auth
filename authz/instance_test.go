@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -672,6 +673,11 @@ func TestInstanceEdgeCases(t *testing.T) {
 		{name: "proof jti over the SDK limit", payload: func(p map[string]any) { p["jti"] = strings.Repeat("j", 129) }, code: "bad_dpop", category: CategoryMalformedProof},
 		{name: "proof without iat", payload: func(p map[string]any) { delete(p, "iat") }, code: "bad_dpop", category: CategoryMalformedProof},
 		{name: "proof iat in the future", payload: func(p map[string]any) { p["iat"] = iv.Now + 500 }, code: "clock_skew", category: CategoryProofStale},
+		// now-iat wraps to a negative int64 for this iat, which an overflowing
+		// skew check reads as fresh.
+		{name: "proof iat 2^63 seconds in the past", payload: func(p map[string]any) { p["iat"] = iv.Now + math.MinInt64 }, code: "clock_skew", category: CategoryProofStale},
+		{name: "proof iat at the int64 minimum", payload: func(p map[string]any) { p["iat"] = int64(math.MinInt64) }, code: "clock_skew", category: CategoryProofStale},
+		{name: "proof iat zero", payload: func(p map[string]any) { p["iat"] = 0 }, code: "clock_skew", category: CategoryProofStale},
 		{name: "proof htu not absolute", payload: func(p map[string]any) { p["htu"] = "/mcp" }, code: "htu_mismatch", category: CategoryHTTPBindingMismatch},
 		{name: "proof htu not a URL", payload: func(p map[string]any) { p["htu"] = "https://%zz" }, code: "htu_mismatch", category: CategoryHTTPBindingMismatch},
 		{name: "proof htu on another port", payload: func(p map[string]any) { p["htu"] = iv.TrustedHost + ":8443/mcp" }, code: "htu_mismatch", category: CategoryHTTPBindingMismatch},
