@@ -146,6 +146,9 @@ type Verifier struct {
 	statusCache StatusCache
 	// issuerAgents maps each instanceMode.issuers host to its agent id.
 	issuerAgents map[string]string
+	// issuerLogs maps each instanceMode.issuers host to the transparency log
+	// whose keys must sign its status token.
+	issuerLogs map[string]string
 	// txn mints transaction tokens; nil when transactionToken is off.
 	txn *TxnMinter
 }
@@ -252,8 +255,10 @@ func (v *Verifier) wireStatusCache() {
 		v.statusCache = NewMemoryStatusCache()
 	}
 	v.issuerAgents = make(map[string]string, len(im.Issuers))
+	v.issuerLogs = make(map[string]string, len(im.Issuers))
 	for _, is := range im.Issuers {
 		v.issuerAgents[is.Host] = is.AgentID
+		v.issuerLogs[is.Host] = is.TL
 	}
 }
 

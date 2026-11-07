@@ -255,7 +255,7 @@ func (a *app) loadIssuerStatus(ctx context.Context) error {
 		}
 		tl, _ := a.cfg.TransparencyLog(is.TL)
 		sources = append(sources, authz.IssuerStatusSource{
-			Host: is.Host, AgentID: is.AgentID, Fetch: client.FetchStatusToken, Timeout: tl.Timeout,
+			Host: is.Host, AgentID: is.AgentID, TL: is.TL, Fetch: client.FetchStatusToken, Timeout: tl.Timeout,
 		})
 		a.metrics.PreregisterIssuer(is.Host)
 		a.logger.InfoContext(ctx, "instance-mode issuer status cache", "issuer", is.Host, "agent_id", is.AgentID,

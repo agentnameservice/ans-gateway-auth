@@ -53,7 +53,9 @@ type IssuerStatus struct {
 	Iat int64
 	// Terminal records that the TL reported the issuer REVOKED, EXPIRED or
 	// superseded (410, or a signed terminal token); every request for it is
-	// refused until the refresher installs a live answer from the TL.
+	// refused for the life of the process. Under ANS such an agent id does
+	// not return to ACTIVE, and a later ACTIVE answer may be a stale replica
+	// or a replayed response.
 	Terminal bool
 	// Raw is the status token as the TL signed it, for a shared store that
 	// re-verifies; nil for a terminal entry learned from a 410.
@@ -66,16 +68,17 @@ type IssuerStatus struct {
 // write paths, kept apart so a client can never undo what the TL said:
 //
 //   - Install records the TL's own current answer, from the background
-//     refresher only, and replaces the entry unconditionally: the TL is
-//     authoritative, so a live answer clears a terminal entry and a terminal
-//     answer replaces any live one. Entries from the two clocks (a 410 dated
-//     by the gateway, a token dated by the TL) are never compared.
+//     refresher only. It replaces a live entry unconditionally, so a terminal
+//     answer replaces any live one, and never replaces a terminal entry.
+//     Entries from the two clocks (a 410 dated by the gateway, a token dated
+//     by the TL) are never compared.
 //   - OfferPresented records a token a client presented after it verified.
 //     It never creates an entry, never replaces a terminal one, and replaces
 //     a live one only when its iat is later; it reports whether it did.
 //
 // The in-memory implementation serves one verifier process; a shared store
-// can replace it.
+// can replace it, but must make each write a compare-and-set, since
+// MemoryStatusCache relies on its lock for that.
 type StatusCache interface {
 	Get(agentID string) (IssuerStatus, bool)
 	Install(s IssuerStatus)
@@ -110,6 +113,9 @@ func (c *MemoryStatusCache) Install(s IssuerStatus) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if cur, ok := c.entries[s.AgentID]; ok && cur.Terminal {
+		return
+	}
 	c.entries[s.AgentID] = s
 }
 
@@ -146,6 +152,10 @@ type IssuerStatusSource struct {
 	Host string
 	// AgentID is the issuer's ANS agent id.
 	AgentID string
+	// TL names the transparencyLogs entry whose keys must sign the issuer's
+	// status token (issuers[].tl); a token another configured log signed is
+	// refused.
+	TL string
 	// Fetch reads the status token from the issuer's TL.
 	Fetch StatusFetcher
 	// Timeout bounds one fetch; zero selects DefaultKeyFetchTimeout.
@@ -197,6 +207,8 @@ func NewStatusRefresher(cache StatusCache, keys KeyProvider, maxStatusAge time.D
 			return nil, errors.New("authz: status source needs a host")
 		case s.AgentID == "":
 			return nil, fmt.Errorf("authz: status source %q needs an agent id", s.Host)
+		case s.TL == "":
+			return nil, fmt.Errorf("authz: status source %q needs a transparency log", s.Host)
 		case s.Fetch == nil:
 			return nil, fmt.Errorf("authz: status source %q needs a fetch function", s.Host)
 		}
@@ -265,14 +277,20 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 	}
 	var tokErr *scitt.TokenError
 	if errors.As(err, &tokErr) && tokErr.Type == scitt.TokenErrTerminalStatus {
-		// The SDK checks the signature before the status, so this is the
-		// TL's own statement; it withholds the payload, so the entry is
-		// dated by our clock.
+		// The SDK checks the signature before the status, so this is a
+		// configured TL's own statement. It withholds the payload, so the
+		// agent id and host are not checked here (doing so needs a CBOR
+		// decoder this module does not depend on directly): a wrong agent's
+		// terminal token fails closed, no worse than the unsigned 410 above.
+		// The entry is dated by our clock.
 		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
 		return StatusRefreshTerminal, nil
 	}
 	if err != nil {
 		return StatusRefreshFailure, fmt.Errorf("issuer %s: status token: %w", src.Host, err)
+	}
+	if !holdsKey(r.keys, src.TL, st.KeyID) {
+		return StatusRefreshFailure, fmt.Errorf("issuer %s: status token is not signed by transparency log %q", src.Host, src.TL)
 	}
 	if err := checkFetchedStatus(&st.Payload, src, now); err != nil {
 		return StatusRefreshFailure, err
@@ -297,6 +315,28 @@ func checkFetchedStatus(p *scitt.StatusTokenPayload, src *IssuerStatusSource, no
 	return nil
 }
 
+// holdsKey reports whether the named key source holds kid, the key a status
+// token verified under. A provider that cannot say (not a Keyring) fails
+// closed: issuers[].tl cannot be enforced, so no token is trusted.
+func holdsKey(keys KeyProvider, source string, kid [4]byte) bool {
+	h, ok := keys.(interface{ HoldsKey(string, [4]byte) bool })
+	return ok && h.HoldsKey(source, kid)
+}
+
+// firstWait is how long Run waits before an issuer's first refresh: at once
+// when nothing live is cached, otherwise the jittered interval measured from
+// the cached token's iat, not from Run, so a slow startup (a replay backend
+// that took startupTimeout to come up) does not leave the startup token past
+// maxStatusAge.
+func (r *StatusRefresher) firstWait(agentID string) time.Duration {
+	cached, ok := r.cache.Get(agentID)
+	if !ok || cached.Terminal {
+		return 0
+	}
+	age := time.Duration(r.now().Unix()-cached.Iat) * time.Second
+	return max(0, r.jittered()-age)
+}
+
 // Run refreshes every issuer until ctx ends: one goroutine per issuer, each
 // refreshing at once when nothing is cached for it, then every
 // maxStatusAge/2 shortened by up to 20% jitter, and after a failure with
@@ -312,11 +352,7 @@ func (r *StatusRefresher) Run(ctx context.Context) {
 
 func (r *StatusRefresher) runOne(ctx context.Context, host, agentID string) {
 	failures := 0
-	wait := r.jittered()
-	if _, ok := r.cache.Get(agentID); !ok {
-		wait = 0
-	}
-	timer := time.NewTimer(wait)
+	timer := time.NewTimer(r.firstWait(agentID))
 	defer timer.Stop()
 	for {
 		select {
@@ -350,8 +386,9 @@ func (r *StatusRefresher) backoff(n int) time.Duration {
 }
 
 // cachedIssuerStatus picks the status token a cache-mode request is judged
-// on. The presented token must verify under the cached root keys (no
-// on-demand refresh: no TL call on the request path), be unexpired, not
+// on. The presented token must verify under the cached root keys of the
+// issuer's own transparency log (issuers[].tl; no on-demand refresh: no TL
+// call on the request path), be unexpired, not
 // lead our clock by more than 60 s, and name the issuer's configured agent.
 // A terminal entry refuses at once, as does a REVOKED presented token.
 // Until the first background fetch succeeds the issuer is status_stale.
@@ -363,6 +400,10 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 	presented, err := scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
 	if err != nil {
 		return nil, statusFailure(ctx, err)
+	}
+	if tl := v.issuerLogs[it.claims.iss]; !holdsKey(v.keys, tl, presented.KeyID) {
+		return nil, refuse(codeBadStatusToken, CategoryStatusInvalid, "status token is not signed by issuer "+
+			echoValue(it.claims.iss)+"'s transparency log "+echoValue(tl))
 	}
 	if err := checkStatusClock(&presented.Payload, now, boundedStatusIATSkew); err != nil {
 		return nil, err

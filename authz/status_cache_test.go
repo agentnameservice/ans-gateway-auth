@@ -215,7 +215,7 @@ func (f *fetcher) fetch(context.Context, string) ([]byte, error) {
 func (h *statusHarness) refresher(f StatusFetcher, offset *atomic.Int64, obs StatusObserver) *StatusRefresher {
 	h.t.Helper()
 	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, obs, nil,
-		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, Fetch: f, Timeout: time.Second})
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: f, Timeout: time.Second})
 	if err != nil {
 		h.t.Fatalf("NewStatusRefresher: %v", err)
 	}
@@ -233,8 +233,9 @@ func requireAllowed(t *testing.T, d Decision, what string) {
 // TestMemoryStatusCacheWrites splits the two write paths. OfferPresented
 // (a client's token) only moves a live entry forward and never replaces a
 // terminal one, whatever its iat. Install (the TL's own current answer)
-// replaces unconditionally, so a live TL token clears a terminal entry and a
-// terminal answer replaces a newer-iat live one.
+// replaces a live entry unconditionally, so a terminal answer replaces a
+// newer-iat live one, but never replaces a terminal entry: under ANS a
+// revoked, expired or superseded agent id does not return to ACTIVE.
 func TestMemoryStatusCacheWrites(t *testing.T) {
 	t.Parallel()
 	c := NewMemoryStatusCache()
@@ -261,9 +262,12 @@ func TestMemoryStatusCacheWrites(t *testing.T) {
 	if got, _ := c.Get("a"); !got.Terminal {
 		t.Fatalf("terminal entry lost: %+v", got)
 	}
-	c.Install(IssuerStatus{AgentID: "a", Iat: 40})
-	if got, _ := c.Get("a"); got.Terminal || got.Iat != 40 {
-		t.Fatalf("Install of a live TL answer did not clear the terminal entry: %+v", got)
+	// A stale or replayed ACTIVE answer, older or newer, cannot undo it.
+	for _, iat := range []int64{40, 1 << 41} {
+		c.Install(IssuerStatus{AgentID: "a", Iat: iat})
+		if got, _ := c.Get("a"); !got.Terminal {
+			t.Fatalf("Install of a live answer (iat %d) cleared the terminal entry: %+v", iat, got)
+		}
 	}
 	if c.OfferPresented(IssuerStatus{Iat: 1}) {
 		t.Fatal("an entry without an agent id was accepted")
@@ -432,6 +436,23 @@ func TestStatusCachePresentedExpiredRefused(t *testing.T) {
 	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(expired)), codeStatusExpired)
 }
 
+// TestStatusCacheCachedExpiredRefused: the cached token wins (its iat is
+// newer than the presented one) but has passed its exp while still within
+// maxStatusAge, which a status token shorter-lived than maxStatusAge allows.
+// It is refused status_expired; the age check alone would admit it.
+func TestStatusCacheCachedExpiredRefused(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	raw := h.mintFor(h.iv.AgentID, h.ansName, scitt.StatusActive, -10, -1)
+	st, err := scitt.VerifyStatusTokenAt(raw, h.keys, 0, h.iv.Now-10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	d := h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -20)))
+	requireInstanceDenial(t, d, codeStatusExpired)
+}
+
 // TestStatusCacheBothStale refuses when neither token is within maxStatusAge.
 func TestStatusCacheBothStale(t *testing.T) {
 	t.Parallel()
@@ -503,16 +524,32 @@ func TestStatusCacheRevokedCachedRefuses(t *testing.T) {
 			if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
 				t.Fatalf("cache entry %+v is not terminal", got)
 			}
-			// Only the TL's own live answer clears the entry, even one whose
-			// iat is below the gateway-clock date of the terminal entry (a
-			// TL clock that lags ours).
+			// A later ACTIVE answer for the same agent id (a lagging TL
+			// replica, a cache, a replayed response) leaves it terminal: the
+			// entry lasts for the life of the process.
 			offset.Store(10)
 			f.set(h.mint(scitt.StatusActive, -5), nil)
 			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
 				t.Fatal(err)
 			}
-			requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -60))), "after the TL issued a newer token")
+			requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
 		})
+	}
+}
+
+// TestStatusRefresherTerminalFailsClosed pins the signed-terminal path: the
+// SDK withholds a terminal token's payload, so a REVOKED token the TL serves
+// for another agent still marks the issuer revoked (fail closed, like a 410).
+func TestStatusRefresherTerminalFailsClosed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	f.set(h.mintFor("00000000-0000-4000-8000-0000000000ff", h.ansName, scitt.StatusRevoked, -1, 3600), nil)
+	if err := h.refresher(f.fetch, new(atomic.Int64), nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("cache entry %+v, want terminal", got)
 	}
 }
 
@@ -549,6 +586,66 @@ func TestStatusCachePresentedForAnotherAgent(t *testing.T) {
 		t.Fatalf("Category = %q", d.Deny.Category)
 	}
 }
+
+// TestStatusCacheOtherTLCannotVouch: issuers[].tl binds which transparency
+// log may vouch for an issuer. A status token another configured TL signed,
+// naming the issuer's agent, is refused on the request path and never
+// cached, and the refresher refuses one too.
+func TestStatusCacheOtherTLCannotVouch(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	other := newStatusHarness(t)
+	other.iv, other.vec, other.ansName, other.certFP = h.iv, h.vec, h.ansName, h.certFP
+	otherStore, err := scitt.NewKeyStore([]string{other.line})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := h.keys.inner.(*Keyring)
+	h.keys = &countingKeys{inner: mustKeyring(t, NoopObserver{},
+		inner.sources[0], KeySource{Name: "other-tl", Lookup: otherStore})}
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := h.refresher(f.fetch, &offset, nil)
+	f.set(h.mint(scitt.StatusActive, -30), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	v := h.verifier()
+	d := v.Verify(t.Context(), h.request(other.mint(scitt.StatusActive, -1)))
+	requireInstanceDenial(t, d, codeBadStatusToken)
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-30 {
+		t.Fatalf("another TL's token entered the cache: iat %d", got.Iat)
+	}
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), "the issuer's own TL")
+
+	f.set(other.mint(scitt.StatusActive, -1), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err == nil || !strings.Contains(err.Error(), "test-tl") {
+		t.Fatalf("Refresh of another TL's token = %v, want a failure naming test-tl", err)
+	}
+}
+
+// TestStatusCacheOpaqueKeysFailClosed: a key provider that cannot say which
+// transparency log holds a key cannot bind issuers[].tl, so cache mode
+// refuses rather than trusting every log.
+func TestStatusCacheOpaqueKeysFailClosed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 30, Token: mustVerify(t, h, h.mint(scitt.StatusActive, -30))})
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(h.config(), opaqueKeys{h.keys}, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeBadStatusToken)
+}
+
+// opaqueKeys hides HoldsKey from the provider it wraps.
+type opaqueKeys struct{ inner KeyProvider }
+
+func (o opaqueKeys) Get(kid [4]byte) (*scitt.TrustedKey, error) { return o.inner.Get(kid) }
+func (o opaqueKeys) RefreshFor(ctx context.Context) bool        { return o.inner.RefreshFor(ctx) }
 
 // TestStatusCachePresentedFutureIatNotCached: a presented token that fails a
 // check is never cached, so a future-dated token cannot pin the cache ahead.
@@ -749,7 +846,7 @@ func TestStatusRefresherUnknownKidRefreshesKeys(t *testing.T) {
 	f := &fetcher{}
 	f.set(h.mint(scitt.StatusActive, -1), nil)
 	r, err := NewStatusRefresher(h.cache, ring, testMaxStatusAge, nil, nil,
-		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, Fetch: f.fetch})
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "tl", Fetch: f.fetch})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,6 +907,31 @@ func TestStatusRefresherRun(t *testing.T) {
 	}
 }
 
+// TestStatusRefresherFirstWait schedules the first background refresh from
+// the cached entry's iat, not from Run: a startup that took long (a slow
+// replay backend) must not leave the startup token past maxStatusAge.
+func TestStatusRefresherFirstWait(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	var offset atomic.Int64
+	r := h.refresher((&fetcher{}).fetch, &offset, nil)
+	if w := r.firstWait(h.iv.AgentID); w != 0 {
+		t.Fatalf("nothing cached: first wait %s, want 0", w)
+	}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now, Token: mustVerify(t, h, h.mint(scitt.StatusActive, 0))})
+	if w := r.firstWait(h.iv.AgentID); w > r.interval || w < r.interval*8/10 {
+		t.Fatalf("token issued now: first wait %s, want the jittered interval", w)
+	}
+	offset.Store(100) // Run starts 100 s after the startup fetch
+	if w := r.firstWait(h.iv.AgentID); w > r.interval-100*time.Second || w < r.interval*8/10-100*time.Second {
+		t.Fatalf("100 s later: first wait %s, want the interval less 100 s", w)
+	}
+	offset.Store(int64(r.interval / time.Second))
+	if w := r.firstWait(h.iv.AgentID); w != 0 {
+		t.Fatalf("a full interval later: first wait %s, want 0", w)
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -826,7 +948,7 @@ func TestNewStatusRefresherErrors(t *testing.T) {
 	t.Parallel()
 	h := newStatusHarness(t)
 	fetch := (&fetcher{}).fetch
-	src := IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, Fetch: fetch}
+	src := IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: fetch}
 	for _, tc := range []struct {
 		name    string
 		cache   StatusCache
@@ -839,9 +961,10 @@ func TestNewStatusRefresherErrors(t *testing.T) {
 		{"no keys", h.cache, nil, time.Minute, []IssuerStatusSource{src}, "key provider"},
 		{"no max age", h.cache, h.keys, 0, []IssuerStatusSource{src}, "maxStatusAge"},
 		{"no sources", h.cache, h.keys, time.Minute, nil, "at least one"},
-		{"no host", h.cache, h.keys, time.Minute, []IssuerStatusSource{{AgentID: "a", Fetch: fetch}}, "host"},
-		{"no agent", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", Fetch: fetch}}, "agent"},
-		{"no fetch", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", AgentID: "a"}}, "fetch"},
+		{"no host", h.cache, h.keys, time.Minute, []IssuerStatusSource{{AgentID: "a", TL: "t", Fetch: fetch}}, "host"},
+		{"no agent", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", TL: "t", Fetch: fetch}}, "agent"},
+		{"no tl", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", AgentID: "a", Fetch: fetch}}, "transparency log"},
+		{"no fetch", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", AgentID: "a", TL: "t"}}, "fetch"},
 		{"duplicate host", h.cache, h.keys, time.Minute, []IssuerStatusSource{src, src}, "duplicate"},
 	} {
 		if _, err := NewStatusRefresher(tc.cache, tc.keys, tc.age, nil, nil, tc.sources...); err == nil || !strings.Contains(err.Error(), tc.want) {

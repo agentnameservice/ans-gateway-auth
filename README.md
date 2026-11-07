@@ -234,12 +234,16 @@ instanceMode:
   issuer, retrying until `startupTimeout`. An issuer still unreachable then is logged and startup
   continues; every request for it is refused `status_stale` until a fetch succeeds.
 - In the background, one loop per issuer refetches every `maxStatusAge`/2, up to 20% sooner
-  (jitter), and backs off from 1 s to at most 30 s after a failure. A fetched token passes the
-  same signature check, under the same root keys, as one on a request, and must name the
-  configured agent id and host; otherwise the cache keeps what it had.
+  (jitter), and backs off from 1 s to at most 30 s after a failure. The first background fetch is
+  scheduled from the startup token's `iat`, so a slow startup does not push it past
+  `maxStatusAge`. A fetched live token passes the same signature check as one on a request, under
+  the keys of the issuer's own `tl`, and must name the configured agent id and host; otherwise the
+  cache keeps what it had. A signed terminal token is checked for its signature only (the SDK
+  withholds its payload), so it fails closed like a `410`.
 - On a request the verifier never calls the TL and never refreshes root keys. The presented
-  status token must still verify under the cached root keys and name the issuer's configured agent
-  id. It is used only when its `iat` is later than the cached token's, and it then replaces the
+  status token must still verify under the cached root keys of the issuer's own `tl` (a token
+  another configured log signed is refused `bad_status_token`) and name the issuer's configured
+  agent id. It is used only when its `iat` is later than the cached token's, and it then replaces the
   cache entry; otherwise the cached token decides. Whichever token is used must have been issued
   within `maxStatusAge`, or the request is refused `status_stale` (fail closed).
 - A presented token that does not verify, or has expired, is refused (`bad_status_token`,
@@ -252,9 +256,10 @@ instanceMode:
   is refused `bad_status_token`.
 - A terminal issuer is refused `revoked` at once: a signed `REVOKED` or `EXPIRED` token on the
   request, or a TL that answers the background fetch with `410 Gone` or a signed terminal token.
-  The background refresher writes the TL's current answer over the cache entry unconditionally,
-  so only a live answer from the TL clears a terminal entry. A presented token never does,
-  whatever its `iat`, and never overwrites one recorded while its request was in flight.
+  A terminal entry stays terminal for the life of the process: under ANS a revoked, expired or
+  superseded agent id never returns to `ACTIVE`, so a later `ACTIVE` answer (a lagging TL replica,
+  a cache, a replayed response) cannot undo it. A presented token never does either, whatever its
+  `iat`, and never overwrites one recorded while its request was in flight.
 - The TL answers `410 Gone` for a revoked or expired agent and for one superseded by a version
   bump or re-registration. After either, the configured `agentId` is terminal and the issuer's
   new tokens are refused (`revoked` for the old id, `iss_mismatch` for a status token naming the
@@ -266,7 +271,9 @@ instanceMode:
   bypass: no 410 or withheld response can make a revoked issuer pass.
 
 A revocation is therefore seen within `maxStatusAge` plus the TL's publish delay, about four
-minutes for the 240 s above. The cache is per process; each replica fetches for itself.
+minutes for the 240 s above. The cache is per process; each replica fetches for itself. A
+shared-store `StatusCache` would need an atomic compare-and-set for `OfferPresented` (and for
+`Install`'s terminal check), because the in-memory cache relies on its lock.
 `ans_authz_issuer_status_refresh_total{issuer,result}` counts fetches by `success`, `failure` and
 `terminal`, and `ans_authz_issuer_status_last_success_timestamp_seconds{issuer}` is the time of the
 last one the TL answered; alert when it falls `maxStatusAge` behind.

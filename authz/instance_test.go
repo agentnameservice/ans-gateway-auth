@@ -106,6 +106,13 @@ func (c *countingKeys) RefreshFor(ctx context.Context) bool {
 
 func (c *countingKeys) calls() int64 { return c.gets.Load() + c.refreshes.Load() }
 
+// HoldsKey forwards to the wrapped provider, so a countingKeys over a
+// Keyring still binds issuers[].tl.
+func (c *countingKeys) HoldsKey(source string, kid [4]byte) bool {
+	h, ok := c.inner.(interface{ HoldsKey(string, [4]byte) bool })
+	return ok && h.HoldsKey(source, kid)
+}
+
 func (iv *instanceVectors) config() Config {
 	c := DefaultConfig()
 	c.TrustedHosts = []string{iv.TrustedHost}
@@ -708,6 +715,43 @@ func TestInstanceEdgeCases(t *testing.T) {
 				t.Fatalf("Category = %q, want %q (detail %q)", d.Deny.Category, c.category, d.Deny.Detail)
 			}
 		})
+	}
+}
+
+// TestInstancePresentedStatusUnknownKid: with the status cache off, a status
+// token under a TL key the keyring does not hold yet is verified again after
+// one on-demand root-key refresh, as certificate mode does.
+func TestInstancePresentedStatusUnknownKid(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	lookup := newMapLookup()
+	keys := &countingKeys{inner: mustKeyring(t, NoopObserver{}, KeySource{Name: "test-tl", Lookup: lookup, Timeout: time.Second,
+		Refresh: func(context.Context) error {
+			tk, err := scitt.ParseC2SPKey(h.line)
+			if err != nil {
+				return err
+			}
+			lookup.add(tk)
+			return nil
+		}})}
+	v := h.iv.verifier(t, h.iv.config(), keys)
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), "after a root-key refresh")
+	if n := keys.refreshes.Load(); n != 1 {
+		t.Fatalf("root-key refreshes = %d, want 1", n)
+	}
+}
+
+// TestInstancePresentedStatusExpired maps the SDK's expired-token error to
+// status_expired with the status cache off.
+func TestInstancePresentedStatusExpired(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	v := h.iv.verifier(t, h.iv.config(), h.keys)
+	expired := h.mintFor(h.iv.AgentID, h.ansName, scitt.StatusActive, -7200, -3600)
+	d := v.Verify(t.Context(), h.request(expired))
+	requireInstanceDenial(t, d, codeStatusExpired)
+	if !strings.Contains(d.Deny.Detail, "token expired at") {
+		t.Fatalf("Detail = %q, want the SDK's expiry error", d.Deny.Detail)
 	}
 }
 
