@@ -82,6 +82,7 @@ const (
 	codeClockSkew        = "clock_skew"
 	codeBadStatusToken   = "bad_status_token"
 	codeStatusExpired    = "status_expired"
+	codeStatusStale      = "status_stale"
 	codeBadRequest       = "bad_request"
 	codeBadAlg           = "bad_alg"
 	codeDepthExceeded    = "depth_exceeded"
@@ -99,6 +100,9 @@ const (
 	instanceIATSkew int64 = 120
 	// statusIATSkew is how far a status token's iat may lead our clock.
 	statusIATSkew int64 = 600
+	// boundedStatusIATSkew replaces statusIATSkew when maxStatusAge is set,
+	// so a future-dated status token cannot stretch its freshness window.
+	boundedStatusIATSkew int64 = 60
 	// instanceReplayGrace extends a proof's replay entry past its freshness
 	// window, as the SDK does for certificate-mode proofs.
 	instanceReplayGrace = 5 * time.Second
@@ -217,6 +221,9 @@ func (v *Verifier) instanceDecision(ctx context.Context, r *Request, base, tok s
 	}
 	st, err := v.issuerStatus(ctx, status, it, now)
 	if err != nil {
+		return Decision{}, err
+	}
+	if err := v.checkIssuerAllowed(it); err != nil {
 		return Decision{}, err
 	}
 	if err := v.checkAudience(it, base); err != nil {
@@ -528,8 +535,17 @@ func (v *Verifier) issuerStatus(ctx context.Context, raw []byte, it *instanceTok
 	if now >= p.Exp {
 		return nil, refuse(codeStatusExpired, CategoryStatusInvalid, fmt.Sprintf("status token expired at %d", p.Exp))
 	}
-	if p.Iat > now+statusIATSkew {
+	maxAge := int64(v.cfg.InstanceMode.MaxStatusAge / time.Second)
+	skew := statusIATSkew
+	if maxAge > 0 {
+		skew = boundedStatusIATSkew
+	}
+	if p.Iat > now+skew {
 		return nil, refuse(codeClockSkew, CategoryStatusInvalid, fmt.Sprintf("status token iat %d is %ds ahead", p.Iat, p.Iat-now))
+	}
+	if maxAge > 0 && now-p.Iat > maxAge {
+		return nil, refuse(codeStatusStale, CategoryStatusInvalid,
+			fmt.Sprintf("status token issued %ds ago, over maxStatusAge %ds", now-p.Iat, maxAge))
 	}
 	if err := checkIssuerNames(p, it); err != nil {
 		return nil, err
@@ -578,6 +594,25 @@ func checkIssuerNames(p *scitt.StatusTokenPayload, it *instanceToken) error {
 		}
 	}
 	return refuse(codeIssMismatch, CategoryBindingFailed, "identity certificate does not name "+echoValue(it.claims.ansName))
+}
+
+// checkIssuerAllowed applies allowedAnsNames to the issuer, compared on
+// version and host as the SDK compares certificate-mode callers.
+func (v *Verifier) checkIssuerAllowed(it *instanceToken) error {
+	if len(v.allowedNames) == 0 {
+		return nil
+	}
+	name, err := verify.ParseAnsName(it.claims.ansName)
+	if err == nil && v.allowedNames[canonicalAnsName(name)] {
+		return nil
+	}
+	return refusePolicy(codeIssMismatch, "issuer "+echoValue(it.claims.ansName)+" is not in allowedAnsNames")
+}
+
+// canonicalAnsName spells an ans:// name by version and host only, the SDK's
+// rule for allowedAnsNames.
+func canonicalAnsName(n *verify.AnsName) string {
+	return "ans://" + n.Version.String() + "." + n.Host
 }
 
 // checkAudience requires aud to be this verifier: instanceMode.expectedAud,
@@ -637,7 +672,10 @@ func (v *Verifier) instanceAllow(it *instanceToken, st *scitt.VerifiedStatusToke
 		Fingerprint: sha256.Sum256(it.certDER), JKT: c.jkt}
 	fingerprint := hex.EncodeToString(id.Fingerprint[:])
 	attributes := map[string]string{
-		MetadataANSName: id.AnsName, MetadataAgentID: id.AgentID, MetadataFingerprint: fingerprint, MetadataJKT: id.JKT,
+		// agent_id names the instance, not the issuer, for extraIdentityHeaders:
+		// a gateway keying a session subject on it must not merge every
+		// instance an issuer signs into one session.
+		MetadataANSName: id.AnsName, MetadataAgentID: c.jkt, MetadataFingerprint: fingerprint, MetadataJKT: c.jkt,
 	}
 	headers := map[string]string{
 		HeaderANSName: id.AnsName, HeaderANSAgentID: id.AgentID, HeaderANSFingerprint: fingerprint,

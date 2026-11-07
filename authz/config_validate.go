@@ -79,6 +79,9 @@ func (m InstanceMode) validate() error {
 	if m.MaxInstancesPerSub < 0 {
 		return errors.New("authz: instanceMode.maxInstancesPerSub must be zero (off) or positive")
 	}
+	if m.MaxStatusAge < 0 {
+		return errors.New("authz: instanceMode.maxStatusAge must be zero (off) or positive")
+	}
 	return nil
 }
 

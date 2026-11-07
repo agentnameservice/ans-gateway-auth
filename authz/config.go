@@ -75,6 +75,12 @@ type InstanceMode struct {
 	// the cap off. The count is per verifier process, not shared across
 	// replicas.
 	MaxInstancesPerSub int `yaml:"maxInstancesPerSub"`
+	// MaxStatusAge, when positive, refuses an issuer status token issued
+	// longer ago than this (STATUS_INVALID, reason status_stale), and lets
+	// its iat lead the verifier's clock by at most 60 s so a future-dated
+	// token cannot extend its freshness. Zero means the token is accepted
+	// until its own exp.
+	MaxStatusAge time.Duration `yaml:"maxStatusAge"`
 }
 
 // RequiredContext names a context-extension key and value the gateway must

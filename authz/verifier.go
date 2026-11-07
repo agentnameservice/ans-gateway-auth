@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
+	"github.com/agentnameservice/ans-sdk-go/verify"
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 
 	"github.com/agentnameservice/ans-gateway-auth/replay"
@@ -138,6 +139,8 @@ type Verifier struct {
 	limiter  *logLimiter
 	// instances enforces instanceMode.maxInstancesPerSub; nil when off.
 	instances *instanceCap
+	// allowedNames is allowedAnsNames in canonical form, for instance mode.
+	allowedNames map[string]bool
 }
 
 // extraHeader is one configured extraIdentityHeaders entry.
@@ -186,6 +189,13 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 	}
 	if len(cfg.AllowedAnsNames) > 0 {
 		v.baseOpts = append(v.baseOpts, pop.WithAllowedAnsNames(cfg.AllowedAnsNames...))
+		v.allowedNames = make(map[string]bool, len(cfg.AllowedAnsNames))
+		for _, n := range cfg.AllowedAnsNames {
+			// Validate already parsed every entry.
+			if parsed, err := verify.ParseAnsName(n); err == nil {
+				v.allowedNames[canonicalAnsName(parsed)] = true
+			}
+		}
 	}
 	v.instances = newInstanceCap(cfg.InstanceMode.MaxInstancesPerSub)
 	v.limiter = &logLimiter{
@@ -465,12 +475,11 @@ func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, toke
 			remove = append(remove, strings.ToLower(pop.DPoPHeader))
 		}
 	}
-	if v.cfg.InstanceMode.Enabled {
-		// A certificate-mode caller has no instance identity; an upstream that
-		// reads these headers must not see a client-supplied value.
-		for _, name := range instanceHeaders {
-			remove = append(remove, strings.ToLower(name))
-		}
+	// A certificate-mode caller has no instance identity; an upstream that
+	// reads these headers must never see a client-supplied value, whether or
+	// not instance mode is enabled.
+	for _, name := range instanceHeaders {
+		remove = append(remove, strings.ToLower(name))
 	}
 	return Decision{
 		Allowed:  true,

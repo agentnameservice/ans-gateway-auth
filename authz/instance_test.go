@@ -41,17 +41,17 @@ type instanceVectors struct {
 }
 
 type instanceVector struct {
-	Name          string         `json:"name"`
-	Description   string         `json:"description"`
-	Method        string         `json:"method"`
-	URL           string         `json:"url"`
-	Body          string         `json:"body"`
-	Token         string         `json:"token"`
-	DPoP          string         `json:"dpop"`
-	StatusToken   string         `json:"statusToken"`
-	PresentTwice  bool           `json:"presentTwice"`
-	PythonVerdict string         `json:"pythonVerdict"`
-	Expect        instanceExpect `json:"expect"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	Method       string         `json:"method"`
+	URL          string         `json:"url"`
+	Body         string         `json:"body"`
+	Token        string         `json:"token"`
+	DPoP         string         `json:"dpop"`
+	StatusToken  string         `json:"statusToken"`
+	PresentTwice bool           `json:"presentTwice"`
+	MaxStatusAge int64          `json:"maxStatusAge"`
+	Expect       instanceExpect `json:"expect"`
 }
 
 type instanceExpect struct {
@@ -223,7 +223,9 @@ func TestInstanceVectors(t *testing.T) {
 	for _, vec := range iv.Vectors {
 		t.Run(vec.Name, func(t *testing.T) {
 			t.Parallel()
-			v := iv.verifier(t, iv.config(), iv.keys(t))
+			cfg := iv.config()
+			cfg.InstanceMode.MaxStatusAge = time.Duration(vec.MaxStatusAge) * time.Second
+			v := iv.verifier(t, cfg, iv.keys(t))
 			if vec.PresentTwice {
 				if d := v.Verify(t.Context(), vec.request(t)); !d.Allowed {
 					t.Fatalf("first presentation denied: %+v", d.Deny)
@@ -750,5 +752,97 @@ func TestInstanceInfrastructureFaults(t *testing.T) {
 	}
 	if (&deniedError{denial: &Denial{Detail: "x"}}).Error() != "x" {
 		t.Fatal("deniedError text")
+	}
+}
+
+// TestInstanceAllowedAnsNames applies allowedAnsNames to the issuer in
+// instance mode, as it applies to the caller in certificate mode.
+func TestInstanceAllowedAnsNames(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	vec := validInstanceVector(t, iv)
+	cfg := iv.config()
+	cfg.AllowedAnsNames = []string{"ans://v1.0.0.other.example.test"}
+	d := iv.verifier(t, cfg, iv.keys(t)).Verify(t.Context(), vec.request(t))
+	requireInstanceDenial(t, d, "iss_mismatch")
+	if d.Deny.Category != CategoryExpectedPeerMismatch || d.Deny.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("Deny = %+v", d.Deny)
+	}
+	cfg.AllowedAnsNames = []string{vec.Expect.AnsName}
+	if d := iv.verifier(t, cfg, iv.keys(t)).Verify(t.Context(), vec.request(t)); !d.Allowed {
+		t.Fatalf("issuer listed in allowedAnsNames denied: %+v", d.Deny)
+	}
+}
+
+// TestCertificateModeStripsInstanceHeadersWhenOff strips the instance
+// headers from a certificate-mode allow even with instance mode off.
+func TestCertificateModeStripsInstanceHeadersWhenOff(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.verifier(t, testConfig()).Verify(t.Context(), f.signed(t, http.MethodGet, fixtureTarget, nil, nil))
+	if !d.Allowed {
+		t.Fatalf("denied: %+v", d.Deny)
+	}
+	for _, name := range []string{"x-ans-act", "x-ans-instance-sub", "x-ans-scope", "x-ans-authorization-details"} {
+		if !slices.Contains(d.RemoveHeaders, name) {
+			t.Fatalf("RemoveHeaders = %v, want %s", d.RemoveHeaders, name)
+		}
+	}
+}
+
+// TestInstanceExtraIdentityHeaders maps agent_id and jkt to the instance in
+// instance mode, so two instances of one issuer never share a session
+// subject, while ans_name and fingerprint stay the issuer's.
+func TestInstanceExtraIdentityHeaders(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	cfg := iv.config()
+	cfg.ExtraIdentityHeaders = map[string]string{
+		"x-session-subject": "agent_id", "x-key": "jkt", "x-caller": "ans_name", "x-cert": "fingerprint",
+	}
+	v := iv.verifier(t, cfg, iv.keys(t))
+	seen := map[string]bool{}
+	for _, vec := range iv.CapRequests[:3] { // sub1 key1, key1 again, key2
+		d := v.Verify(t.Context(), vec.request(t))
+		if !d.Allowed {
+			t.Fatalf("%s denied: %+v", vec.Name, d.Deny)
+		}
+		jkt := d.Headers[HeaderANSJKT]
+		if d.Headers["x-session-subject"] != jkt || d.Headers["x-key"] != jkt {
+			t.Fatalf("%s: extra headers %v, want agent_id and jkt = instance jkt %s", vec.Name, d.Headers, jkt)
+		}
+		if d.Headers["x-caller"] != d.Headers[HeaderANSName] || d.Headers["x-cert"] != d.Headers[HeaderANSFingerprint] {
+			t.Fatalf("%s: ans_name/fingerprint must stay the issuer's: %v", vec.Name, d.Headers)
+		}
+		if d.Headers[HeaderANSAgentID] != iv.AgentID {
+			t.Fatalf("X-ANS-Agent-Id = %q, want the issuer's %q", d.Headers[HeaderANSAgentID], iv.AgentID)
+		}
+		seen[d.Headers["x-session-subject"]] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("two instance keys produced %d distinct session subjects, want 2", len(seen))
+	}
+}
+
+// TestInstanceEmptyBody admits an empty body bound by the empty-content
+// digest (pop.EmptyContentDigest) and refuses one whose proof has no digest.
+func TestInstanceEmptyBody(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	byName := map[string]instanceVector{}
+	for _, vec := range iv.Vectors {
+		byName[vec.Name] = vec
+	}
+	ok, missing := byName["valid_empty_body"], byName["bad_dpop_no_content_digest"]
+	if ok.Body != "" || missing.Body != "" {
+		t.Fatalf("empty-body vectors carry bodies %q / %q", ok.Body, missing.Body)
+	}
+	if d := iv.verifier(t, iv.config(), iv.keys(t)).Verify(t.Context(), ok.request(t)); !d.Allowed {
+		t.Fatalf("empty body with the empty-content digest denied: %+v", d.Deny)
+	}
+	d := iv.verifier(t, iv.config(), iv.keys(t)).Verify(t.Context(), missing.request(t))
+	requireInstanceDenial(t, d, "bad_dpop")
+	if d.Deny.Category != CategoryMalformedProof {
+		t.Fatalf("Category = %q, want %q", d.Deny.Category, CategoryMalformedProof)
 	}
 }

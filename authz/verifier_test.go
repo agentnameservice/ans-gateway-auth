@@ -784,15 +784,18 @@ func TestVerifyCallerContext(t *testing.T) {
 
 func TestVerifyAllowContract(t *testing.T) {
 	t.Parallel()
+	instanceRemovals := []string{"x-ans-instance-sub", "x-ans-act", "x-ans-scope", "x-ans-authorization-details"}
 	tests := []struct {
 		name       string
 		strip      bool
 		withToken  bool
 		wantRemove []string
 	}{
-		{name: "strip without token", strip: true, wantRemove: []string{"x-scitt-receipt", "x-ans-status-token", "dpop"}},
-		{name: "strip with DPoP token", strip: true, withToken: true, wantRemove: []string{"x-scitt-receipt", "x-ans-status-token"}},
-		{name: "no strip"},
+		{name: "strip without token", strip: true, wantRemove: append([]string{"x-scitt-receipt", "x-ans-status-token", "dpop"}, instanceRemovals...)},
+		{name: "strip with DPoP token", strip: true, withToken: true, wantRemove: append([]string{"x-scitt-receipt", "x-ans-status-token"}, instanceRemovals...)},
+		// The instance-only headers are stripped in every mode, so a
+		// client-supplied value never reaches the upstream.
+		{name: "no strip", wantRemove: instanceRemovals},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

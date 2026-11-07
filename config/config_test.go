@@ -130,6 +130,7 @@ instanceMode:
   allowedIssuers: [issuer.example.test]
   expectedAud: gw.example.com
   maxInstancesPerSub: 3
+  maxStatusAge: 5m
 transparencyLogs:
   - name: local
     baseURL: http://127.0.0.1:18081
@@ -168,7 +169,7 @@ readiness:
 			RequiredContext:      &authz.RequiredContext{Key: "ans-authz", Value: "body-forwarded"},
 			RequireTokenClaims:   false,
 			InstanceMode: authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
-				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3},
+				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3, MaxStatusAge: 5 * time.Minute},
 		},
 		TransparencyLogs: []TransparencyLog{
 			{Name: "local", BaseURL: "http://127.0.0.1:18081", AllowInsecure: true, Timeout: 500 * time.Millisecond},

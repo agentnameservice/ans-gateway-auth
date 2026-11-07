@@ -107,6 +107,7 @@ instanceMode:                  # second caller mode; see "Instance mode" below
   allowedIssuers: []           # bare lowercase hosts, e.g. [authority.example.com]; required when enabled
   expectedAud: ""              # bare host the token's aud must name; empty = host of the matched authority
   maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
+  maxStatusAge: 0s             # refuse an issuer status token older than this (status_stale); 0 = until its exp
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -172,27 +173,36 @@ names `typ` `instance+jwt` is refused while instance mode is off. The verifier c
 4. the status token verifies under a cached TL root key, is unexpired, names `ans_name` (whose
    host is `iss`), is `ACTIVE` or `WARNING`, and lists the SHA-256 of the `x5c` certificate in
    `validIdentityCerts` (as `SHA256:<hex>` or raw 32 bytes); the certificate is inside its
-   validity dates and carries `ans_name` as a URI SAN;
-5. `aud` is `expectedAud`, or the host of the matched authority;
-6. `act`, when present, names one actor and nests no further `act`;
-7. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
+   validity dates and carries `ans_name` as a URI SAN. Its `iat` may lead the verifier's clock by
+   600 s; with `maxStatusAge` set, by 60 s, and a token issued more than `maxStatusAge` ago is
+   refused (`status_stale`), so a revocation is seen within that bound instead of at the status
+   token's own `exp` (about an hour on the TL);
+5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
+   host, as for certificate-mode callers);
+6. `aud` is `expectedAud`, or the host of the matched authority;
+7. `act`, when present, names one actor and nests no further `act`;
+8. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
 
 An allowed instance request reaches the upstream with, each set with overwrite semantics:
 `X-ANS-Name`, `X-ANS-Agent-Id` and `X-ANS-Fingerprint` (the issuer's), `X-ANS-JKT` (the instance
 key), `X-ANS-Instance-Sub` (the user the token was issued for), `X-ANS-Scope`, `X-ANS-Act` and
 `X-ANS-Authorization-Details` (compact JSON). An optional header the token does not carry is
-removed rather than set, and with `instanceMode.enabled` a certificate-mode allow removes all four
-`X-ANS-Instance-Sub`, `X-ANS-Act`, `X-ANS-Scope` and `X-ANS-Authorization-Details`, so a
-client-supplied value never reaches the upstream. Attribute per instance by `X-ANS-JKT` or the
+removed rather than set, and every certificate-mode allow removes all four `X-ANS-Instance-Sub`,
+`X-ANS-Act`, `X-ANS-Scope` and `X-ANS-Authorization-Details`, whether or not instance mode is on,
+so a client-supplied value never reaches the upstream. For `extraIdentityHeaders`, instance mode
+maps `agent_id` and `jkt` to the instance key (`cnf.jkt`), not the issuer, so a gateway that keys
+an MCP session subject on `agent_id` gives each instance its own session; `ans_name` and
+`fingerprint` stay the issuer's. `X-ANS-Agent-Id` itself stays the issuer's agent id. Attribute per instance by `X-ANS-JKT` or the
 `act.sub` in `X-ANS-Act`. With `stripIdentityHeaders`, `Authorization`, `DPoP` and the status
 token are removed too: the verifier is the token's audience.
 
 Denials use the categories above; the decision log's `reason` starts with the reference
 implementation's code (`expired`, `bad_token`, `bad_signature`, `bad_dpop`, `replay`, `revoked`,
 `cert_not_current`, `iss_mismatch`, `aud_mismatch`, `htu_mismatch`, `clock_skew`, `bad_alg`,
-`bad_status_token`, `status_expired`, `depth_exceeded`, `bad_request`, `instance_cap`,
-`instance_disabled`). Policy refusals (`iss_mismatch` at the allowlist, `depth_exceeded`,
-`instance_cap`) are `403 EXPECTED_PEER_MISMATCH`. The token format follows ans-agent's
+`bad_status_token`, `status_expired`, `status_stale`, `depth_exceeded`, `bad_request`,
+`instance_cap`, `instance_disabled`). Policy refusals (`iss_mismatch` at `allowedIssuers` or
+`allowedAnsNames`, `depth_exceeded`, `instance_cap`) are `403 EXPECTED_PEER_MISMATCH`.
+`examples/mcpecho/ans-authz-instance.yaml` is a working configuration. The token format follows ans-agent's
 `src/instance_token.py`; `testdata/instance-vectors.json` holds the two implementations to the same
 verdicts. The per-sub cap is counted per process, not across replicas.
 
@@ -264,6 +274,11 @@ read access to that secret.
   `maxContentBytes` plus 1 MiB of headroom for the identity headers and framing, so raise
   `maxContentBytes` together with the gateway's body cap.
 - No ext_authz decision cache: a DPoP proof is single-use.
+- Refuse header names containing `_` at the gateway. agentgateway v1.6.0 has no
+  `headers_with_underscores_action`; the recipes add the authorization rule
+  `deny: 'request.headers.exists(k, k.contains("_"))'`, which returns `403` for a request
+  carrying, say, `X_ANS_Act` (checked against the pinned v1.6.0 binary). On Envoy, set
+  `headers_with_underscores_action: REJECT_REQUEST`.
 - Upstreams must be reachable only through the gateway; otherwise `X-ANS-*` can be forged.
 - A gateway rate limit does not protect the verifier or the replay cache. In agentgateway v1.6.0
   `localRateLimit` runs after `extAuthz` and `authorization`, and listener policies have no rate

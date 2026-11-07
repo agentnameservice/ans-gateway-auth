@@ -74,6 +74,14 @@ func TestConfigValidate(t *testing.T) {
 			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
 				ExpectedAud: "https://gw.example.com"}
 		}, wantErr: "instanceMode.expectedAud"},
+		{name: "instance max status age negative", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: -time.Second}
+		}, wantErr: "maxStatusAge"},
+		{name: "instance max status age set", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute}
+		}},
 		{name: "instance cap negative", mutate: func(c *Config) {
 			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
 				MaxInstancesPerSub: -1}
