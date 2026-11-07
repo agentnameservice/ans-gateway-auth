@@ -647,6 +647,39 @@ type opaqueKeys struct{ inner KeyProvider }
 func (o opaqueKeys) Get(kid [4]byte) (*scitt.TrustedKey, error) { return o.inner.Get(kid) }
 func (o opaqueKeys) RefreshFor(ctx context.Context) bool        { return o.inner.RefreshFor(ctx) }
 
+// TestStatusCacheAgentIDCase: a UUID's case carries no meaning, so a
+// configured upper-case agentId matches the lower-case id the TL and the
+// issuer's presented token carry, on the refresh and the request path.
+func TestStatusCacheAgentIDCase(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	upper := strings.ToUpper(lower)
+	mint := func(iatOff int64) []byte { return h.mintFor(lower, h.ansName, scitt.StatusActive, iatOff, iatOff+3600) }
+	f := &fetcher{}
+	f.set(mint(-30), nil)
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, nil, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: upper, TL: "test-tl", Fetch: f.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now, 0) }
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh with an upper-case agentId: %v", err)
+	}
+	cfg := h.config()
+	cfg.InstanceMode.Issuers[0].AgentID = upper
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(cfg, h.keys, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	requireAllowed(t, v.Verify(t.Context(), h.request(mint(-1))), "upper-case agentId, lower-case token")
+	requireAllowed(t, v.Verify(t.Context(), h.request(mint(-40))), "cached entry under the canonical id")
+}
+
 // TestStatusCachePresentedFutureIatNotCached: a presented token that fails a
 // check is never cached, so a future-dated token cannot pin the cache ahead.
 func TestStatusCachePresentedFutureIatNotCached(t *testing.T) {

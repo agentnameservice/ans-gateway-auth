@@ -83,12 +83,24 @@ func (c Config) Warnings() []string {
 	if c.GRPC.TokenClaimsNamespace == envoyJWTAuthnNamespace {
 		warnings = append(warnings, "grpc.tokenClaimsNamespace is envoy.filters.http.jwt_authn, which every filter in the chain can write; forwarded cnf.jkt claims are only as trustworthy as that chain")
 	}
+	if im := c.InstanceMode; im.Enabled && im.MaxStatusAge == 0 {
+		warnings = append(warnings, "instanceMode.maxStatusAge is 0; a presented status token is trusted until its own exp (about an hour), so an issuer's revocation can take that long to land; set maxStatusAge, e.g. 240s")
+	}
+	if im := c.InstanceMode; im.Enabled && im.MaxStatusAge > maxUsefulStatusAge {
+		warnings = append(warnings, fmt.Sprintf(
+			"instanceMode.maxStatusAge %s is over %s, longer than a TL status token usually lives; status_stale cannot fire before status_expired, and a 410 is noticed only every maxStatusAge/2",
+			im.MaxStatusAge, maxUsefulStatusAge))
+	}
 	if r := c.Replay.Redis; c.Replay.Type == ReplayTypeRedis && r != nil && !r.TLS && !isLoopbackHost(hostOf(r.Addr)) {
 		warnings = append(warnings, fmt.Sprintf(
 			"replay.redis.tls is false for non-loopback %s; proof identifiers and the keyspace sentinel travel in plaintext", r.Addr))
 	}
 	return warnings
 }
+
+// maxUsefulStatusAge is about the lifetime of a TL status token; a longer
+// maxStatusAge never refuses status_stale before the token's exp does.
+const maxUsefulStatusAge = time.Hour
 
 // hostOf strips the port from a host:port address.
 func hostOf(addr string) string {

@@ -144,7 +144,9 @@ pins the same key id twice, when `http://` is used without `allowInsecure`, when
 gRPC listener has no TLS, when TLS material does not load, or when `checkTimeout` is not above
 every fetch timeout. `--check` and startup warn when `checkTimeout` is not below the gateway's
 two-second ext_authz budget, when root keys are fetched over plaintext from a non-loopback host
-(pin `rootKeys` instead), and when `requiredContext` is unset.
+(pin `rootKeys` instead), when `requiredContext` is unset, and when instance mode runs with
+`maxStatusAge` 0 or over an hour. `--check` also loads the transaction-token signing key, so a
+key startup would refuse fails `--check`.
 
 ### Trust material
 
@@ -219,7 +221,8 @@ verdicts. The per-sub cap is counted per process, not across replicas.
 
 With `maxStatusAge` set, the verifier owns each issuer's status, so revocation latency no longer
 depends on what a client presents. Every `allowedIssuers` host needs an `issuers` entry naming
-the issuer's ANS agent id (a UUID) and a `transparencyLogs` entry with a `baseURL`:
+the issuer's ANS agent id (a UUID, compared without regard to case) and a `transparencyLogs`
+entry with a `baseURL`:
 
 ```yaml
 instanceMode:

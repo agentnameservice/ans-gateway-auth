@@ -588,6 +588,25 @@ func TestConfigWarnings(t *testing.T) {
 			want:   []string{"grpc.tokenClaimsNamespace is envoy.filters.http.jwt_authn, which every filter in the chain can write; forwarded cnf.jkt claims are only as trustworthy as that chain"},
 		},
 		{
+			name: "instance mode without maxStatusAge", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.InstanceMode = authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"}}
+			},
+			want: []string{"instanceMode.maxStatusAge is 0; a presented status token is trusted until its own exp (about an hour), so an issuer's revocation can take that long to land; set maxStatusAge, e.g. 240s"},
+		},
+		{
+			name: "instance mode with maxStatusAge over an hour", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.InstanceMode = instanceWithIssuer("tl")
+				c.InstanceMode.MaxStatusAge = 2 * time.Hour
+			},
+			want: []string{"instanceMode.maxStatusAge 2h0m0s is over 1h0m0s, longer than a TL status token usually lives; status_stale cannot fire before status_expired, and a 410 is noticed only every maxStatusAge/2"},
+		},
+		{
+			name: "instance mode with a bounded maxStatusAge is fine", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) { c.InstanceMode = instanceWithIssuer("tl") },
+		},
+		{
 			name: "plaintext redis on a non-loopback host", checkTimeout: 1500 * time.Millisecond,
 			mutate: func(c *Config) {
 				c.Replay.Type = ReplayTypeRedis

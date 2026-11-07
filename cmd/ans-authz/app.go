@@ -159,19 +159,27 @@ func (a *app) buildServer(logger *slog.Logger) error {
 // missing or unusable key stops startup; no key is ever generated.
 func (a *app) loadTxnMinter() error {
 	tt := a.cfg.TransactionToken
-	if !tt.Enabled {
-		return nil
-	}
-	key, err := authz.LoadTxnSigningKey(tt.SigningKeyFile)
-	if err != nil {
+	m, err := txnMinter(tt)
+	if err != nil || m == nil {
 		return err
 	}
-	if a.txn, err = authz.NewTxnMinter(tt, key); err != nil {
-		return err
-	}
+	a.txn = m
 	a.logger.Info("transaction tokens enabled", "issuer", tt.Issuer, "audience", tt.Audience,
 		"ttl", tt.TTL, "header", tt.Header, "kid", a.txn.KeyID())
 	return nil
+}
+
+// txnMinter loads the signing key and builds the minter, or returns nil when
+// transaction tokens are off; startup and --check share it.
+func txnMinter(tt authz.TransactionToken) (*authz.TxnMinter, error) {
+	if !tt.Enabled {
+		return nil, nil //nolint:nilnil // transaction tokens off is a valid outcome
+	}
+	key, err := authz.LoadTxnSigningKey(tt.SigningKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	return authz.NewTxnMinter(tt, key)
 }
 
 // jwks serves the transaction-token public key for upstreams to verify

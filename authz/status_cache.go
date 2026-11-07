@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -218,6 +219,9 @@ func NewStatusRefresher(cache StatusCache, keys KeyProvider, maxStatusAge time.D
 		if s.Timeout <= 0 {
 			s.Timeout = DefaultKeyFetchTimeout
 		}
+		// A UUID's case carries no meaning; the cache is keyed, and the TL
+		// asked, by its canonical lower-case form.
+		s.AgentID = strings.ToLower(s.AgentID)
 		r.byHost[s.Host] = len(r.sources)
 		r.sources = append(r.sources, s)
 	}
@@ -302,7 +306,7 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 // checkFetchedStatus requires the token the TL served to be about this
 // issuer, and not dated ahead of our clock, so it cannot pin the cache.
 func checkFetchedStatus(p *scitt.StatusTokenPayload, src *IssuerStatusSource, now int64) error {
-	if p.AgentID != src.AgentID {
+	if !strings.EqualFold(p.AgentID, src.AgentID) {
 		return fmt.Errorf("issuer %s: status token names agent %q, want %q", src.Host, p.AgentID, src.AgentID)
 	}
 	name, err := verify.ParseAnsName(p.AnsName)
@@ -408,7 +412,7 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 	if err := checkStatusClock(&presented.Payload, now, boundedStatusIATSkew); err != nil {
 		return nil, err
 	}
-	if presented.Payload.AgentID != agentID {
+	if !strings.EqualFold(presented.Payload.AgentID, agentID) {
 		return nil, refuse(codeIssMismatch, CategoryBindingFailed, "status token names agent "+
 			echoValue(presented.Payload.AgentID)+", not issuer "+echoValue(it.claims.iss)+"'s configured agent")
 	}

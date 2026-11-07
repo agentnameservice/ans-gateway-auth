@@ -759,6 +759,54 @@ func TestInstancePresentedStatusExpired(t *testing.T) {
 	}
 }
 
+// TestInstanceExpectedAud: a configured expectedAud replaces the matched
+// authority's host. The vector's aud is that host, so pinning another
+// expectedAud refuses it.
+func TestInstanceExpectedAud(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	vec := validInstanceVector(t, iv)
+	cfg := iv.config()
+	cfg.InstanceMode.ExpectedAud = "public.example.test"
+	requireInstanceDenial(t, iv.verifier(t, cfg, iv.keys(t)).Verify(t.Context(), vec.request(t)), codeAudMismatch)
+	cfg.InstanceMode.ExpectedAud = iv.ExpectedAud
+	if d := iv.verifier(t, cfg, iv.keys(t)).Verify(t.Context(), vec.request(t)); !d.Allowed {
+		t.Fatalf("expectedAud equal to the token's aud: %+v", d.Deny)
+	}
+}
+
+// TestCheckAudience covers each source of the wanted aud and each aud shape.
+func TestCheckAudience(t *testing.T) {
+	t.Parallel()
+	const base = "https://internal.example.test"
+	for _, tc := range []struct {
+		name, expected, aud string
+		ok                  bool
+	}{
+		{"expectedAud matches, authority differs", "public.example.test", `"public.example.test"`, true},
+		{"expectedAud set, aud is the authority host", "public.example.test", `"internal.example.test"`, false},
+		{"no expectedAud, aud is the authority host", "", `"internal.example.test"`, true},
+		{"aud as a JSON array", "", `["internal.example.test"]`, false},
+		{"aud absent", "", ``, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := &Verifier{cfg: Config{InstanceMode: InstanceMode{ExpectedAud: tc.expected}}}
+			it := &instanceToken{claims: instanceClaims{aud: json.RawMessage(tc.aud)}}
+			if tc.aud == "" {
+				it.claims.aud = nil
+			}
+			err := v.checkAudience(it, base)
+			if tc.ok != (err == nil) {
+				t.Fatalf("checkAudience = %v, want ok=%v", err, tc.ok)
+			}
+			if err != nil && !strings.HasPrefix(err.Error(), codeAudMismatch+": ") {
+				t.Fatalf("err = %v, want %s", err, codeAudMismatch)
+			}
+		})
+	}
+}
+
 // TestInstanceRouting keeps the instance path narrow: only a DPoP token whose
 // header decodes and names typ instance+jwt selects it.
 func TestInstanceRouting(t *testing.T) {

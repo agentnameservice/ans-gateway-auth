@@ -257,7 +257,8 @@ func (v *Verifier) wireStatusCache() {
 	v.issuerAgents = make(map[string]string, len(im.Issuers))
 	v.issuerLogs = make(map[string]string, len(im.Issuers))
 	for _, is := range im.Issuers {
-		v.issuerAgents[is.Host] = is.AgentID
+		// Canonical lower case, as the status refresher keys the cache.
+		v.issuerAgents[is.Host] = strings.ToLower(is.AgentID)
 		v.issuerLogs[is.Host] = is.TL
 	}
 }
