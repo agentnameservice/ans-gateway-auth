@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/url"
@@ -54,7 +55,52 @@ func (c Config) Validate() error {
 	if rc := c.RequiredContext; rc != nil && (rc.Key == "" || rc.Value == "") {
 		return errors.New("authz: requiredContext needs both key and value")
 	}
-	return validateExtraIdentityHeaders(c.ExtraIdentityHeaders)
+	return cmp.Or(c.InstanceMode.validate(), validateExtraIdentityHeaders(c.ExtraIdentityHeaders))
+}
+
+// validate checks instance mode only when it is enabled: at least one issuer,
+// every issuer and the expected aud a bare lowercase host, and a cap that is
+// zero (off) or positive.
+func (m InstanceMode) validate() error {
+	if !m.Enabled {
+		return nil
+	}
+	if len(m.AllowedIssuers) == 0 {
+		return errors.New("authz: instanceMode.allowedIssuers must name at least one issuer when instance mode is enabled")
+	}
+	for _, iss := range m.AllowedIssuers {
+		if !bareLowercaseHost(iss) {
+			return fmt.Errorf("authz: instanceMode.allowedIssuers entry %q must be a bare lowercase host", iss)
+		}
+	}
+	if m.ExpectedAud != "" && !bareLowercaseHost(m.ExpectedAud) {
+		return fmt.Errorf("authz: instanceMode.expectedAud %q must be a bare lowercase host", m.ExpectedAud)
+	}
+	if m.MaxInstancesPerSub < 0 {
+		return errors.New("authz: instanceMode.maxInstancesPerSub must be zero (off) or positive")
+	}
+	return nil
+}
+
+// bareLowercaseHost reports whether s is a lowercase DNS name: dot-separated
+// labels of a-z, 0-9 and inner hyphens, with no scheme, port or path.
+func bareLowercaseHost(s string) bool {
+	const maxLabel, maxHost = 63, 253
+	if s == "" || len(s) > maxHost {
+		return false
+	}
+	for label := range strings.SplitSeq(s, ".") {
+		if label == "" || len(label) > maxLabel || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := range len(label) {
+			b := label[i]
+			if (b < 'a' || b > 'z') && (b < '0' || b > '9') && b != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validateExtraIdentityHeaders requires token header names that do not
@@ -66,6 +112,9 @@ func validateExtraIdentityHeaders(extra map[string]string) error {
 		strings.ToLower(HeaderANSAgentID):     HeaderANSAgentID,
 		strings.ToLower(HeaderANSFingerprint): HeaderANSFingerprint,
 		strings.ToLower(HeaderANSJKT):         HeaderANSJKT,
+	}
+	for _, name := range instanceHeaders {
+		seen[strings.ToLower(name)] = name
 	}
 	for name, attribute := range extra {
 		if !validHeaderName(name) {

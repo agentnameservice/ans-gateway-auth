@@ -47,6 +47,34 @@ type Config struct {
 	// with the same overwrite semantics as the standard X-ANS-* headers, for
 	// gateways or upstreams that key on their own header name.
 	ExtraIdentityHeaders map[string]string `yaml:"extraIdentityHeaders"`
+	// InstanceMode admits callers that hold no ANS certificate of their own:
+	// a local agent instance presenting a short-lived instance token signed by
+	// an ANS-registered issuer's identity-certificate key. Off by default.
+	InstanceMode InstanceMode `yaml:"instanceMode"`
+}
+
+// InstanceMode configures the second caller mode. A request selects it by
+// presenting `Authorization: DPoP <JWS whose header typ is "instance+jwt">`
+// with no X-SCITT-Receipt; every other request takes the certificate path.
+type InstanceMode struct {
+	// Enabled turns instance mode on. When false an instance request is
+	// refused (MISSING_HEADERS, reason instance_disabled).
+	Enabled bool `yaml:"enabled"`
+	// AllowedIssuers lists the issuers whose instance tokens are accepted, as
+	// bare lowercase hosts (the host inside the issuer's ans:// name, e.g.
+	// "authority.example.com"). A token's iss is checked against this list
+	// before any key or transparency-log lookup. Required when Enabled.
+	AllowedIssuers []string `yaml:"allowedIssuers"`
+	// ExpectedAud is the aud an instance token must carry, as a bare lowercase
+	// host. Empty means the host of the authority the request matched
+	// (externalAuthority, or the matching trustedHosts entry).
+	ExpectedAud string `yaml:"expectedAud"`
+	// MaxInstancesPerSub caps how many distinct instance keys (cnf.jkt) one
+	// issuer's sub may present while their tokens are live; the next distinct
+	// key is refused (EXPECTED_PEER_MISMATCH, reason instance_cap). Zero turns
+	// the cap off. The count is per verifier process, not shared across
+	// replicas.
+	MaxInstancesPerSub int `yaml:"maxInstancesPerSub"`
 }
 
 // RequiredContext names a context-extension key and value the gateway must

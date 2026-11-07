@@ -136,6 +136,8 @@ type Verifier struct {
 	extra    []extraHeader
 	baseOpts []pop.CallerOption
 	limiter  *logLimiter
+	// instances enforces instanceMode.maxInstancesPerSub; nil when off.
+	instances *instanceCap
 }
 
 // extraHeader is one configured extraIdentityHeaders entry.
@@ -185,6 +187,7 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 	if len(cfg.AllowedAnsNames) > 0 {
 		v.baseOpts = append(v.baseOpts, pop.WithAllowedAnsNames(cfg.AllowedAnsNames...))
 	}
+	v.instances = newInstanceCap(cfg.InstanceMode.MaxInstancesPerSub)
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
 		now:      func() time.Time { return v.now() },
@@ -225,6 +228,9 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	}
 	if d := v.checkContent(ctx, r, base); d != nil {
 		return denied(d)
+	}
+	if tok, ok := isInstanceRequest(r.Header); ok {
+		return v.verifyInstance(ctx, r, base, tok)
 	}
 	hdrs, err := scitt.ExtractHeaders(r.Header)
 	if err != nil {
@@ -457,6 +463,13 @@ func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, toke
 		remove = append(remove, strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken))
 		if !tokenPresented {
 			remove = append(remove, strings.ToLower(pop.DPoPHeader))
+		}
+	}
+	if v.cfg.InstanceMode.Enabled {
+		// A certificate-mode caller has no instance identity; an upstream that
+		// reads these headers must not see a client-supplied value.
+		for _, name := range instanceHeaders {
+			remove = append(remove, strings.ToLower(name))
 		}
 	}
 	return Decision{

@@ -102,6 +102,11 @@ trustedHosts: [https://api.example.com]   # or externalAuthority: https://api.ex
 requiredContext: {key: ans-authz, value: body-forwarded}
 requireTokenClaims: true       # 503 when a DPoP-bound token arrives without gateway-validated claims
 extraIdentityHeaders: {}       # e.g. {x-ai-eg-mcp-subject: agent_id}; values: ans_name, agent_id, fingerprint, jkt
+instanceMode:                  # second caller mode; see "Instance mode" below
+  enabled: false
+  allowedIssuers: []           # bare lowercase hosts, e.g. [authority.example.com]; required when enabled
+  expectedAud: ""              # bare host the token's aud must name; empty = host of the matched authority
+  maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -143,6 +148,53 @@ endpoint's TLS identity is part of the trust chain: use `https://` with a certif
 and treat `allowInsecure` as a loopback development setting. Status tokens are accepted up to
 ten minutes past their expiry (an SDK constant), so revocation latency at the verifier is the
 token lifetime plus ten minutes.
+
+### Instance mode
+
+A local agent instance (a client on a laptop) holds only its own P-256 key, not an ANS identity
+certificate. An ANS-registered issuer mints it a short-lived instance token, signed with the key
+of the issuer's own identity certificate. With `instanceMode.enabled`, such a caller sends:
+
+| Header | Value |
+|---|---|
+| `Authorization` | `DPoP <instance token>`: a compact JWS whose header is exactly `{"alg":"ES256","typ":"instance+jwt","x5c":[<issuer identity cert>]}`, with claims `iss`, `ans_name`, `aud`, `sub`, `scope`, `authorization_details`, `iat`, `exp` (at most 900 s after `iat`), `jti`, `cnf.jkt` and, for a child, `act` |
+| `DPoP` | a proof whose header carries a bare P-256 `jwk` (no `x5c`), with `htm`, `htu`, `iat`, `jti`, `ath` and `ans_content_digest` |
+| `X-ANS-Status-Token` | the issuer's TL status token |
+
+No `X-SCITT-Receipt`: a request with one takes the certificate path. A request whose token header
+names `typ` `instance+jwt` is refused while instance mode is off. The verifier checks, in order:
+
+1. `iss` is in `allowedIssuers`, before any key or transparency-log lookup;
+2. the proof verifies under its `jwk`, whose RFC 7638 thumbprint is `cnf.jkt`, and binds the
+   method, the `htu` rebuilt from configuration, the token (`ath`) and the body digest, within
+   `popSkew`;
+3. the token's ES256 signature verifies under `x5c[0]`, a P-256 key;
+4. the status token verifies under a cached TL root key, is unexpired, names `ans_name` (whose
+   host is `iss`), is `ACTIVE` or `WARNING`, and lists the SHA-256 of the `x5c` certificate in
+   `validIdentityCerts` (as `SHA256:<hex>` or raw 32 bytes); the certificate is inside its
+   validity dates and carries `ans_name` as a URI SAN;
+5. `aud` is `expectedAud`, or the host of the matched authority;
+6. `act`, when present, names one actor and nests no further `act`;
+7. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
+
+An allowed instance request reaches the upstream with, each set with overwrite semantics:
+`X-ANS-Name`, `X-ANS-Agent-Id` and `X-ANS-Fingerprint` (the issuer's), `X-ANS-JKT` (the instance
+key), `X-ANS-Instance-Sub` (the user the token was issued for), `X-ANS-Scope`, `X-ANS-Act` and
+`X-ANS-Authorization-Details` (compact JSON). An optional header the token does not carry is
+removed rather than set, and with `instanceMode.enabled` a certificate-mode allow removes all four
+`X-ANS-Instance-Sub`, `X-ANS-Act`, `X-ANS-Scope` and `X-ANS-Authorization-Details`, so a
+client-supplied value never reaches the upstream. Attribute per instance by `X-ANS-JKT` or the
+`act.sub` in `X-ANS-Act`. With `stripIdentityHeaders`, `Authorization`, `DPoP` and the status
+token are removed too: the verifier is the token's audience.
+
+Denials use the categories above; the decision log's `reason` starts with the reference
+implementation's code (`expired`, `bad_token`, `bad_signature`, `bad_dpop`, `replay`, `revoked`,
+`cert_not_current`, `iss_mismatch`, `aud_mismatch`, `htu_mismatch`, `clock_skew`, `bad_alg`,
+`bad_status_token`, `status_expired`, `depth_exceeded`, `bad_request`, `instance_cap`,
+`instance_disabled`). Policy refusals (`iss_mismatch` at the allowlist, `depth_exceeded`,
+`instance_cap`) are `403 EXPECTED_PEER_MISMATCH`. The token format follows ans-agent's
+`src/instance_token.py`; `testdata/instance-vectors.json` holds the two implementations to the same
+verdicts. The per-sub cap is counted per process, not across replicas.
 
 ### Authority rule (ANS-6 section 7.7)
 
