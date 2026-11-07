@@ -1,6 +1,7 @@
 package extauthz
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -17,11 +18,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/agentnameservice/ans-sdk-go/pop"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -530,5 +533,42 @@ func TestTruncate(t *testing.T) {
 				t.Fatalf("truncate = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestServerCheckRemovesForgedInstanceHeaders sends a forged X-ANS-Act and
+// X-ANS-Instance-Sub through gRPC Check with a valid certificate-mode
+// identity: the CheckResponse removes them, so the upstream never sees them.
+func TestServerCheckRemovesForgedInstanceHeaders(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	lis := bufconn.Listen(1 << 20)
+	serve(t, NewServer(f.verifier), lis)
+	client := bufconnClient(t, lis)
+	req, err := http.NewRequest(http.MethodPost, fixtureBaseURL+"/echo", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"X-ANS-Act": `{"sub":"instance:forged"}`, "X-ANS-Instance-Sub": "user:admin"} {
+		req.Header.Set(name, value)
+	}
+	if err := pop.AttachIdentity(req, f.signer, f.scitt); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Check(context.Background(), checkRequestFrom(req, []byte(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := resp.GetOkResponse()
+	if codes.Code(resp.GetStatus().GetCode()) != codes.OK || ok == nil {
+		t.Fatalf("status = %v body %s", resp.GetStatus(), resp.GetDeniedResponse().GetBody())
+	}
+	for _, name := range []string{"x-ans-act", "x-ans-instance-sub"} {
+		if v := headerValue(ok.GetHeaders(), name); v != "" {
+			t.Fatalf("%s set to %q", name, v)
+		}
+		if !slices.Contains(ok.GetHeadersToRemove(), name) {
+			t.Fatalf("HeadersToRemove = %v, want %s", ok.GetHeadersToRemove(), name)
+		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
+	"github.com/agentnameservice/ans-sdk-go/verify"
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 
 	"github.com/agentnameservice/ans-gateway-auth/replay"
@@ -136,6 +137,28 @@ type Verifier struct {
 	extra    []extraHeader
 	baseOpts []pop.CallerOption
 	limiter  *logLimiter
+	// instances enforces instanceMode.maxInstancesPerSub; nil when off.
+	instances *instanceCap
+	// allowedNames is allowedAnsNames in canonical form, for instance mode.
+	allowedNames map[string]bool
+	// statusCache holds the issuers' TL status tokens when
+	// instanceMode.maxStatusAge is set; nil otherwise.
+	statusCache StatusCache
+	// issuerAgents maps each instanceMode.issuers host to its agent id.
+	issuerAgents map[string]string
+	// txn mints transaction tokens; nil when transactionToken is off.
+	txn *TxnMinter
+}
+
+// VerifierOption configures optional NewVerifier wiring.
+type VerifierOption func(*Verifier)
+
+// WithStatusCache supplies the issuer status cache the background
+// StatusRefresher fills. Without it, a verifier whose instance mode sets
+// maxStatusAge holds its own empty cache, so every instance request is
+// status_stale (fail closed).
+func WithStatusCache(c StatusCache) VerifierOption {
+	return func(v *Verifier) { v.statusCache = c }
 }
 
 // extraHeader is one configured extraIdentityHeaders entry.
@@ -147,7 +170,8 @@ type extraHeader struct {
 // NewVerifier validates cfg and wires the verifier. A nil Observer selects
 // NoopObserver and a nil logger discards the rate-limited misconfiguration
 // logs.
-func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger) (*Verifier, error) {
+func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger,
+	opts ...VerifierOption) (*Verifier, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -184,6 +208,28 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 	}
 	if len(cfg.AllowedAnsNames) > 0 {
 		v.baseOpts = append(v.baseOpts, pop.WithAllowedAnsNames(cfg.AllowedAnsNames...))
+		v.allowedNames = make(map[string]bool, len(cfg.AllowedAnsNames))
+		for _, n := range cfg.AllowedAnsNames {
+			// Validate already parsed every entry.
+			if parsed, err := verify.ParseAnsName(n); err == nil {
+				v.allowedNames[canonicalAnsName(parsed)] = true
+			}
+		}
+	}
+	v.instances = newInstanceCap(cfg.InstanceMode.MaxInstancesPerSub)
+	for _, opt := range opts {
+		opt(v)
+	}
+	v.wireStatusCache()
+	switch {
+	case cfg.TransactionToken.Enabled && v.txn == nil:
+		return nil, errors.New("authz: transactionToken is enabled but no minter was supplied (WithTxnMinter)")
+	case !cfg.TransactionToken.Enabled && v.txn != nil:
+		return nil, errors.New("authz: a transaction-token minter was supplied but transactionToken is not enabled")
+	case v.txn != nil && v.txn.Config() != cfg.TransactionToken:
+		// The header the verifier strips and the one the minter sets must be
+		// the same name, and iss, aud and ttl the configured ones.
+		return nil, errors.New("authz: the transaction-token minter's configuration does not match transactionToken")
 	}
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
@@ -191,6 +237,24 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 		last:     make(map[string]time.Time),
 	}
 	return v, nil
+}
+
+// wireStatusCache turns the issuer status cache on exactly when instance mode
+// bounds status age, holding an empty (fail-closed) cache when none was
+// supplied.
+func (v *Verifier) wireStatusCache() {
+	im := v.cfg.InstanceMode
+	if !im.Enabled || im.MaxStatusAge <= 0 {
+		v.statusCache = nil
+		return
+	}
+	if v.statusCache == nil {
+		v.statusCache = NewMemoryStatusCache()
+	}
+	v.issuerAgents = make(map[string]string, len(im.Issuers))
+	for _, is := range im.Issuers {
+		v.issuerAgents[is.Host] = is.AgentID
+	}
 }
 
 // Verify decides one request within cfg.CheckTimeout. It never returns an
@@ -226,6 +290,9 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if d := v.checkContent(ctx, r, base); d != nil {
 		return denied(d)
 	}
+	if tok, ok := isInstanceRequest(r.Header); ok {
+		return v.verifyInstance(ctx, r, base, tok)
+	}
 	hdrs, err := scitt.ExtractHeaders(r.Header)
 	if err != nil {
 		return denied(deny(http.StatusUnauthorized, CategorySCITTHeaderInvalid))
@@ -242,7 +309,8 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if err != nil {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))
 	}
-	return v.allow(id, headers, tokenPresented)
+	return v.attachTxn(v.allow(id, headers, tokenPresented), r,
+		txnClaims{Sub: id.AnsName, Cnf: txnConfirmation{JKT: id.JKT}})
 }
 
 // htuBase returns the scheme://authority the proof must have been minted for,
@@ -458,6 +526,12 @@ func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, toke
 		if !tokenPresented {
 			remove = append(remove, strings.ToLower(pop.DPoPHeader))
 		}
+	}
+	// A certificate-mode caller has no instance identity; an upstream that
+	// reads these headers must never see a client-supplied value, whether or
+	// not instance mode is enabled.
+	for _, name := range instanceHeaders {
+		remove = append(remove, strings.ToLower(name))
 	}
 	return Decision{
 		Allowed:  true,

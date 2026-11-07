@@ -33,6 +33,11 @@ mcp:
     authorization:
       rules:
       - require: 'has(extauthz.ans_name)'
+      # agentgateway v1.6.0 has no Envoy-style headers_with_underscores_action,
+      # so refuse any header name with an underscore here: an upstream that
+      # folds names (CGI-style HTTP_X_ANS_ACT) could otherwise read a
+      # client's X_ANS_Act as the verifier's X-ANS-Act.
+      - deny: 'request.headers.exists(k, k.contains("_"))'
     # Per-tool rules read the verified identity. Replace the name with the
     # caller you want to admit; `mcp.tool` is only present on tools/call.
     mcpAuthorization:

@@ -102,6 +102,20 @@ trustedHosts: [https://api.example.com]   # or externalAuthority: https://api.ex
 requiredContext: {key: ans-authz, value: body-forwarded}
 requireTokenClaims: true       # 503 when a DPoP-bound token arrives without gateway-validated claims
 extraIdentityHeaders: {}       # e.g. {x-ai-eg-mcp-subject: agent_id}; values: ans_name, agent_id, fingerprint, jkt
+instanceMode:                  # second caller mode; see "Instance mode" below
+  enabled: false
+  allowedIssuers: []           # bare lowercase hosts, e.g. [authority.example.com]; required when enabled
+  expectedAud: ""              # bare host the token's aud must name; empty = host of the matched authority
+  maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
+  maxStatusAge: 0s             # e.g. 240s: keep issuers' status warm, refuse status older than this (status_stale); 0 = until its exp, not recommended
+  issuers: []                  # with maxStatusAge: one per allowedIssuers host, e.g. [{host: authority.example.com, agentId: <uuid>, tl: prod-tl}]
+transactionToken:             # signed context for the upstream; see "Transaction tokens" below
+  enabled: false
+  signingKeyFile: ""           # PEM P-256 key (EC PRIVATE KEY or PRIVATE KEY), mode 0600 or tighter; required when enabled, never generated
+  issuer: ""                   # https URL of this gateway, e.g. https://gw.webmesh.ai
+  audience: ""                 # the upstream, e.g. dnsdoc.webmesh.ai
+  ttl: 60s                     # exp - iat; whole seconds, at most 300s
+  header: Txn-Token
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -143,6 +157,164 @@ endpoint's TLS identity is part of the trust chain: use `https://` with a certif
 and treat `allowInsecure` as a loopback development setting. Status tokens are accepted up to
 ten minutes past their expiry (an SDK constant), so revocation latency at the verifier is the
 token lifetime plus ten minutes.
+
+### Instance mode
+
+A local agent instance (a client on a laptop) holds only its own P-256 key, not an ANS identity
+certificate. An ANS-registered issuer mints it a short-lived instance token, signed with the key
+of the issuer's own identity certificate. With `instanceMode.enabled`, such a caller sends:
+
+| Header | Value |
+|---|---|
+| `Authorization` | `DPoP <instance token>`: a compact JWS whose header is exactly `{"alg":"ES256","typ":"instance+jwt","x5c":[<issuer identity cert>]}`, with claims `iss`, `ans_name`, `aud`, `sub`, `scope`, `authorization_details`, `iat`, `exp` (at most 900 s after `iat`), `jti`, `cnf.jkt` and, for a child, `act` |
+| `DPoP` | a proof whose header carries a bare P-256 `jwk` (no `x5c`), with `htm`, `htu`, `iat`, `jti`, `ath` and `ans_content_digest` |
+| `X-ANS-Status-Token` | the issuer's TL status token |
+
+No `X-SCITT-Receipt`: a request with one takes the certificate path. A request whose token header
+names `typ` `instance+jwt` is refused while instance mode is off. The verifier checks, in order:
+
+1. `iss` is in `allowedIssuers`, before any key or transparency-log lookup;
+2. the proof verifies under its `jwk`, whose RFC 7638 thumbprint is `cnf.jkt`, and binds the
+   method, the `htu` rebuilt from configuration, the token (`ath`) and the body digest, within
+   `popSkew`;
+3. the token's ES256 signature verifies under `x5c[0]`, a P-256 key;
+4. the status token verifies under a cached TL root key, is unexpired, names `ans_name` (whose
+   host is `iss`), is `ACTIVE` or `WARNING`, and lists the SHA-256 of the `x5c` certificate in
+   `validIdentityCerts` (as `SHA256:<hex>` or raw 32 bytes); the certificate is inside its
+   validity dates and carries `ans_name` as a URI SAN. Its `iat` may lead the verifier's clock by
+   600 s; with `maxStatusAge` set, by 60 s, and the status is judged as described under "Issuer
+   status cache" below. 0 is not recommended for instance mode: a revocation then lands only
+   when the issuer's status token expires (about an hour on the TL);
+5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
+   host, as for certificate-mode callers);
+6. `aud` is `expectedAud`, or the host of the matched authority;
+7. `act`, when present, names one actor, nests no further `act`, and that actor is the token's
+   own instance key, `instance:<cnf.jkt>` (`act_mismatch` otherwise);
+8. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
+
+An allowed instance request reaches the upstream with, each set with overwrite semantics:
+`X-ANS-Name`, `X-ANS-Agent-Id` and `X-ANS-Fingerprint` (the issuer's), `X-ANS-JKT` (the instance
+key), `X-ANS-Instance-Sub` (the user the token was issued for), `X-ANS-Scope`, `X-ANS-Act` and
+`X-ANS-Authorization-Details` (compact JSON). An optional header the token does not carry is
+removed rather than set, and every certificate-mode allow removes all four `X-ANS-Instance-Sub`,
+`X-ANS-Act`, `X-ANS-Scope` and `X-ANS-Authorization-Details`, whether or not instance mode is on,
+so a client-supplied value never reaches the upstream. For `extraIdentityHeaders`, instance mode
+maps `agent_id` and `jkt` to the instance key (`cnf.jkt`), not the issuer, so a gateway that keys
+an MCP session subject on `agent_id` gives each instance its own session; `ans_name` and
+`fingerprint` stay the issuer's. `X-ANS-Agent-Id` itself stays the issuer's agent id. Attribute per instance by `X-ANS-JKT` or the
+`act.sub` in `X-ANS-Act`. With `stripIdentityHeaders`, `Authorization`, `DPoP` and the status
+token are removed too: the verifier is the token's audience.
+
+Denials use the categories above; the decision log's `reason` starts with the reference
+implementation's code (`expired`, `bad_token`, `bad_signature`, `bad_dpop`, `replay`, `revoked`,
+`cert_not_current`, `iss_mismatch`, `aud_mismatch`, `htu_mismatch`, `clock_skew`, `bad_alg`,
+`bad_status_token`, `status_expired`, `status_stale`, `depth_exceeded`, `bad_request`,
+`instance_cap`, `instance_disabled`, `act_mismatch`). Policy refusals (`iss_mismatch` at `allowedIssuers` or
+`allowedAnsNames`, `depth_exceeded`, `instance_cap`) are `403 EXPECTED_PEER_MISMATCH`.
+`examples/mcpecho/ans-authz-instance.yaml` is a working configuration. The token format follows ans-agent's
+`src/instance_token.py`; `testdata/instance-vectors.json` holds the two implementations to the same
+verdicts. The per-sub cap is counted per process, not across replicas.
+
+#### Issuer status cache
+
+With `maxStatusAge` set, the verifier owns each issuer's status, so revocation latency no longer
+depends on what a client presents. Every `allowedIssuers` host needs an `issuers` entry naming
+the issuer's ANS agent id (a UUID) and a `transparencyLogs` entry with a `baseURL`:
+
+```yaml
+instanceMode:
+  enabled: true
+  allowedIssuers: [authority.example.com]
+  maxStatusAge: 240s
+  issuers:
+  - {host: authority.example.com, agentId: 3f8e2a1c-0000-4000-8000-000000000001, tl: prod-tl}
+```
+
+- At startup, before serving, it fetches `GET <baseURL>/v1/agents/<agentId>/status-token` for each
+  issuer, retrying until `startupTimeout`. An issuer still unreachable then is logged and startup
+  continues; every request for it is refused `status_stale` until a fetch succeeds.
+- In the background, one loop per issuer refetches every `maxStatusAge`/2, up to 20% sooner
+  (jitter), and backs off from 1 s to at most 30 s after a failure. A fetched token passes the
+  same signature check, under the same root keys, as one on a request, and must name the
+  configured agent id and host; otherwise the cache keeps what it had.
+- On a request the verifier never calls the TL and never refreshes root keys. The presented
+  status token must still verify under the cached root keys and name the issuer's configured agent
+  id. It is used only when its `iat` is later than the cached token's, and it then replaces the
+  cache entry; otherwise the cached token decides. Whichever token is used must have been issued
+  within `maxStatusAge`, or the request is refused `status_stale` (fail closed).
+- A presented token that does not verify, or has expired, is refused (`bad_status_token`,
+  `status_expired`) even when the cache holds a fresh token: clients must present a valid,
+  unexpired TL status token. This is a deliberate deviation from "use the cache when the client's
+  token is worse"; the verifier never looks past a bad credential.
+- Root keys are not refreshed on demand in this mode. A TL root-key rotation is picked up by the
+  background status refresh (it refreshes the keys when a fetched token names an unknown key id)
+  within one refresh interval, `maxStatusAge`/2; until then a presented token under the new key
+  is refused `bad_status_token`.
+- A terminal issuer is refused `revoked` at once: a signed `REVOKED` or `EXPIRED` token on the
+  request, or a TL that answers the background fetch with `410 Gone` or a signed terminal token.
+  The background refresher writes the TL's current answer over the cache entry unconditionally,
+  so only a live answer from the TL clears a terminal entry. A presented token never does,
+  whatever its `iat`, and never overwrites one recorded while its request was in flight.
+- The TL answers `410 Gone` for a revoked or expired agent and for one superseded by a version
+  bump or re-registration. After either, the configured `agentId` is terminal and the issuer's
+  new tokens are refused (`revoked` for the old id, `iss_mismatch` for a status token naming the
+  new one). Update `issuers[].agentId` to the new agent id and restart `ans-authz`. The 410 is
+  logged with the issuer's host and agent id, and startup logs every configured `{host, agentId}`.
+- A `410` is unsigned: the verifier trusts it on the TL connection's TLS alone. An attacker with
+  network position between the verifier and the TL (or a TL endpoint without TLS) can therefore
+  force an immediate `revoked` for an issuer. This is a fail-closed denial of service, not a
+  bypass: no 410 or withheld response can make a revoked issuer pass.
+
+A revocation is therefore seen within `maxStatusAge` plus the TL's publish delay, about four
+minutes for the 240 s above. The cache is per process; each replica fetches for itself.
+`ans_authz_issuer_status_refresh_total{issuer,result}` counts fetches by `success`, `failure` and
+`terminal`, and `ans_authz_issuer_status_last_success_timestamp_seconds{issuer}` is the time of the
+last one the TL answered; alert when it falls `maxStatusAge` behind.
+
+### Transaction tokens
+
+With `transactionToken.enabled`, every allow, in either caller mode, carries a short-lived
+JWT ([draft-ietf-oauth-transaction-tokens](https://datatracker.ietf.org/doc/draft-ietf-oauth-transaction-tokens/))
+in `Txn-Token` (or `transactionToken.header`), set with overwrite semantics. **Upstreams must
+authorize on this token, not on the `X-ANS-*` headers.** Those headers stay as information only:
+any hop between the gateway and the upstream can set a header, but only the gateway's key can
+sign the token, and its `aud` names one upstream.
+
+The header is `{"alg":"ES256","typ":"txntoken+jwt","kid":<RFC 7638 thumbprint>}`. The claims:
+
+| Claim | Value |
+|---|---|
+| `iss`, `aud` | `transactionToken.issuer`, `transactionToken.audience` |
+| `iat`, `exp` | now, now + `ttl`; in instance mode never later than the instance token's own `exp` |
+| `jti` | 128 random bits |
+| `txn` | the gateway's request id (`x-request-id`), or 128 random bits when there is none. It is copied, not authenticated: a client that can set `x-request-id` chooses it, so use it to correlate logs, never to authorize |
+| `sub` | the user (`sub` of the instance token); in certificate mode, the caller's ANS name |
+| `act` | instance mode only: the single hop `{"sub":"instance:<cnf.jkt>"}`, the key that signed the request. A child instance token's own `act` must already name that key (otherwise `act_mismatch`). The parent instance a child was minted from is not named: delegation is one hop, and a child token carries no parent key |
+| `cnf.jkt` | the key that signed the request's DPoP proof |
+| `scope`, `authorization_details` | copied from the instance token when present |
+| `ans_issuer` | instance mode only: `{host, ans_name, cert_fp}`, the issuer and the SHA-256 of its identity certificate |
+| `rctx` | `{method, path}` of the request, without the query |
+
+The public key is served as a JWK Set (`kid`, `alg` ES256, `use` sig) at
+`GET /.well-known/jwks.json` on the health and metrics listener (`httpListen`, loopback by
+default), so an upstream on the same host can fetch it. Startup and `--check` warn when
+transaction tokens are on and `httpListen` is not loopback. The route exists only while transaction
+tokens are on. To rotate the key, publish the new key file and restart; upstreams should
+refetch the JWKS when they meet an unknown `kid`.
+
+An upstream checks: the signature under the JWKS key named by `kid`; `typ`; `iss`; `aud` is its
+own name; `exp` (allow a few seconds of skew); then authorizes on `sub`, `act`, `scope` and
+`authorization_details`. A client-supplied header of the configured name is overwritten on every
+allow and removed when minting is off, so it never reaches the upstream in either mode. A
+failure to mint denies the request (503 `INTERNAL_ERROR`) rather than allowing it without a
+token.
+
+Limits: the token is a bearer credential between the gateway and the upstream, so that hop
+should be loopback or TLS. `aud` separates tokens by upstream only when each `ans-authz` fronts
+one upstream: every upstream behind one `ans-authz` receives the same `aud`, and any of them can
+replay a token it received to another within `ttl`. Run one `ans-authz` (one
+`transactionToken.audience`) per upstream that must not accept another's tokens. Its `jti` is unique, but the upstream must keep its own replay cache
+if it needs single use within `ttl`.
 
 ### Authority rule (ANS-6 section 7.7)
 
@@ -212,6 +384,17 @@ read access to that secret.
   `maxContentBytes` plus 1 MiB of headroom for the identity headers and framing, so raise
   `maxContentBytes` together with the gateway's body cap.
 - No ext_authz decision cache: a DPoP proof is single-use.
+- Refuse header names containing `_` at the gateway. agentgateway v1.6.0 has no
+  `headers_with_underscores_action`; the recipes add the authorization rule
+  `deny: 'request.headers.exists(k, k.contains("_"))'`, which returns `403` for a request
+  carrying, say, `X_ANS_Act` (checked against the pinned v1.6.0 binary). On Envoy, set
+  `headers_with_underscores_action: REJECT_REQUEST`; the Agent Router recipes do so through
+  Envoy Gateway's `ClientTrafficPolicy` (`headers.withUnderscoresAction: RejectRequest`), which
+  rejects the request before ext_authz runs. On agentgateway the order is reversed:
+  `extAuthz` runs before `authorization`, so a request the underscore rule later refuses has
+  already been verified and its proof `jti` recorded in the replay cache, as with the rate
+  limit below. The proof is spent, the request still never reaches the upstream, and the cost
+  is replay-cache capacity, bounded the same way.
 - Upstreams must be reachable only through the gateway; otherwise `X-ANS-*` can be forged.
 - A gateway rate limit does not protect the verifier or the replay cache. In agentgateway v1.6.0
   `localRateLimit` runs after `extAuthz` and `authorization`, and listener policies have no rate

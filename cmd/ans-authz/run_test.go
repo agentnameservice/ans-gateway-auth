@@ -101,6 +101,7 @@ func TestRunStartupFailures(t *testing.T) {
 		want string
 	}{
 		{name: "transparency log unreachable", yaml: configYAML(remoteTL(failing.URL)), want: "no root keys after"},
+		{name: "transaction token key file missing", yaml: txnYAML(pinnedTL(tr.line), "/nonexistent/txn.pem"), want: "transactionToken.signingKeyFile"},
 		{
 			name: "grpc port taken", yaml: configYAML(pinnedTL(tr.line)),
 			args: []string{"--grpc-listen", taken.Addr().String()}, want: "grpc listen",

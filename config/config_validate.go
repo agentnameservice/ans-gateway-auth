@@ -32,6 +32,9 @@ func (c Config) Validate() error {
 	if err := c.validateTransparencyLogs(); err != nil {
 		return err
 	}
+	if err := c.validateIssuerLogs(); err != nil {
+		return err
+	}
 	if err := c.Replay.validate(c.CheckTimeout); err != nil {
 		return err
 	}
@@ -66,6 +69,10 @@ func (c Config) Warnings() []string {
 			warnings = append(warnings, fmt.Sprintf(
 				"transparencyLogs %q fetches root keys over plaintext from non-loopback %s; an on-path host can inject trust, pin rootKeys", tl.Name, u.Host))
 		}
+	}
+	if c.TransactionToken.Enabled && !isLoopbackHost(hostOf(c.HTTPListen)) {
+		warnings = append(warnings, fmt.Sprintf(
+			"transactionToken is enabled and httpListen %s is not loopback; /.well-known/jwks.json is served there over plain HTTP, so an on-path host can substitute the upstreams' verification key", c.HTTPListen))
 	}
 	if c.RequiredContext == nil {
 		warnings = append(warnings, "requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests")
@@ -106,6 +113,34 @@ func (c Config) validateTransparencyLogs() error {
 		names[tl.Name] = true
 	}
 	return nil
+}
+
+// validateIssuerLogs requires every instanceMode.issuers entry to name a
+// transparency log with a baseURL, the log its status token is fetched from.
+func (c Config) validateIssuerLogs() error {
+	if !c.InstanceMode.Enabled {
+		return nil
+	}
+	for i, is := range c.InstanceMode.Issuers {
+		tl, ok := c.TransparencyLog(is.TL)
+		switch {
+		case !ok:
+			return fmt.Errorf("config: instanceMode.issuers[%d]: tl %q is not a transparencyLogs entry", i, is.TL)
+		case tl.BaseURL == "":
+			return fmt.Errorf("config: instanceMode.issuers[%d]: tl %q has no baseURL to fetch the status token from", i, is.TL)
+		}
+	}
+	return nil
+}
+
+// TransparencyLog returns the transparencyLogs entry with this name.
+func (c Config) TransparencyLog(name string) (TransparencyLog, bool) {
+	for _, tl := range c.TransparencyLogs {
+		if tl.Name == name {
+			return tl, true
+		}
+	}
+	return TransparencyLog{}, false
 }
 
 func (tl TransparencyLog) validate(checkTimeout time.Duration) error {

@@ -76,6 +76,11 @@ func validConfig() Config {
 	return c
 }
 
+func instanceWithIssuer(tl string) authz.InstanceMode {
+	return authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"}, MaxStatusAge: 4 * time.Minute,
+		Issuers: []authz.InstanceIssuer{{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: tl}}}
+}
+
 func TestDefault(t *testing.T) {
 	t.Parallel()
 	want := Config{
@@ -125,6 +130,23 @@ requiredContext:
   key: ans-authz
   value: body-forwarded
 requireTokenClaims: false
+instanceMode:
+  enabled: true
+  allowedIssuers: [issuer.example.test]
+  expectedAud: gw.example.com
+  maxInstancesPerSub: 3
+  maxStatusAge: 5m
+  issuers:
+    - host: issuer.example.test
+      agentId: 00000000-0000-4000-8000-000000000001
+      tl: local
+transactionToken:
+  enabled: true
+  signingKeyFile: /etc/ans-authz/txn.pem
+  issuer: https://gw.example.test
+  audience: upstream.example.test
+  ttl: 90s
+  header: X-Txn-Token
 transparencyLogs:
   - name: local
     baseURL: http://127.0.0.1:18081
@@ -162,6 +184,11 @@ readiness:
 			CheckTimeout:         1200 * time.Millisecond,
 			RequiredContext:      &authz.RequiredContext{Key: "ans-authz", Value: "body-forwarded"},
 			RequireTokenClaims:   false,
+			InstanceMode: authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3, MaxStatusAge: 5 * time.Minute,
+				Issuers: []authz.InstanceIssuer{{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "local"}}},
+			TransactionToken: authz.TransactionToken{Enabled: true, SigningKeyFile: "/etc/ans-authz/txn.pem",
+				Issuer: "https://gw.example.test", Audience: "upstream.example.test", TTL: 90 * time.Second, Header: "X-Txn-Token"},
 		},
 		TransparencyLogs: []TransparencyLog{
 			{Name: "local", BaseURL: "http://127.0.0.1:18081", AllowInsecure: true, Timeout: 500 * time.Millisecond},
@@ -319,6 +346,21 @@ func TestConfigValidate(t *testing.T) {
 		{name: "transparency log timeout zero", mutate: func(c *Config) {
 			c.TransparencyLogs[0].Timeout = 0
 		}, wantErr: "timeout must be positive"},
+		{name: "instance issuer on a known TL with a baseURL", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("tl")
+		}},
+		{name: "instance issuer on an unknown TL", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("nope")
+		}, wantErr: `instanceMode.issuers[0]: tl "nope" is not a transparencyLogs entry`},
+		{name: "instance issuer on a TL without a baseURL", mutate: func(c *Config) {
+			c.TransparencyLogs[0].BaseURL = ""
+			c.TransparencyLogs[0].RootKeys = []string{rootKey}
+			c.InstanceMode = instanceWithIssuer("tl")
+		}, wantErr: `instanceMode.issuers[0]: tl "tl" has no baseURL`},
+		{name: "instance issuers ignored while instance mode is off", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("nope")
+			c.InstanceMode.Enabled = false
+		}},
 		{name: "transparency log timeout negative", mutate: func(c *Config) {
 			c.TransparencyLogs[0].Timeout = -time.Second
 		}, wantErr: "timeout must be positive"},
@@ -511,6 +553,23 @@ func TestConfigWarnings(t *testing.T) {
 			mutate: func(c *Config) {
 				c.TransparencyLogs[0].BaseURL = "http://localhost:18081"
 				c.TransparencyLogs[0].AllowInsecure = true
+			},
+		},
+		{
+			name: "transaction-token JWKS on a non-loopback listener", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.TransactionToken = authz.TransactionToken{Enabled: true, SigningKeyFile: "/k.pem",
+					Issuer: "https://gw.example.test", Audience: "up.example.test", TTL: time.Minute, Header: "Txn-Token"}
+				c.HTTPListen = "0.0.0.0:9192"
+			},
+			want: []string{"transactionToken is enabled and httpListen 0.0.0.0:9192 is not loopback; /.well-known/jwks.json is served there over plain HTTP, so an on-path host can substitute the upstreams' verification key"},
+		},
+		{
+			name: "transaction-token JWKS on loopback is fine", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.TransactionToken = authz.TransactionToken{Enabled: true, SigningKeyFile: "/k.pem",
+					Issuer: "https://gw.example.test", Audience: "up.example.test", TTL: time.Minute, Header: "Txn-Token"}
+				c.HTTPListen = "[::1]:9192"
 			},
 		},
 		{
