@@ -2,16 +2,28 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/agentnameservice/ans-sdk-go/examples/a2a-no-mtls/demokit"
 	"github.com/alicebob/miniredis/v2"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
@@ -468,5 +480,315 @@ func TestNewAppRejectsInvalidWiring(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+const (
+	testIssuerHost    = "issuer.example.test"
+	testIssuerAgentID = "00000000-0000-4000-8000-000000000001"
+)
+
+// statusTL is a fake transparency log serving root keys and one issuer's
+// status token, counting every request.
+type statusTL struct {
+	srv      *httptest.Server
+	line     string
+	token    atomic.Pointer[[]byte]
+	failing  atomic.Bool
+	gone     atomic.Bool
+	statuses atomic.Int64
+	total    atomic.Int64
+}
+
+func newStatusTL(t *testing.T) *statusTL {
+	t.Helper()
+	tlKey, bundle, err := demokit.Provision("ans://v1.0.0."+testIssuerHost, testIssuerAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &statusTL{line: c2spLine(t, "status-tl", &tlKey.PublicKey)}
+	s.token.Store(&bundle.StatusToken)
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.total.Add(1)
+		switch r.URL.Path {
+		case "/root-keys":
+			_, _ = w.Write([]byte(s.line + "\n"))
+		case "/v1/agents/" + testIssuerAgentID + "/status-token":
+			s.statuses.Add(1)
+			if s.failing.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if s.gone.Load() {
+				w.WriteHeader(http.StatusGone)
+				return
+			}
+			w.Header().Set("Content-Type", "application/ans-status-token+cbor")
+			_, _ = w.Write(*s.token.Load())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func instanceStatusYAML(baseURL string) string {
+	return configYAML(remoteTL(baseURL),
+		"instanceMode:",
+		"  enabled: true",
+		"  allowedIssuers: ["+testIssuerHost+"]",
+		"  maxStatusAge: 240s",
+		"  issuers:",
+		"  - {host: "+testIssuerHost+", agentId: "+testIssuerAgentID+", tl: remote}")
+}
+
+// TestAppIssuerStatusStartupFetch fetches each issuer's status token before
+// serving and exposes the refresh in metrics.
+func TestAppIssuerStatusStartupFetch(t *testing.T) {
+	tl := newStatusTL(t)
+	a, cancel := startApp(t, loadConfig(t, instanceStatusYAML(tl.srv.URL)))
+	defer func() { cancel(); _ = a.Wait() }()
+	if n := tl.statuses.Load(); n != 1 {
+		t.Fatalf("startup made %d status-token fetches, want 1", n)
+	}
+	got, ok := a.statusCache.Get(testIssuerAgentID)
+	if !ok || got.Token == nil || got.Token.Payload.AgentID != testIssuerAgentID {
+		t.Fatalf("cache after startup = %+v, %v", got, ok)
+	}
+	_, body := httpGet(t, "http://"+a.HTTPAddr()+"/metrics")
+	for _, want := range []string{
+		`ans_authz_issuer_status_refresh_total{issuer="` + testIssuerHost + `",result="success"} 1`,
+		`ans_authz_issuer_status_last_success_timestamp_seconds{issuer="` + testIssuerHost + `"}`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("metrics lack %s:\n%s", want, body)
+		}
+	}
+}
+
+// TestAppIssuerStatusStartupFailureFailsClosed starts with the TL's status
+// route down: startup succeeds after retrying, logs the issuer, and the cache
+// stays empty (every request for it is status_stale) until a fetch succeeds.
+func TestAppIssuerStatusStartupFailureFailsClosed(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.failing.Store(true)
+	var logs recordingLog
+	cfg := loadConfig(t, instanceStatusYAML(tl.srv.URL))
+	a, err := newApp(context.Background(), cfg, logs.logger())
+	if err != nil {
+		t.Fatalf("newApp with the TL status route down: %v", err)
+	}
+	defer func() { _ = a.cache.Close() }()
+	if tl.statuses.Load() < 2 {
+		t.Fatalf("startup made %d status-token attempts, want retries", tl.statuses.Load())
+	}
+	if _, ok := a.statusCache.Get(testIssuerAgentID); ok {
+		t.Fatal("cache populated although every fetch failed")
+	}
+	if !strings.Contains(logs.String(), "no issuer status after startupTimeout") || !strings.Contains(logs.String(), testIssuerHost) {
+		t.Fatalf("log lacks the failed issuer:\n%s", logs.String())
+	}
+}
+
+// TestAppIssuerStatusBackgroundRefresh: Start runs the refresher, so a TL
+// that recovers after startup fills the cache without any request.
+func TestAppIssuerStatusBackgroundRefresh(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.failing.Store(true)
+	cfg := loadConfig(t, instanceStatusYAML(tl.srv.URL))
+	a, cancel := startApp(t, cfg)
+	defer func() { cancel(); _ = a.Wait() }()
+	tl.failing.Store(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := a.statusCache.Get(testIssuerAgentID); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never filled the cache (%d attempts)", tl.statuses.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestAppIssuerStatusNoTLCallOnCheck sends instance-mode Check calls over
+// gRPC and counts TL requests: none.
+func TestAppIssuerStatusNoTLCallOnCheck(t *testing.T) {
+	tl := newStatusTL(t)
+	a, cancel := startApp(t, loadConfig(t, instanceStatusYAML(tl.srv.URL)))
+	defer func() { cancel(); _ = a.Wait() }()
+	conn, err := grpc.NewClient(a.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := authv3.NewAuthorizationClient(conn)
+	before := tl.total.Load()
+	req := httptest.NewRequest(http.MethodPost, "http://"+testAuthority+"/mcp", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "DPoP eyJ0eXAiOiJpbnN0YW5jZStqd3QifQ.e30.sig")
+	req.Header.Set("Dpop", "x.y.z")
+	req.Header.Set("X-Ans-Status-Token", "AAAA")
+	for range 5 {
+		resp, err := client.Check(context.Background(), checkRequestFrom(req, []byte("{}")))
+		if err != nil || codes.Code(resp.GetStatus().GetCode()) == codes.OK {
+			t.Fatalf("instance Check: %v %v", resp.GetStatus(), err)
+		}
+	}
+	if n := tl.total.Load() - before; n != 0 {
+		t.Fatalf("Check made %d TL requests, want 0", n)
+	}
+}
+
+// TestAppIssuerStatusSupersededLogs: a TL that answers 410 (revoked, expired
+// or superseded) caches a terminal entry and logs the issuer's host and agent
+// id with the re-registration hint; startup also lists every configured
+// issuer.
+func TestAppIssuerStatusSupersededLogs(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.gone.Store(true)
+	var logs recordingLog
+	a, err := newApp(context.Background(), loadConfig(t, instanceStatusYAML(tl.srv.URL)), logs.logger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.cache.Close() }()
+	if got, ok := a.statusCache.Get(testIssuerAgentID); !ok || !got.Terminal {
+		t.Fatalf("cache after a 410 = %+v, %v", got, ok)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		"issuer status is revoked, expired or superseded at its TL (HTTP 410); if this issuer re-registered, update issuers[].agentId",
+		"instance-mode issuer status cache",
+		"issuer=" + testIssuerHost,
+		"agent_id=" + testIssuerAgentID,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// writeTxnKey writes a fresh P-256 signing key as SEC1 PEM.
+func writeTxnKey(t *testing.T) (string, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "txn.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, key
+}
+
+func txnYAML(tl, keyFile string) string {
+	return configYAML(tl,
+		"transactionToken:",
+		"  enabled: true",
+		"  signingKeyFile: "+keyFile,
+		"  issuer: https://gw.example.test",
+		"  audience: upstream.example.test")
+}
+
+// TestAppTransactionTokenJWKS: a certificate-mode allow over gRPC carries a
+// Txn-Token that verifies under the key /.well-known/jwks.json serves, and
+// that key is the configured file's.
+func TestAppTransactionTokenJWKS(t *testing.T) {
+	tr := newTrust(t)
+	keyFile, key := writeTxnKey(t)
+	a, cancel := startApp(t, loadConfig(t, txnYAML(pinnedTL(tr.line), keyFile)))
+	defer func() { cancel(); _ = a.Wait() }()
+
+	resp, err := http.Get("http://" + a.HTTPAddr() + "/.well-known/jwks.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/jwk-set+json" {
+		t.Fatalf("jwks = %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	var jwks struct {
+		Keys []struct {
+			X   string `json:"x"`
+			Y   string `json:"y"`
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+			Use string `json:"use"`
+			D   string `json:"d"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil || len(jwks.Keys) != 1 {
+		t.Fatalf("jwks body: %v %+v", err, jwks)
+	}
+	k := jwks.Keys[0]
+	if k.Alg != "ES256" || k.Use != "sig" || k.D != "" || k.Kid == "" {
+		t.Fatalf("jwk = %+v", k)
+	}
+	xb, _ := base64.RawURLEncoding.DecodeString(k.X)
+	yb, _ := base64.RawURLEncoding.DecodeString(k.Y)
+	pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{4}, xb...), yb...))
+	if err != nil || !pub.Equal(&key.PublicKey) {
+		t.Fatalf("jwks key is not the configured key: %v", err)
+	}
+
+	conn, err := grpc.NewClient(a.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	signed := tr.signedCheckRequest(t, http.MethodPost, "/echo", []byte(`{"a":1}`))
+	signed.GetAttributes().GetRequest().GetHttp().GetHeaders()["txn-token"] = "forged"
+	out, err := authv3.NewAuthorizationClient(conn).Check(context.Background(), signed)
+	if err != nil || codes.Code(out.GetStatus().GetCode()) != codes.OK {
+		t.Fatalf("signed: %v %v", out.GetStatus(), err)
+	}
+	var tok string
+	for _, h := range out.GetOkResponse().GetHeaders() {
+		if h.GetHeader().GetKey() == "Txn-Token" {
+			tok = h.GetHeader().GetValue()
+		}
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatalf("Txn-Token = %q", tok)
+	}
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if len(sig) != 64 || !ecdsa.Verify(pub, digest[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])) {
+		t.Fatal("Txn-Token does not verify under the JWKS key")
+	}
+	hdr, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	if !strings.Contains(string(hdr), `"kid":"`+k.Kid+`"`) || !strings.Contains(string(hdr), `"typ":"txntoken+jwt"`) {
+		t.Fatalf("header %s does not name kid %s", hdr, k.Kid)
+	}
+	payload, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	if !strings.Contains(string(payload), `"sub":"`+testAnsName+`"`) {
+		t.Fatalf("payload %s", payload)
+	}
+}
+
+// TestAppJWKSAbsentWhenDisabled: no transaction tokens, no JWKS route.
+func TestAppJWKSAbsentWhenDisabled(t *testing.T) {
+	tr := newTrust(t)
+	a, cancel := startApp(t, loadConfig(t, configYAML(pinnedTL(tr.line))))
+	defer func() { cancel(); _ = a.Wait() }()
+	if code, _ := httpGet(t, "http://"+a.HTTPAddr()+"/.well-known/jwks.json"); code != http.StatusNotFound {
+		t.Fatalf("jwks with transaction tokens off = %d, want 404", code)
+	}
+}
+
+// TestNewAppTransactionTokenKeyErrors: an unreadable or wrong key file stops
+// startup, never falling back to a generated key.
+func TestNewAppTransactionTokenKeyErrors(t *testing.T) {
+	tr := newTrust(t)
+	cfg := loadConfig(t, txnYAML(pinnedTL(tr.line), filepath.Join(t.TempDir(), "missing.pem")))
+	if _, err := newApp(context.Background(), cfg, discardLogger()); err == nil || !strings.Contains(err.Error(), "transactionToken.signingKeyFile") {
+		t.Fatalf("missing key file: err = %v", err)
 	}
 }

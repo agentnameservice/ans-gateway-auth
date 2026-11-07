@@ -59,6 +59,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ans-authz:", tlsErr)
 			return exitUsage
 		}
+		// Read the signing key as startup does, so a key startup would refuse
+		// (missing, readable by others, not P-256) fails here too.
+		if _, keyErr := txnMinter(cfg.TransactionToken); keyErr != nil {
+			fmt.Fprintln(stderr, "ans-authz:", keyErr)
+			return exitUsage
+		}
 		fmt.Fprintln(stdout, "configuration OK")
 		for _, w := range cfg.Warnings() {
 			fmt.Fprintln(stdout, "warning:", w)

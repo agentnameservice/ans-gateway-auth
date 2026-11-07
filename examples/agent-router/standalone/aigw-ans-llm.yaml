@@ -38,6 +38,24 @@ spec:
       kind: EnvoyProxy
       name: envoy-ai-gateway
 ---
+# Reject any request carrying a header name with an underscore (HTTP/1 400, HTTP/2 stream
+# reset). An upstream that folds header names (CGI-style HTTP_X_ANS_ACT) would otherwise read a
+# client's X_ANS_Act as the verifier's X-ANS-Act. Envoy Gateway v1.9.2, which Agent Router
+# v1.2.0 pins, already defaults to RejectRequest; stating it keeps the rule if that default or
+# this listener changes. Raw Envoy's default is ALLOW.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: aigw-run-reject-underscore-headers
+  namespace: default
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aigw-run
+  headers:
+    withUnderscoresAction: RejectRequest
+---
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:

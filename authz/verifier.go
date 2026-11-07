@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
+	"github.com/agentnameservice/ans-sdk-go/verify"
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 
 	"github.com/agentnameservice/ans-gateway-auth/replay"
@@ -136,6 +137,31 @@ type Verifier struct {
 	extra    []extraHeader
 	baseOpts []pop.CallerOption
 	limiter  *logLimiter
+	// instances enforces instanceMode.maxInstancesPerSub; nil when off.
+	instances *instanceCap
+	// allowedNames is allowedAnsNames in canonical form, for instance mode.
+	allowedNames map[string]bool
+	// statusCache holds the issuers' TL status tokens when
+	// instanceMode.maxStatusAge is set; nil otherwise.
+	statusCache StatusCache
+	// issuerAgents maps each instanceMode.issuers host to its agent id.
+	issuerAgents map[string]string
+	// issuerLogs maps each instanceMode.issuers host to the transparency log
+	// whose keys must sign its status token.
+	issuerLogs map[string]string
+	// txn mints transaction tokens; nil when transactionToken is off.
+	txn *TxnMinter
+}
+
+// VerifierOption configures optional NewVerifier wiring.
+type VerifierOption func(*Verifier)
+
+// WithStatusCache supplies the issuer status cache the background
+// StatusRefresher fills. Without it, a verifier whose instance mode sets
+// maxStatusAge holds its own empty cache, so every instance request is
+// status_stale (fail closed).
+func WithStatusCache(c StatusCache) VerifierOption {
+	return func(v *Verifier) { v.statusCache = c }
 }
 
 // extraHeader is one configured extraIdentityHeaders entry.
@@ -147,7 +173,8 @@ type extraHeader struct {
 // NewVerifier validates cfg and wires the verifier. A nil Observer selects
 // NoopObserver and a nil logger discards the rate-limited misconfiguration
 // logs.
-func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger) (*Verifier, error) {
+func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger,
+	opts ...VerifierOption) (*Verifier, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -184,6 +211,28 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 	}
 	if len(cfg.AllowedAnsNames) > 0 {
 		v.baseOpts = append(v.baseOpts, pop.WithAllowedAnsNames(cfg.AllowedAnsNames...))
+		v.allowedNames = make(map[string]bool, len(cfg.AllowedAnsNames))
+		for _, n := range cfg.AllowedAnsNames {
+			// Validate already parsed every entry.
+			if parsed, err := verify.ParseAnsName(n); err == nil {
+				v.allowedNames[canonicalAnsName(parsed)] = true
+			}
+		}
+	}
+	v.instances = newInstanceCap(cfg.InstanceMode.MaxInstancesPerSub)
+	for _, opt := range opts {
+		opt(v)
+	}
+	v.wireStatusCache()
+	switch {
+	case cfg.TransactionToken.Enabled && v.txn == nil:
+		return nil, errors.New("authz: transactionToken is enabled but no minter was supplied (WithTxnMinter)")
+	case !cfg.TransactionToken.Enabled && v.txn != nil:
+		return nil, errors.New("authz: a transaction-token minter was supplied but transactionToken is not enabled")
+	case v.txn != nil && v.txn.Config() != cfg.TransactionToken:
+		// The header the verifier strips and the one the minter sets must be
+		// the same name, and iss, aud and ttl the configured ones.
+		return nil, errors.New("authz: the transaction-token minter's configuration does not match transactionToken")
 	}
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
@@ -191,6 +240,27 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 		last:     make(map[string]time.Time),
 	}
 	return v, nil
+}
+
+// wireStatusCache turns the issuer status cache on exactly when instance mode
+// bounds status age, holding an empty (fail-closed) cache when none was
+// supplied.
+func (v *Verifier) wireStatusCache() {
+	im := v.cfg.InstanceMode
+	if !im.Enabled || im.MaxStatusAge <= 0 {
+		v.statusCache = nil
+		return
+	}
+	if v.statusCache == nil {
+		v.statusCache = NewMemoryStatusCache()
+	}
+	v.issuerAgents = make(map[string]string, len(im.Issuers))
+	v.issuerLogs = make(map[string]string, len(im.Issuers))
+	for _, is := range im.Issuers {
+		// Canonical lower case, as the status refresher keys the cache.
+		v.issuerAgents[is.Host] = strings.ToLower(is.AgentID)
+		v.issuerLogs[is.Host] = is.TL
+	}
 }
 
 // Verify decides one request within cfg.CheckTimeout. It never returns an
@@ -226,6 +296,9 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if d := v.checkContent(ctx, r, base); d != nil {
 		return denied(d)
 	}
+	if tok, ok := isInstanceRequest(r.Header); ok {
+		return v.verifyInstance(ctx, r, base, tok)
+	}
 	hdrs, err := scitt.ExtractHeaders(r.Header)
 	if err != nil {
 		return denied(deny(http.StatusUnauthorized, CategorySCITTHeaderInvalid))
@@ -238,11 +311,15 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if d := v.completeTokenBinding(ctx, r, id, tok, tokenPresented, base); d != nil {
 		return denied(d)
 	}
+	// An agent id is a UUID, whose case carries no meaning; the upstream sees
+	// the canonical lower-case spelling, as in instance mode.
+	id.AgentID = strings.ToLower(id.AgentID)
 	headers, err := v.identityHeaders(id)
 	if err != nil {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))
 	}
-	return v.allow(id, headers, tokenPresented)
+	return v.attachTxn(v.allow(id, headers, tokenPresented), r,
+		txnClaims{Sub: id.AnsName, Cnf: txnConfirmation{JKT: id.JKT}}, v.now())
 }
 
 // htuBase returns the scheme://authority the proof must have been minted for,
@@ -427,14 +504,28 @@ func withDetail(d *Denial, err error) *Denial {
 // comes from signed material, so a defective issuer cannot inject header
 // framing.
 func (v *Verifier) identityHeaders(id *pop.CallerIdentity) (map[string]string, error) {
-	attributes := map[string]string{
+	return v.withExtraHeaders(standardHeaders(id), attributeValues(id))
+}
+
+// attributeValues are the caller's values for the attributes extraIdentityHeaders names.
+func attributeValues(id *pop.CallerIdentity) map[string]string {
+	return map[string]string{
 		MetadataANSName: id.AnsName, MetadataAgentID: id.AgentID,
 		MetadataFingerprint: id.FingerprintHex(), MetadataJKT: id.JKT,
 	}
-	headers := map[string]string{
-		HeaderANSName: attributes[MetadataANSName], HeaderANSAgentID: attributes[MetadataAgentID],
-		HeaderANSFingerprint: attributes[MetadataFingerprint], HeaderANSJKT: attributes[MetadataJKT],
+}
+
+// standardHeaders are the four X-ANS-* headers every allow sets.
+func standardHeaders(id *pop.CallerIdentity) map[string]string {
+	return map[string]string{
+		HeaderANSName: id.AnsName, HeaderANSAgentID: id.AgentID,
+		HeaderANSFingerprint: id.FingerprintHex(), HeaderANSJKT: id.JKT,
 	}
+}
+
+// withExtraHeaders adds the configured extraIdentityHeaders from attributes
+// to headers and checks every value, in both caller modes.
+func (v *Verifier) withExtraHeaders(headers, attributes map[string]string) (map[string]string, error) {
 	for _, e := range v.extra {
 		headers[e.name] = attributes[e.attribute]
 	}
@@ -452,12 +543,15 @@ func (v *Verifier) identityHeaders(id *pop.CallerIdentity) (map[string]string, e
 // additions and would strip them again.
 func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, tokenPresented bool) Decision {
 	fingerprint := id.FingerprintHex()
-	var remove []string
-	if v.cfg.StripIdentityHeaders {
-		remove = append(remove, strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken))
-		if !tokenPresented {
-			remove = append(remove, strings.ToLower(pop.DPoPHeader))
-		}
+	remove := v.consumedHeaders()
+	if v.cfg.StripIdentityHeaders && !tokenPresented {
+		remove = append(remove, strings.ToLower(pop.DPoPHeader))
+	}
+	// A certificate-mode caller has no instance identity; an upstream that
+	// reads these headers must never see a client-supplied value, whether or
+	// not instance mode is enabled.
+	for _, name := range instanceHeaders {
+		remove = append(remove, strings.ToLower(name))
 	}
 	return Decision{
 		Allowed:  true,
@@ -469,6 +563,15 @@ func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, toke
 		},
 		RemoveHeaders: remove,
 	}
+}
+
+// consumedHeaders are the trust headers stripIdentityHeaders removes in both
+// caller modes: the receipt and the status token.
+func (v *Verifier) consumedHeaders() []string {
+	if !v.cfg.StripIdentityHeaders {
+		return nil
+	}
+	return []string{strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken)}
 }
 
 // logMisconfiguration emits one ERROR per reason and authority per interval.

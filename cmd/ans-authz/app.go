@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,6 +51,16 @@ type app struct {
 	cache   replay.Cache
 	server  *extauthz.Server
 
+	// statusCache and statusRefresher keep the instance-mode issuers' TL
+	// status tokens warm; nil unless instanceMode.maxStatusAge is set.
+	statusCache     *authz.MemoryStatusCache
+	statusRefresher *authz.StatusRefresher
+	// txn mints transaction tokens; nil unless transactionToken.enabled.
+	txn *authz.TxnMinter
+	// clients holds each transparency log's HTTP client by name, for the
+	// status refresher; logs without a baseURL have none.
+	clients map[string]*scitt.HTTPClient
+
 	// refreshable counts transparency logs with a baseURL, which the keyring
 	// refreshes every keyRefreshInterval.
 	refreshable int
@@ -67,7 +78,10 @@ type app struct {
 // newApp loads trust material (retrying transparency-log fetches until
 // startupTimeout) and builds the verifier. Nothing listens yet.
 func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, error) {
-	a := &app{cfg: cfg, logger: logger, metrics: extauthz.NewMetrics()}
+	a := &app{cfg: cfg, logger: logger, metrics: extauthz.NewMetrics(), clients: make(map[string]*scitt.HTTPClient)}
+	if err := a.loadTxnMinter(); err != nil {
+		return nil, err
+	}
 
 	sources := make([]authz.KeySource, 0, len(cfg.TransparencyLogs))
 	for _, tl := range cfg.TransparencyLogs {
@@ -93,6 +107,9 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 		return nil, err
 	}
 	a.keyring = keyring
+	if err := a.loadIssuerStatus(ctx); err != nil {
+		return nil, err
+	}
 
 	a.cache, err = a.newReplayCache(ctx)
 	if err != nil {
@@ -108,7 +125,14 @@ func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, 
 // buildServer wires the verifier and the ext_authz server over the loaded
 // keys and replay cache.
 func (a *app) buildServer(logger *slog.Logger) error {
-	verifier, err := authz.NewVerifier(a.cfg.Config, a.keyring, a.cache, a.metrics, logger)
+	var verifierOpts []authz.VerifierOption
+	if a.statusCache != nil {
+		verifierOpts = append(verifierOpts, authz.WithStatusCache(a.statusCache))
+	}
+	if a.txn != nil {
+		verifierOpts = append(verifierOpts, authz.WithTxnMinter(a.txn))
+	}
+	verifier, err := authz.NewVerifier(a.cfg.Config, a.keyring, a.cache, a.metrics, logger, verifierOpts...)
 	if err != nil {
 		return err
 	}
@@ -129,6 +153,41 @@ func (a *app) buildServer(logger *slog.Logger) error {
 	}
 	a.server = extauthz.NewServer(verifier, opts...)
 	return nil
+}
+
+// loadTxnMinter reads the transaction-token signing key from its file. A
+// missing or unusable key stops startup; no key is ever generated.
+func (a *app) loadTxnMinter() error {
+	tt := a.cfg.TransactionToken
+	m, err := txnMinter(tt)
+	if err != nil || m == nil {
+		return err
+	}
+	a.txn = m
+	a.logger.Info("transaction tokens enabled", "issuer", tt.Issuer, "audience", tt.Audience,
+		"ttl", tt.TTL, "header", tt.Header, "kid", a.txn.KeyID())
+	return nil
+}
+
+// txnMinter loads the signing key and builds the minter, or returns nil when
+// transaction tokens are off; startup and --check share it.
+func txnMinter(tt authz.TransactionToken) (*authz.TxnMinter, error) {
+	if !tt.Enabled {
+		return nil, nil //nolint:nilnil // transaction tokens off is a valid outcome
+	}
+	key, err := authz.LoadTxnSigningKey(tt.SigningKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	return authz.NewTxnMinter(tt, key)
+}
+
+// jwks serves the transaction-token public key for upstreams to verify
+// against.
+func (a *app) jwks(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/jwk-set+json")
+	w.Header().Set("Cache-Control", "max-age=300")
+	_, _ = w.Write(a.txn.JWKS())
 }
 
 // serverTLS loads the gRPC listener's TLS material up front, so unusable
@@ -173,6 +232,7 @@ func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*keyStor
 	if err != nil {
 		return nil, false, fmt.Errorf("transparency log %q: client: %w", tl.Name, err)
 	}
+	a.clients[tl.Name] = client
 	store := newKeyStore(tl.Name, pinned, client, logger)
 	if pinned.IsEmpty() {
 		if err := retryUntil(ctx, a.cfg.StartupTimeout, store.DoRefresh); err != nil {
@@ -182,6 +242,51 @@ func (a *app) loadKeys(ctx context.Context, tl config.TransparencyLog) (*keyStor
 		logger.WarnContext(ctx, "initial root-key fetch failed, continuing with pinned keys", "error", err)
 	}
 	return store, true, nil
+}
+
+// loadIssuerStatus builds the issuer status cache and its refresher when
+// instance mode bounds status age, and fetches every issuer's status token
+// once, concurrently, retrying until startupTimeout. An issuer that cannot be
+// fetched does not stop startup: it is logged, and every request for it is
+// refused status_stale until the background refresher succeeds.
+func (a *app) loadIssuerStatus(ctx context.Context) error {
+	im := a.cfg.InstanceMode
+	if !im.Enabled || im.MaxStatusAge <= 0 {
+		return nil
+	}
+	sources := make([]authz.IssuerStatusSource, 0, len(im.Issuers))
+	for _, is := range im.Issuers {
+		client, ok := a.clients[is.TL]
+		if !ok {
+			// Validation requires a baseURL, so every named log has a client.
+			return fmt.Errorf("instanceMode issuer %q: transparency log %q has no client", is.Host, is.TL)
+		}
+		tl, _ := a.cfg.TransparencyLog(is.TL)
+		sources = append(sources, authz.IssuerStatusSource{
+			Host: is.Host, AgentID: is.AgentID, TL: is.TL, Fetch: client.FetchStatusToken, Timeout: tl.Timeout,
+		})
+		a.metrics.PreregisterIssuer(is.Host)
+		a.logger.InfoContext(ctx, "instance-mode issuer status cache", "issuer", is.Host, "agent_id", is.AgentID,
+			"tl", is.TL, "max_status_age", im.MaxStatusAge)
+	}
+	a.statusCache = authz.NewMemoryStatusCache()
+	refresher, err := authz.NewStatusRefresher(a.statusCache, a.keyring, im.MaxStatusAge, a.metrics, a.logger, sources...)
+	if err != nil {
+		return err
+	}
+	a.statusRefresher = refresher
+	var wg sync.WaitGroup
+	for _, host := range refresher.Hosts() {
+		wg.Go(func() {
+			err := retryUntil(ctx, a.cfg.StartupTimeout, func(ctx context.Context) error { return refresher.Refresh(ctx, host) })
+			if err != nil {
+				a.logger.ErrorContext(ctx, "no issuer status after startupTimeout; its instance tokens are refused status_stale until a background refresh succeeds",
+					"issuer", host, "startup_timeout", a.cfg.StartupTimeout, "error", err)
+			}
+		})
+	}
+	wg.Wait()
+	return nil
 }
 
 // retryUntil calls fn with exponential backoff until it succeeds, ctx ends or
@@ -269,6 +374,9 @@ func (a *app) Start(ctx context.Context) error {
 	if a.refreshable > 0 {
 		go a.keyring.RunPeriodic(runCtx, a.cfg.KeyRefreshInterval)
 	}
+	if a.statusRefresher != nil {
+		go a.statusRefresher.Run(runCtx)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -277,6 +385,9 @@ func (a *app) Start(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.Handle("GET /metrics", a.metrics.Handler())
+	if a.txn != nil {
+		mux.HandleFunc("GET /.well-known/jwks.json", a.jwks)
+	}
 	a.httpSrv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: httpReadHeaderTimeout,

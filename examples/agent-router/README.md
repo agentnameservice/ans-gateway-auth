@@ -182,6 +182,20 @@ the verifier's memory as about 64 MiB plus three times the cap times that bound.
 the bound and the memory request together, and pair a large cap with Envoy connection limits or
 a rate limit so unauthenticated traffic cannot exhaust the gateway before it is rejected.
 
+### Header names with underscores
+
+Each recipe ships a `ClientTrafficPolicy` with `headers.withUnderscoresAction: RejectRequest` on
+the Gateway it protects. The standalone files carry it for `aigw-run`, and
+`kubernetes/securitypolicy-gateway.yaml` carries it for `envoy-ai-gateway`, which also covers the
+MCPRoute in `mcproute-ans.yaml`. Envoy Gateway turns that setting into the HCM's
+`headers_with_underscores_action: REJECT_REQUEST`: an HTTP/1 request gets 400 and an HTTP/2
+stream is reset, before ext_authz runs.
+
+Envoy Gateway v1.9.2, which Agent Router v1.2.0 pins, already defaults to `RejectRequest`; raw
+Envoy defaults to `ALLOW`. The recipes state the rule so it holds if that default changes or a
+listener is copied elsewhere. `tests/agentrouter` checks that every recipe carries it. Rename the
+policy's target when you rename your Gateway.
+
 ### How identity reaches authorization
 
 - Envoy Gateway `SecurityPolicy.authorization` rules match `x-ans-agent-id` because the RBAC filter

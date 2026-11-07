@@ -12,6 +12,15 @@ func validConfig() Config {
 	return c
 }
 
+func validTxn() TransactionToken {
+	return TransactionToken{Enabled: true, SigningKeyFile: "/etc/ans-authz/txn.pem", Issuer: "https://gw.example.test",
+		Audience: "upstream.example.test", TTL: 60 * time.Second, Header: "Txn-Token"}
+}
+
+func validIssuer() InstanceIssuer {
+	return InstanceIssuer{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "tl"}
+}
+
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -51,6 +60,152 @@ func TestConfigValidate(t *testing.T) {
 		{name: "extra identity headers colliding by case", mutate: func(c *Config) {
 			c.ExtraIdentityHeaders = map[string]string{"x-caller": "agent_id", "X-Caller": "ans_name"}
 		}, wantErr: "collides"},
+		{name: "instance mode with issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3}
+		}},
+		{name: "instance mode off ignores its other fields", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{AllowedIssuers: []string{"Not A Host"}}
+		}},
+		{name: "instance mode without issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true}
+		}, wantErr: "instanceMode.allowedIssuers"},
+		{name: "instance issuer not lowercase", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"Issuer.example.test"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance issuer as a URL", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"https://issuer.example.test"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance issuer with a port", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test:443"}}
+		}, wantErr: "bare lowercase host"},
+		{name: "instance expected aud as a URL", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				ExpectedAud: "https://gw.example.com"}
+		}, wantErr: "instanceMode.expectedAud"},
+		{name: "instance max status age negative", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: -time.Second}
+		}, wantErr: "maxStatusAge"},
+		{name: "instance max status age set", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer()}}
+		}},
+		{name: "instance max status age without issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute}
+		}, wantErr: `instanceMode.issuers has no entry for allowedIssuers host "issuer.example.test"`},
+		{name: "instance max status age below the minimum", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 9 * time.Second, Issuers: []InstanceIssuer{validIssuer()}}
+		}, wantErr: "maxStatusAge must be at least 10s"},
+		{name: "instance issuers without max status age", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				Issuers: []InstanceIssuer{validIssuer()}}
+		}, wantErr: "instanceMode.issuers needs maxStatusAge"},
+		{name: "instance issuer entry not allowlisted", mutate: func(c *Config) {
+			other := validIssuer()
+			other.Host = "other.example.test"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer(), other}}
+		}, wantErr: `instanceMode.issuers[1]: host "other.example.test" is not in allowedIssuers`},
+		{name: "instance issuer entry duplicated", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer(), validIssuer()}}
+		}, wantErr: "instanceMode.issuers[1]: host \"issuer.example.test\" is listed twice"},
+		{name: "instance issuer agent id not a UUID", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "../root-keys"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id with a misplaced dash", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "000000000-000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id with a non-hex digit", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "0000000g-0000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id in upper case", mutate: func(c *Config) {
+			ok := validIssuer()
+			ok.AgentID = "ABCDEF00-0000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{ok}}
+		}},
+		{name: "instance issuer without a TL", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.TL = ""
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: tl"},
+		{name: "instance cap negative", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxInstancesPerSub: -1}
+		}, wantErr: "maxInstancesPerSub"},
+		{name: "transaction token defaults", mutate: func(c *Config) {
+			if c.TransactionToken.TTL != 60*time.Second || c.TransactionToken.Header != "Txn-Token" || c.TransactionToken.Enabled {
+				t.Errorf("transactionToken defaults = %+v", c.TransactionToken)
+			}
+		}},
+		{name: "transaction token enabled", mutate: func(c *Config) { c.TransactionToken = validTxn() }},
+		{name: "transaction token without a key file", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.SigningKeyFile = ""
+		}, wantErr: "transactionToken.signingKeyFile is required"},
+		{name: "transaction token without an issuer", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Issuer = ""
+		}, wantErr: "transactionToken.issuer"},
+		{name: "transaction token issuer not a URL", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Issuer = "gw.example.test"
+		}, wantErr: "transactionToken.issuer"},
+		{name: "transaction token without an audience", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Audience = ""
+		}, wantErr: "transactionToken.audience is required"},
+		{name: "transaction token ttl zero", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 0
+		}, wantErr: "transactionToken.ttl must be positive and at most 5m0s"},
+		{name: "transaction token ttl over the maximum", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 301 * time.Second
+		}, wantErr: "transactionToken.ttl must be positive and at most 5m0s"},
+		{name: "transaction token ttl at the maximum", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 300 * time.Second
+		}},
+		{name: "transaction token ttl below a second", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 500 * time.Millisecond
+		}, wantErr: "whole number of seconds"},
+		// An empty header means DefaultTxnHeader, so Config literals written
+		// before transaction tokens existed still validate.
+		{name: "transaction token header empty uses the default", mutate: func(c *Config) {
+			c.TransactionToken.Header = ""
+		}},
+		{name: "transaction token header empty collides with an extra header", mutate: func(c *Config) {
+			c.TransactionToken.Header = ""
+			c.ExtraIdentityHeaders = map[string]string{"Txn-Token": "agent_id"}
+		}, wantErr: "collides"},
+		{name: "transaction token header invalid", mutate: func(c *Config) {
+			c.TransactionToken.Header = "Txn Token"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with an identity header", mutate: func(c *Config) {
+			c.TransactionToken.Header = "x-ans-name"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with a credential header", mutate: func(c *Config) {
+			c.TransactionToken.Header = "authorization"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with an extra identity header", mutate: func(c *Config) {
+			c.ExtraIdentityHeaders = map[string]string{"txn-token": "agent_id"}
+		}, wantErr: "transactionToken.header"},
 		{name: "neither trusted hosts nor external authority", mutate: func(c *Config) {
 			c.TrustedHosts = nil
 		}, wantErr: "trustedHosts or externalAuthority"},
@@ -175,5 +330,17 @@ func TestHeaderFieldChecks(t *testing.T) {
 		if got := validHeaderValue(tc.value); got != tc.ok {
 			t.Errorf("validHeaderValue(%q) = %v, want %v", tc.value, got, tc.ok)
 		}
+	}
+}
+
+// TestConfigValidateZeroTransactionToken holds the library contract from
+// main: a Config built by hand, not from DefaultConfig, still validates when
+// transaction tokens are off, so importers' existing literals keep working.
+func TestConfigValidateZeroTransactionToken(t *testing.T) {
+	t.Parallel()
+	c := Config{TrustedHosts: []string{"https://gw.example.com"}, PoPSkew: DefaultPoPSkew,
+		MaxContentBytes: DefaultMaxContentBytes, CheckTimeout: DefaultCheckTimeout}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() on a Config with a zero TransactionToken = %v, want nil", err)
 	}
 }

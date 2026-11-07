@@ -784,15 +784,20 @@ func TestVerifyCallerContext(t *testing.T) {
 
 func TestVerifyAllowContract(t *testing.T) {
 	t.Parallel()
+	// The instance-only headers and the transaction-token header (minting
+	// off here) are stripped in every mode.
+	instanceRemovals := []string{"x-ans-instance-sub", "x-ans-act", "x-ans-scope", "x-ans-authorization-details", "txn-token"}
 	tests := []struct {
 		name       string
 		strip      bool
 		withToken  bool
 		wantRemove []string
 	}{
-		{name: "strip without token", strip: true, wantRemove: []string{"x-scitt-receipt", "x-ans-status-token", "dpop"}},
-		{name: "strip with DPoP token", strip: true, withToken: true, wantRemove: []string{"x-scitt-receipt", "x-ans-status-token"}},
-		{name: "no strip"},
+		{name: "strip without token", strip: true, wantRemove: append([]string{"x-scitt-receipt", "x-ans-status-token", "dpop"}, instanceRemovals...)},
+		{name: "strip with DPoP token", strip: true, withToken: true, wantRemove: append([]string{"x-scitt-receipt", "x-ans-status-token"}, instanceRemovals...)},
+		// The instance-only headers are stripped in every mode, so a
+		// client-supplied value never reaches the upstream.
+		{name: "no strip", wantRemove: instanceRemovals},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -946,6 +951,23 @@ func TestVerifyExtraIdentityHeaders(t *testing.T) {
 		if slices.Contains(d.RemoveHeaders, strings.ToLower(name)) {
 			t.Fatalf("%s is both set and removed", name)
 		}
+	}
+}
+
+// TestVerifyAgentIDLowercase: a certificate-mode caller whose receipt and
+// status token spell the agent id in upper case reaches the upstream under
+// the canonical lower-case id, as an instance-mode issuer does.
+func TestVerifyAgentIDLowercase(t *testing.T) {
+	t.Parallel()
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	f := newFixtureFor(t, strings.ToUpper(lower))
+	d := f.verifier(t, testConfig()).Verify(t.Context(), signedGet(t, f))
+	if !d.Allowed {
+		t.Fatalf("denied: %+v", d.Deny)
+	}
+	if d.Headers[HeaderANSAgentID] != lower || d.Metadata[MetadataAgentID] != lower || d.Identity.AgentID != lower {
+		t.Fatalf("agent id: header %q, metadata %v, identity %q; want %q",
+			d.Headers[HeaderANSAgentID], d.Metadata[MetadataAgentID], d.Identity.AgentID, lower)
 	}
 }
 
