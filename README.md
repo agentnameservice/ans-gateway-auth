@@ -175,24 +175,33 @@ of the issuer's own identity certificate. With `instanceMode.enabled`, such a ca
 No `X-SCITT-Receipt`: a request with one takes the certificate path. A request whose token header
 names `typ` `instance+jwt` is refused while instance mode is off. The verifier checks, in order:
 
-1. `iss` is in `allowedIssuers`, before any key or transparency-log lookup;
-2. the proof verifies under its `jwk`, whose RFC 7638 thumbprint is `cnf.jkt`, and binds the
-   method, the `htu` rebuilt from configuration, the token (`ath`) and the body digest, within
-   `popSkew`;
-3. the token's ES256 signature verifies under `x5c[0]`, a P-256 key;
-4. the status token verifies under a cached TL root key, is unexpired, names `ans_name` (whose
+1. the token's shape: the header, the required claims (`iat` and `exp` JSON integers, `sub` not an
+   `ans://` name), and `act`, which, when present, names one actor, nests no further `act`, and is
+   the token's own instance key, `instance:<cnf.jkt>` (`depth_exceeded`, `act_mismatch`). These
+   read the token alone, so a token from an issuer outside `allowedIssuers` can be refused here
+   with one of these codes rather than `iss_mismatch`;
+2. `iss` is in `allowedIssuers`, before any key or transparency-log lookup;
+3. the proof verifies under its `jwk`, whose RFC 7638 thumbprint is `cnf.jkt`, and binds the
+   method (compared exactly), the `htu` rebuilt from configuration, the token (`ath`) and the body
+   digest, within `popSkew`;
+4. the token's ES256 signature verifies under `x5c[0]`, a P-256 key;
+5. the token is unexpired, its `iat` leads the verifier's clock by at most 120 s, and `exp` is at
+   most 300 s after `iat` (`expired`, `clock_skew`, `bad_token`);
+6. the status token verifies under a cached TL root key, is unexpired, names `ans_name` (whose
    host is `iss`), is `ACTIVE` or `WARNING`, and lists the SHA-256 of the `x5c` certificate in
    `validIdentityCerts` (as `SHA256:<hex>` or raw 32 bytes); the certificate is inside its
    validity dates and carries `ans_name` as a URI SAN. Its `iat` may lead the verifier's clock by
    600 s; with `maxStatusAge` set, by 60 s, and the status is judged as described under "Issuer
    status cache" below. 0 is not recommended for instance mode: a revocation then lands only
    when the issuer's status token expires (about an hour on the TL);
-5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
+7. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
    host, as for certificate-mode callers);
-6. `aud` is `expectedAud`, or the host of the matched authority;
-7. `act`, when present, names one actor, nests no further `act`, and that actor is the token's
-   own instance key, `instance:<cnf.jkt>` (`act_mismatch` otherwise);
-8. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
+8. `aud` is `expectedAud`, or the host of the matched authority;
+9. with transaction tokens on, the token is minted, dated by the clock reading the instance token
+   was checked against;
+10. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache, so a
+    request refused at any earlier step leaves its `jti` unused. A replayed proof therefore has
+    its status token verified (from the cache or as presented) before it is refused `replay`.
 
 An allowed instance request reaches the upstream with, each set with overwrite semantics:
 `X-ANS-Name`, `X-ANS-Agent-Id` and `X-ANS-Fingerprint` (the issuer's), `X-ANS-JKT` (the instance
@@ -315,7 +324,10 @@ refetch the JWKS when they meet an unknown `kid`.
 
 An upstream checks: the signature under the JWKS key named by `kid`; `typ`; `iss`; `aud` is its
 own name; `exp` (allow a few seconds of skew); then authorizes on `sub`, `act`, `scope` and
-`authorization_details`. A client-supplied header of the configured name is overwritten on every
+`authorization_details`. `sub` has two namespaces: a token without `act` is certificate mode and
+its `sub` is an ANS name; a token with `act` is instance mode and its `sub` is the issuer's user,
+so key instance-mode authorization on `ans_issuer.host` together with `sub` (two issuers may both
+mint `sub` "alice"). An instance token whose `sub` is an `ans://` name is refused. A client-supplied header of the configured name is overwritten on every
 allow and removed when minting is off, so it never reaches the upstream in either mode. A
 failure to mint denies the request (503 `INTERNAL_ERROR`) rather than allowing it without a
 token.
