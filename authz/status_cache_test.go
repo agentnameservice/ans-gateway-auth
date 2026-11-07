@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1045,4 +1047,172 @@ func (o *recStatusObserver) results() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.seen...)
+}
+
+// TestStatusIatInt64MinUnderMaxAge is vector status_iat_int64_min_under_max_age:
+// a TL-signed status token whose iat is the int64 minimum is ancient, not
+// fresh. now-iat wraps there, so the age check must not subtract.
+func TestStatusIatInt64MinUnderMaxAge(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	st := mustVerify(t, h, h.mint(scitt.StatusActive, -10))
+	st.Payload.Iat = math.MinInt64
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now, Token: st})
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -60))), codeStatusStale)
+}
+
+// TestStatusRefresherFirstWaitAncientIat: a cached iat so old that its age
+// overflows time.Duration still means "refresh at once", not a wrapped wait.
+func TestStatusRefresherFirstWaitAncientIat(t *testing.T) {
+	t.Parallel()
+	for _, iat := range []int64{math.MinInt64, 1_800_000_000 - 9_300_000_000} {
+		h := newStatusHarness(t)
+		r := h.refresher((&fetcher{}).fetch, new(atomic.Int64), nil)
+		h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: iat})
+		if w := r.firstWait(h.iv.AgentID); w != 0 {
+			t.Errorf("cached iat %d: first wait %s, want 0", iat, w)
+		}
+	}
+}
+
+// TestStatusCacheAgentIDHeaderLowercase: X-ANS-Agent-Id and the agent_id
+// metadata carry the canonical lower-case id whatever case the winning
+// status token used, so one issuer reaches the upstream under one spelling.
+func TestStatusCacheAgentIDHeaderLowercase(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	f := &fetcher{}
+	f.set(h.mintFor(lower, h.ansName, scitt.StatusActive, -30, 3600), nil)
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, nil, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: lower, TL: "test-tl", Fetch: f.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now, 0) }
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := h.config()
+	cfg.InstanceMode.Issuers[0].AgentID = lower
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(cfg, h.keys, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	upper := h.mintFor(strings.ToUpper(lower), h.ansName, scitt.StatusActive, -1, 3600)
+	d := v.Verify(t.Context(), h.request(upper))
+	requireAllowed(t, d, "upper-case presented token")
+	if got := d.Headers[HeaderANSAgentID]; got != lower {
+		t.Fatalf("%s = %q, want %q", HeaderANSAgentID, got, lower)
+	}
+	if got := d.Metadata[MetadataAgentID]; got != lower {
+		t.Fatalf("metadata %s = %v, want %q", MetadataAgentID, got, lower)
+	}
+	if d.Identity.AgentID != lower {
+		t.Fatalf("Identity.AgentID = %q", d.Identity.AgentID)
+	}
+}
+
+// TestRevokedOtherAgent is vector revoked_other_agent: a validly signed
+// REVOKED token about another agent is refused for not being about this
+// issuer (iss_mismatch), the check that runs before the status check, in
+// both status modes. A REVOKED token about this issuer stays revoked.
+func TestRevokedOtherAgent(t *testing.T) {
+	t.Parallel()
+	const otherAgent = "11111111-1111-4111-8111-111111111111"
+	const otherName = "ans://v1.0.0.other.example.test"
+	for _, mode := range []string{"presented", "cache"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			h := newStatusHarness(t)
+			v := h.verifier()
+			if mode == "presented" {
+				noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+				var err error
+				if v, err = NewVerifier(h.iv.config(), h.keys, noReplay, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Unix(h.iv.Now, 0)
+				v.now = func() time.Time { return now }
+			} else {
+				f := &fetcher{}
+				f.set(h.mint(scitt.StatusActive, -30), nil)
+				if err := h.refresher(f.fetch, new(atomic.Int64), nil).Refresh(t.Context(), h.issuer()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, tc := range []struct {
+				name, agent, ansName string
+			}{
+				{"other agent and name", otherAgent, otherName},
+				{"other name", h.iv.AgentID, otherName},
+			} {
+				d := v.Verify(t.Context(), h.request(h.mintFor(tc.agent, tc.ansName, scitt.StatusRevoked, -5, 3600)))
+				requireInstanceDenial(t, d, codeIssMismatch)
+				if d.Deny.Category != CategoryBindingFailed {
+					t.Fatalf("%s: Category = %q", tc.name, d.Deny.Category)
+				}
+			}
+			if mode == "cache" {
+				d := v.Verify(t.Context(), h.request(h.mintFor(otherAgent, h.ansName, scitt.StatusRevoked, -5, 3600)))
+				requireInstanceDenial(t, d, codeIssMismatch)
+			}
+			requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusRevoked, -5))), codeRevoked)
+		})
+	}
+}
+
+// TestStatusPayloadNames reads agent_id and ans_name the way the SDK does
+// (integer key over string key) and refuses CBOR it cannot fully walk, so
+// terminalBinding falls back to the SDK's revoked.
+func TestStatusPayloadNames(t *testing.T) {
+	t.Parallel()
+	cose := func(payload []byte) []byte {
+		protected := cborMap(cborInt(1), cborInt(-7), cborInt(4), cborBytes([]byte{1, 2, 3, 4}))
+		return append(cborHead(6, 18), cborArray(cborBytes(protected), cborMap(), cborBytes(payload),
+			cborBytes(make([]byte, es256SigLen)))...)
+	}
+	const agent, name = "a-1", "ans://v1.0.0.x.example"
+	big := append(cborHead(0, 1<<40), cborHead(0, 1<<20)...) // 8- and 4-byte heads, then ignored
+	for _, tc := range []struct {
+		desc        string
+		payload     []byte
+		agent, name string
+		ok          bool
+	}{
+		{"integer keys", cborMap(cborInt(1), cborText(agent), cborInt(5), cborText(name)), agent, name, true},
+		{"string keys", cborMap(cborText("agent_id"), cborText(agent), cborText("ans_name"), cborText(name)), agent, name, true},
+		{"integer key wins", cborMap(cborText("agent_id"), cborText("s"), cborInt(1), cborText(agent),
+			cborInt(5), cborText(name)), agent, name, true},
+		{"other keys skipped", cborMap(cborInt(2), cborText("REVOKED"), cborInt(3), cborInt(-5),
+			cborInt(6), cborArray(cborMap(cborInt(1), cborBytes([]byte{9}))), cborText("x"), append(cborHead(6, 1), cborInt(0)...),
+			cborBytes([]byte{1}), cborHead(7, 20), cborInt(1), cborText(agent), cborInt(5), cborText(name),
+			big[:9], big[9:]), agent, name, true},
+		{"non-text value", cborMap(cborInt(1), cborInt(7), cborInt(5), cborText(name)), "", name, false},
+		{"missing name", cborMap(cborInt(1), cborText(agent)), agent, "", false},
+		{"not a map", cborArray(cborText(agent)), "", "", false},
+		{"truncated", cborMap(cborInt(1), cborText(agent), cborInt(5))[:8], "", "", false},
+		{"trailing bytes", append(cborMap(cborInt(1), cborText(agent), cborInt(5), cborText(name)), 0), "", "", false},
+		{"indefinite map", append([]byte{0xbf}, cborInt(1)...), "", "", false},
+		{"text past end", cborMap(cborInt(1), cborHead(3, 50)), "", "", false},
+		{"string key past end", cborMap(cborHead(3, 50)), "", "", false},
+		{"bytes past end", cborMap(cborInt(9), cborHead(2, 50)), "", "", false},
+		{"huge map", cborMap(cborInt(9), cborHead(5, 1<<30)), "", "", false},
+		{"huge array", cborMap(cborInt(9), cborHead(4, 1<<30)), "", "", false},
+		{"short head", cborMap(cborInt(9), []byte{0x1b, 0}), "", "", false},
+		{"reserved info", cborMap(cborInt(9), []byte{0x1c}), "", "", false},
+		{"too deep", cborMap(cborInt(9), append(bytes.Repeat([]byte{0x81}, cborMaxDepth+2), 0)), "", "", false},
+		{"bad key", cborMap([]byte{0x1c}), "", "", false},
+	} {
+		p, ok := statusPayloadNames(cose(tc.payload))
+		if ok != tc.ok || (ok && (p.AgentID != tc.agent || p.AnsName != tc.name)) {
+			t.Errorf("%s: got %+v, %v; want %q %q %v", tc.desc, p, ok, tc.agent, tc.name, tc.ok)
+		}
+	}
+	if _, ok := statusPayloadNames([]byte("junk")); ok {
+		t.Error("a non-COSE input parsed")
+	}
 }

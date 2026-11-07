@@ -311,6 +311,9 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if d := v.completeTokenBinding(ctx, r, id, tok, tokenPresented, base); d != nil {
 		return denied(d)
 	}
+	// An agent id is a UUID, whose case carries no meaning; the upstream sees
+	// the canonical lower-case spelling, as in instance mode.
+	id.AgentID = strings.ToLower(id.AgentID)
 	headers, err := v.identityHeaders(id)
 	if err != nil {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))

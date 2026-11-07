@@ -178,7 +178,13 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	tlKey, bundle, err := demokit.Provision(fixtureAnsName, fixtureAgentID)
+	return newFixtureFor(t, fixtureAgentID)
+}
+
+// newFixtureFor is newFixture for a caller with the given agent id.
+func newFixtureFor(t *testing.T, agentID string) *fixture {
+	t.Helper()
+	tlKey, bundle, err := demokit.Provision(fixtureAnsName, agentID)
 	if err != nil {
 		t.Fatalf("demokit.Provision: %v", err)
 	}

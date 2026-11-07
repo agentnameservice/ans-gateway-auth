@@ -51,7 +51,9 @@ func (v *Verifier) recordInstanceJTI(ctx context.Context, proof *instanceProof) 
 // certificate mode; the differences are commented where they are made.
 func (v *Verifier) instanceAllow(it *instanceToken, st *scitt.VerifiedStatusToken) (Decision, error) {
 	c := it.claims
-	id := &pop.CallerIdentity{AnsName: c.ansName, AgentID: st.Payload.AgentID,
+	// An agent id is a UUID, whose case carries no meaning; the upstream
+	// sees one spelling per issuer whichever status token won.
+	id := &pop.CallerIdentity{AnsName: c.ansName, AgentID: strings.ToLower(st.Payload.AgentID),
 		Fingerprint: sha256.Sum256(it.certDER), JKT: c.jkt}
 	fingerprint := id.FingerprintHex()
 	attributes := attributeValues(id)

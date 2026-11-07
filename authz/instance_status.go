@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/agentnameservice/ans-sdk-go/verify"
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
@@ -25,7 +26,7 @@ func (v *Verifier) issuerStatus(ctx context.Context, raw []byte, it *instanceTok
 	if v.statusCache != nil {
 		st, err = v.cachedIssuerStatus(ctx, raw, it, now)
 	} else {
-		st, err = v.presentedIssuerStatus(ctx, raw, now)
+		st, err = v.presentedIssuerStatus(ctx, raw, it, now)
 	}
 	if err != nil {
 		return nil, err
@@ -48,13 +49,14 @@ func (v *Verifier) issuerStatus(ctx context.Context, raw []byte, it *instanceTok
 
 // presentedIssuerStatus is the maxStatusAge-0 path: the presented token
 // alone, bounded only by its own exp.
-func (v *Verifier) presentedIssuerStatus(ctx context.Context, raw []byte, now int64) (*scitt.VerifiedStatusToken, error) {
+func (v *Verifier) presentedIssuerStatus(ctx context.Context, raw []byte, it *instanceToken,
+	now int64) (*scitt.VerifiedStatusToken, error) {
 	st, err := scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
 	if kid, unknown := unknownKeyID(err); unknown && v.keyAvailable(ctx, kid) {
 		st, err = scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
 	}
 	if err != nil {
-		return nil, statusFailure(ctx, err)
+		return nil, statusFailure(ctx, err, raw, it, "")
 	}
 	if err := checkStatusClock(&st.Payload, now, statusIATSkew); err != nil {
 		return nil, err
@@ -74,7 +76,9 @@ func checkStatusClock(p *scitt.StatusTokenPayload, now, skew int64) error {
 	return nil
 }
 
-func statusFailure(ctx context.Context, err error) error {
+// statusFailure maps a status-token verification error. agentID, when set,
+// is the issuer's configured agent (cache mode).
+func statusFailure(ctx context.Context, err error, raw []byte, it *instanceToken, agentID string) error {
 	if ctx.Err() != nil {
 		return err
 	}
@@ -84,11 +88,33 @@ func statusFailure(ctx context.Context, err error) error {
 		case scitt.TokenErrExpired:
 			return refuse(codeStatusExpired, CategoryStatusInvalid, err.Error())
 		case scitt.TokenErrTerminalStatus:
+			// Whether the token is about this issuer is checked before its
+			// status, so a terminal token naming another agent is
+			// iss_mismatch, as for a live one.
+			if berr := terminalBinding(raw, it, agentID); berr != nil {
+				return berr
+			}
 			return refuse(codeRevoked, CategoryStatusInvalid, err.Error())
 		case scitt.TokenErrMissingField, scitt.TokenErrPayloadInvalid, scitt.TokenErrPayloadEmpty:
 		}
 	}
 	return refuse(codeBadStatusToken, CategoryStatusInvalid, err.Error())
+}
+
+// terminalBinding runs the issuer binding checks on a terminal status token.
+// The SDK refuses a terminal token after checking its signature but without
+// returning its payload, so the two names are read from the signed payload
+// here. A payload that cannot be read leaves the refusal revoked.
+func terminalBinding(raw []byte, it *instanceToken, agentID string) error {
+	p, ok := statusPayloadNames(raw)
+	if !ok {
+		return nil
+	}
+	if agentID != "" && !strings.EqualFold(p.AgentID, agentID) {
+		return refuse(codeIssMismatch, CategoryBindingFailed, "status token names agent "+
+			echoValue(p.AgentID)+", not issuer "+echoValue(it.claims.iss)+"'s configured agent")
+	}
+	return checkIssuerNames(p, it)
 }
 
 // checkIssuerNames binds the token's iss and ans_name to the status token and

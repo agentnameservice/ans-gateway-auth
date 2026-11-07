@@ -337,8 +337,14 @@ func (r *StatusRefresher) firstWait(agentID string) time.Duration {
 	if !ok || cached.Terminal {
 		return 0
 	}
-	age := time.Duration(r.now().Unix()-cached.Iat) * time.Second
-	return max(0, r.jittered()-age)
+	// Compare before converting: an ancient iat's age overflows
+	// time.Duration, and a far-future one is held to one interval.
+	now, interval := r.now().Unix(), int64(r.interval/time.Second)
+	if cached.Iat <= now-interval {
+		return 0
+	}
+	age := max(now-cached.Iat, -interval)
+	return max(0, r.jittered()-time.Duration(age)*time.Second)
 }
 
 // Run refreshes every issuer until ctx ends: one goroutine per issuer, each
@@ -403,7 +409,7 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 	agentID := v.issuerAgents[it.claims.iss]
 	presented, err := scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
 	if err != nil {
-		return nil, statusFailure(ctx, err)
+		return nil, statusFailure(ctx, err, raw, it, agentID)
 	}
 	if tl := v.issuerLogs[it.claims.iss]; !holdsKey(v.keys, tl, presented.KeyID) {
 		return nil, refuse(codeBadStatusToken, CategoryStatusInvalid, "status token is not signed by issuer "+
@@ -433,9 +439,12 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 	if now >= p.Exp {
 		return nil, refuse(codeStatusExpired, CategoryStatusInvalid, fmt.Sprintf("status token expired at %d", p.Exp))
 	}
-	if maxAge := int64(v.cfg.InstanceMode.MaxStatusAge / time.Second); now-p.Iat > maxAge {
+	// p.Iat < now-maxAge, not now-p.Iat > maxAge: the subtraction wraps for
+	// an iat near the int64 minimum and would read as fresh.
+	if maxAge := int64(v.cfg.InstanceMode.MaxStatusAge / time.Second); p.Iat < now-maxAge {
 		return nil, refuse(codeStatusStale, CategoryStatusInvalid, fmt.Sprintf(
-			"newest status token for issuer %s was issued %ds ago, over maxStatusAge %ds", echoValue(it.claims.iss), now-p.Iat, maxAge))
+			"newest status token for issuer %s was issued at %d, over maxStatusAge %ds before %d",
+			echoValue(it.claims.iss), p.Iat, maxAge, now))
 	}
 	if fromClient {
 		v.statusCache.OfferPresented(IssuerStatus{AgentID: agentID, Iat: p.Iat, Raw: slices.Clone(raw), Token: chosen})

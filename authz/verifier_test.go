@@ -954,6 +954,23 @@ func TestVerifyExtraIdentityHeaders(t *testing.T) {
 	}
 }
 
+// TestVerifyAgentIDLowercase: a certificate-mode caller whose receipt and
+// status token spell the agent id in upper case reaches the upstream under
+// the canonical lower-case id, as an instance-mode issuer does.
+func TestVerifyAgentIDLowercase(t *testing.T) {
+	t.Parallel()
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	f := newFixtureFor(t, strings.ToUpper(lower))
+	d := f.verifier(t, testConfig()).Verify(t.Context(), signedGet(t, f))
+	if !d.Allowed {
+		t.Fatalf("denied: %+v", d.Deny)
+	}
+	if d.Headers[HeaderANSAgentID] != lower || d.Metadata[MetadataAgentID] != lower || d.Identity.AgentID != lower {
+		t.Fatalf("agent id: header %q, metadata %v, identity %q; want %q",
+			d.Headers[HeaderANSAgentID], d.Metadata[MetadataAgentID], d.Identity.AgentID, lower)
+	}
+}
+
 func TestIdentityHeadersRejectUnsafeValues(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
