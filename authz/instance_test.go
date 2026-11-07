@@ -703,6 +703,10 @@ func TestInstanceEdgeCases(t *testing.T) {
 		// exp-iat wraps negative for this iat, which an overflowing cap reads
 		// as a short lifetime; the reference's integers do not wrap.
 		{name: "bad_token_lifetime_overflow", claims: func(c map[string]any) { c["iat"] = int64(math.MinInt64); c["exp"] = int64(4102444800) }, code: "bad_token", category: CategoryMalformedProof},
+		// An instance sub in the ans:// namespace would mint a transaction
+		// token whose sub matches a certificate-mode caller's.
+		{name: "sub is an ANS name", claims: func(c map[string]any) { c["sub"] = "ans://v1.0.0.agent.example.test" }, code: "bad_token", category: CategoryMalformedProof},
+		{name: "sub is an ANS name in upper case", claims: func(c map[string]any) { c["sub"] = "ANS://v1.0.0.agent.example.test" }, code: "bad_token", category: CategoryMalformedProof},
 		{name: "token iat in the future", claims: func(c map[string]any) { c["iat"] = iv.Now + 500; c["exp"] = iv.Now + 600 }, code: "clock_skew", category: CategoryProofStale},
 		{name: "unknown status-token issuer", code: "cert_not_current", category: CategoryBindingFailed},
 	}

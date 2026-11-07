@@ -114,9 +114,9 @@ const (
 	uncompressedPointTag = 0x04
 )
 
-// instanceHeaders are the upstream headers only instance mode sets. When
-// instance mode is enabled, a certificate-mode allow removes them so a
-// client-supplied value never reaches the upstream.
+// instanceHeaders are the upstream headers only instance mode sets. Every
+// certificate-mode allow removes them, whether or not instance mode is
+// enabled, so a client-supplied value never reaches the upstream.
 var instanceHeaders = []string{ //nolint:gochecknoglobals // immutable header list
 	HeaderANSInstanceSub, HeaderANSAct, HeaderANSScope, HeaderANSAuthorizationDetails,
 }
@@ -195,12 +195,14 @@ func isInstanceRequest(h http.Header) (string, bool) {
 	return tok, true
 }
 
-// verifyInstance runs the instance-mode checks: the issuer allowlist before
-// any lookup; the DPoP proof under its own jwk (htm, htu, ath, body digest,
-// freshness, cnf.jkt); the token's ES256 signature under x5c; the issuer's
-// status token against the cached TL root keys; aud; then the optional
-// per-sub cap and, last, the replay check, so a refused request never burns
-// its jti or records an unvouched proof.
+// verifyInstance runs the instance-mode checks: the token's shape and act;
+// the issuer allowlist, before any key or TL lookup; the DPoP proof under its
+// own jwk (htm, htu, ath, body digest, freshness, cnf.jkt); the token's ES256
+// signature under x5c; its lifetime; the issuer's status token against the
+// cached TL root keys; allowedAnsNames; aud; the transaction token, minted at
+// the time the token was checked; then the optional per-sub cap and, last,
+// the replay check, so a refused request never burns its jti or records an
+// unvouched proof.
 func (v *Verifier) verifyInstance(ctx context.Context, r *Request, base, tok string) Decision {
 	d, err := v.instanceDecision(ctx, r, base, tok)
 	if err != nil {
@@ -229,15 +231,18 @@ func (v *Verifier) instanceDecision(ctx context.Context, r *Request, base, tok s
 	if err != nil {
 		return Decision{}, &deniedError{denial: withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err)}
 	}
-	if err := v.admitInstance(ctx, it, proof, now); err != nil {
-		return Decision{}, err
-	}
 	claims, err := instanceTxnClaims(it)
 	if err != nil {
 		return Decision{}, &deniedError{denial: withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err)}
 	}
-	if d = v.attachTxn(d, r, claims); !d.Allowed {
+	// Mint before admitting, so a mint failure leaves the jti and cap slot
+	// unused, and at the time the token's lifetime was checked, so exp stays
+	// after iat however long the replay check takes.
+	if d = v.attachTxn(d, r, claims, time.Unix(now, 0)); !d.Allowed {
 		return Decision{}, &deniedError{denial: d.Deny}
+	}
+	if err := v.admitInstance(ctx, it, proof, now); err != nil {
+		return Decision{}, err
 	}
 	return d, nil
 }

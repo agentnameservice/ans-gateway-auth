@@ -15,8 +15,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/agentnameservice/ans-gateway-auth/replay"
 )
 
 const (
@@ -413,6 +416,92 @@ func TestTxnTokenMintFailure(t *testing.T) {
 	d := txnVerifier(t, iv, m).Verify(t.Context(), validReq(t, iv))
 	if d.Allowed || d.Deny == nil || d.Deny.HTTPStatus != http.StatusServiceUnavailable || d.Deny.Category != CategoryInternalError {
 		t.Fatalf("Verify = %+v (deny %+v)", d, d.Deny)
+	}
+}
+
+// TestTxnTokenMintFailureKeepsJTI: a request refused because minting failed
+// has not burned its jti or taken a cap slot, so the same proof retried once
+// the minter recovers is admitted rather than refused replay.
+func TestTxnTokenMintFailureKeepsJTI(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	m := mustMinter(t, txnConfig(), newTxnKey(t))
+	cfg := iv.config()
+	cfg.TransactionToken = m.cfg
+	cfg.InstanceMode.MaxInstancesPerSub = 1
+	mem := replay.NewMemory(t.Context(), 1000, nil)
+	t.Cleanup(func() { _ = mem.Close() })
+	v, err := NewVerifier(cfg, iv.keys(t), mem, nil, nil, WithTxnMinter(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(iv.Now, 0)
+	v.now = func() time.Time { return now }
+	m.random = failingReader{}
+	if d := v.Verify(t.Context(), validReq(t, iv)); d.Allowed || d.Deny.Category != CategoryInternalError {
+		t.Fatalf("mint failure: %+v (deny %+v)", d, d.Deny)
+	}
+	if n := len(v.instances.subs); n != 0 {
+		t.Fatalf("a refused request holds %d cap entries", n)
+	}
+	m.random = rand.Reader
+	if d := v.Verify(t.Context(), validReq(t, iv)); !d.Allowed {
+		t.Fatalf("retry after the minter recovered: %+v", d.Deny)
+	}
+}
+
+// TestTxnTokenMintUsesDecisionClock: the clock moves past the instance
+// token's exp while the replay check runs. The transaction token is minted
+// at the time the instance token was checked, so its exp stays after its
+// iat; a second clock reading would mint one already expired.
+func TestTxnTokenMintUsesDecisionClock(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	m := mustMinter(t, txnConfig(), newTxnKey(t))
+	it, err := parseInstanceToken(validInstanceVector(t, iv).Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := it.claims.exp
+	cfg := iv.config()
+	cfg.TransactionToken = m.cfg
+	cfg.PoPSkew = time.Duration(exp-iv.Now) * time.Second
+	var clock atomic.Int64
+	clock.Store(exp - 1)
+	slow := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) {
+		clock.Store(exp + 2) // a 3 s replay round trip
+		return false, nil
+	}}
+	v, err := NewVerifier(cfg, iv.keys(t), slow, nil, nil, WithTxnMinter(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	d := v.Verify(t.Context(), validReq(t, iv))
+	if !d.Allowed {
+		t.Fatalf("denied: %+v", d.Deny)
+	}
+	_, claims := decodeTxn(t, m, d.Headers[DefaultTxnHeader])
+	iat, gotExp := int64(claims["iat"].(float64)), int64(claims["exp"].(float64))
+	if iat != exp-1 || gotExp != exp {
+		t.Fatalf("iat %d exp %d, want iat %d exp %d", iat, gotExp, exp-1, exp)
+	}
+}
+
+// TestTxnMintRefusesExpiredSource: mint refuses claims whose notAfter is not
+// after the mint time, rather than signing a token that is born expired.
+func TestTxnMintRefusesExpiredSource(t *testing.T) {
+	t.Parallel()
+	m := mustMinter(t, txnConfig(), newTxnKey(t))
+	r := &Request{Method: http.MethodGet, Path: "/"}
+	now := time.Unix(1800000000, 0)
+	for _, notAfter := range []int64{now.Unix(), now.Unix() - 1} {
+		if _, err := m.mint(txnClaims{Sub: "user:x", notAfter: notAfter}, r, now); err == nil {
+			t.Fatalf("notAfter %d at %d: minted", notAfter, now.Unix())
+		}
+	}
+	if _, err := m.mint(txnClaims{Sub: "user:x", notAfter: now.Unix() + 1}, r, now); err != nil {
+		t.Fatalf("notAfter one second ahead: %v", err)
 	}
 }
 

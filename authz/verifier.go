@@ -315,7 +315,7 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))
 	}
 	return v.attachTxn(v.allow(id, headers, tokenPresented), r,
-		txnClaims{Sub: id.AnsName, Cnf: txnConfirmation{JKT: id.JKT}})
+		txnClaims{Sub: id.AnsName, Cnf: txnConfirmation{JKT: id.JKT}}, v.now())
 }
 
 // htuBase returns the scheme://authority the proof must have been minted for,
@@ -500,14 +500,28 @@ func withDetail(d *Denial, err error) *Denial {
 // comes from signed material, so a defective issuer cannot inject header
 // framing.
 func (v *Verifier) identityHeaders(id *pop.CallerIdentity) (map[string]string, error) {
-	attributes := map[string]string{
+	return v.withExtraHeaders(standardHeaders(id), attributeValues(id))
+}
+
+// attributeValues are the caller's values for the attributes extraIdentityHeaders names.
+func attributeValues(id *pop.CallerIdentity) map[string]string {
+	return map[string]string{
 		MetadataANSName: id.AnsName, MetadataAgentID: id.AgentID,
 		MetadataFingerprint: id.FingerprintHex(), MetadataJKT: id.JKT,
 	}
-	headers := map[string]string{
-		HeaderANSName: attributes[MetadataANSName], HeaderANSAgentID: attributes[MetadataAgentID],
-		HeaderANSFingerprint: attributes[MetadataFingerprint], HeaderANSJKT: attributes[MetadataJKT],
+}
+
+// standardHeaders are the four X-ANS-* headers every allow sets.
+func standardHeaders(id *pop.CallerIdentity) map[string]string {
+	return map[string]string{
+		HeaderANSName: id.AnsName, HeaderANSAgentID: id.AgentID,
+		HeaderANSFingerprint: id.FingerprintHex(), HeaderANSJKT: id.JKT,
 	}
+}
+
+// withExtraHeaders adds the configured extraIdentityHeaders from attributes
+// to headers and checks every value, in both caller modes.
+func (v *Verifier) withExtraHeaders(headers, attributes map[string]string) (map[string]string, error) {
 	for _, e := range v.extra {
 		headers[e.name] = attributes[e.attribute]
 	}
@@ -525,12 +539,9 @@ func (v *Verifier) identityHeaders(id *pop.CallerIdentity) (map[string]string, e
 // additions and would strip them again.
 func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, tokenPresented bool) Decision {
 	fingerprint := id.FingerprintHex()
-	var remove []string
-	if v.cfg.StripIdentityHeaders {
-		remove = append(remove, strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken))
-		if !tokenPresented {
-			remove = append(remove, strings.ToLower(pop.DPoPHeader))
-		}
+	remove := v.consumedHeaders()
+	if v.cfg.StripIdentityHeaders && !tokenPresented {
+		remove = append(remove, strings.ToLower(pop.DPoPHeader))
 	}
 	// A certificate-mode caller has no instance identity; an upstream that
 	// reads these headers must never see a client-supplied value, whether or
@@ -548,6 +559,15 @@ func (v *Verifier) allow(id *pop.CallerIdentity, headers map[string]string, toke
 		},
 		RemoveHeaders: remove,
 	}
+}
+
+// consumedHeaders are the trust headers stripIdentityHeaders removes in both
+// caller modes: the receipt and the status token.
+func (v *Verifier) consumedHeaders() []string {
+	if !v.cfg.StripIdentityHeaders {
+		return nil
+	}
+	return []string{strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken)}
 }
 
 // logMisconfiguration emits one ERROR per reason and authority per interval.

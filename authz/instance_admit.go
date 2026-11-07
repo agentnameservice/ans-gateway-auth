@@ -3,7 +3,6 @@ package authz
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -47,22 +46,21 @@ func (v *Verifier) recordInstanceJTI(ctx context.Context, proof *instanceProof) 
 
 // instanceAllow builds the identity contract. Every header is set with
 // overwrite semantics; an optional header the token does not carry is
-// removed instead, so a client-supplied value never survives.
+// removed instead, so a client-supplied value never survives. It shares the
+// standard headers, extraIdentityHeaders and the header-value check with
+// certificate mode; the differences are commented where they are made.
 func (v *Verifier) instanceAllow(it *instanceToken, st *scitt.VerifiedStatusToken) (Decision, error) {
 	c := it.claims
 	id := &pop.CallerIdentity{AnsName: c.ansName, AgentID: st.Payload.AgentID,
 		Fingerprint: sha256.Sum256(it.certDER), JKT: c.jkt}
-	fingerprint := hex.EncodeToString(id.Fingerprint[:])
-	attributes := map[string]string{
-		// agent_id names the instance, not the issuer, for extraIdentityHeaders:
-		// a gateway keying a session subject on it must not merge every
-		// instance an issuer signs into one session.
-		MetadataANSName: id.AnsName, MetadataAgentID: c.jkt, MetadataFingerprint: fingerprint, MetadataJKT: c.jkt,
-	}
-	headers := map[string]string{
-		HeaderANSName: id.AnsName, HeaderANSAgentID: id.AgentID, HeaderANSFingerprint: fingerprint,
-		HeaderANSJKT: id.JKT, HeaderANSInstanceSub: c.sub,
-	}
+	fingerprint := id.FingerprintHex()
+	attributes := attributeValues(id)
+	// agent_id names the instance, not the issuer, for extraIdentityHeaders:
+	// a gateway keying a session subject on it must not merge every instance
+	// an issuer signs into one session.
+	attributes[MetadataAgentID] = c.jkt
+	headers := standardHeaders(id)
+	headers[HeaderANSInstanceSub] = c.sub
 	metadata := map[string]any{
 		MetadataANSName: id.AnsName, MetadataAgentID: id.AgentID, MetadataFingerprint: fingerprint,
 		MetadataJKT: id.JKT, MetadataInstanceSub: c.sub,
@@ -86,19 +84,15 @@ func (v *Verifier) instanceAllow(it *instanceToken, st *scitt.VerifiedStatusToke
 			metadata[o.metadata] = o.value
 		}
 	}
-	for _, e := range v.extra {
-		headers[e.name] = attributes[e.attribute]
+	headers, err := v.withExtraHeaders(headers, attributes)
+	if err != nil {
+		return Decision{}, err
 	}
-	for name, value := range headers {
-		if !validHeaderValue(value) {
-			return Decision{}, fmt.Errorf("identity attribute for header %s is not a valid header field value", name)
-		}
-	}
+	remove = append(remove, v.consumedHeaders()...)
 	if v.cfg.StripIdentityHeaders {
-		// The verifier is the token's audience and has consumed the proof, so
-		// neither is meant for the upstream.
-		remove = append(remove, strings.ToLower(scitt.HeaderReceipt), strings.ToLower(scitt.HeaderStatusToken),
-			strings.ToLower(pop.DPoPHeader), strings.ToLower(headerAuthorization))
+		// Unlike certificate mode, the verifier is the token's audience and
+		// has consumed the proof, so neither is meant for the upstream.
+		remove = append(remove, strings.ToLower(pop.DPoPHeader), strings.ToLower(headerAuthorization))
 	}
 	return Decision{Allowed: true, Identity: id, Headers: headers, RemoveHeaders: remove, Metadata: metadata}, nil
 }

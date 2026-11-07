@@ -277,6 +277,9 @@ func (m *TxnMinter) mint(c txnClaims, r *Request, now time.Time) (string, error)
 	c.Iat = now.Unix()
 	c.Exp = c.Iat + int64(m.cfg.TTL/time.Second)
 	if c.notAfter > 0 {
+		if c.notAfter <= c.Iat {
+			return "", fmt.Errorf("transaction token: source credential expired at %d, not after %d", c.notAfter, c.Iat)
+		}
 		c.Exp = min(c.Exp, c.notAfter)
 	}
 	c.Rctx = txnRequestContext{Method: r.Method, Path: pathOnly(r.Path)}
@@ -338,7 +341,7 @@ func WithTxnMinter(m *TxnMinter) VerifierOption {
 // minting is off, so a client-supplied value never reaches the upstream in
 // any mode. A mint failure denies: an upstream that authorizes on the token
 // must never receive an allow without one.
-func (v *Verifier) attachTxn(d Decision, r *Request, claims txnClaims) Decision {
+func (v *Verifier) attachTxn(d Decision, r *Request, claims txnClaims, now time.Time) Decision {
 	if !d.Allowed {
 		return d
 	}
@@ -346,7 +349,7 @@ func (v *Verifier) attachTxn(d Decision, r *Request, claims txnClaims) Decision 
 		d.RemoveHeaders = append(d.RemoveHeaders, strings.ToLower(v.cfg.TransactionToken.headerName()))
 		return d
 	}
-	tok, err := v.txn.mint(claims, r, v.now())
+	tok, err := v.txn.mint(claims, r, now)
 	if err != nil {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))
 	}

@@ -8,7 +8,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
+
+// ansNameScheme prefixes an ANS name, the certificate-mode transaction-token
+// sub.
+const ansNameScheme = "ans://"
 
 // parseInstanceToken checks the token's shape: a compact JWS whose header is
 // exactly {alg ES256, typ instance+jwt, x5c [one certificate]}, and the
@@ -78,6 +83,11 @@ func decodeInstanceClaims(payload map[string]json.RawMessage) (instanceClaims, e
 	c.iat, c.exp = iat, exp
 	if c.iss == "" || c.ansName == "" || c.sub == "" || c.jti == "" || c.jkt == "" || !iatOK || !expOK {
 		return c, refuse(codeBadToken, CategoryMalformedProof, "missing iss, ans_name, sub, iat, exp, jti or cnf.jkt")
+	}
+	// The transaction token's sub is the caller's ANS name in certificate
+	// mode, so an instance sub must not claim that namespace.
+	if strings.HasPrefix(strings.ToLower(c.sub), ansNameScheme) {
+		return c, refuse(codeBadToken, CategoryMalformedProof, "sub must not be an ans:// name")
 	}
 	if raw := nullAsAbsent(payload["scope"]); raw != nil {
 		if json.Unmarshal(raw, &c.scope) != nil {
