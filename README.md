@@ -107,7 +107,7 @@ instanceMode:                  # second caller mode; see "Instance mode" below
   allowedIssuers: []           # bare lowercase hosts, e.g. [authority.example.com]; required when enabled
   expectedAud: ""              # bare host the token's aud must name; empty = host of the matched authority
   maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
-  maxStatusAge: 0s             # refuse an issuer status token older than this (status_stale); 0 = until its exp
+  maxStatusAge: 0s             # refuse an issuer status token older than this (status_stale); 0 = until its exp, not recommended
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -176,7 +176,8 @@ names `typ` `instance+jwt` is refused while instance mode is off. The verifier c
    validity dates and carries `ans_name` as a URI SAN. Its `iat` may lead the verifier's clock by
    600 s; with `maxStatusAge` set, by 60 s, and a token issued more than `maxStatusAge` ago is
    refused (`status_stale`), so a revocation is seen within that bound instead of at the status
-   token's own `exp` (about an hour on the TL);
+   token's own `exp`. 0 is not recommended for instance mode: a revocation then lands only when
+   the issuer's status token expires (about an hour on the TL);
 5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
    host, as for certificate-mode callers);
 6. `aud` is `expectedAud`, or the host of the matched authority;
@@ -278,7 +279,13 @@ read access to that secret.
   `headers_with_underscores_action`; the recipes add the authorization rule
   `deny: 'request.headers.exists(k, k.contains("_"))'`, which returns `403` for a request
   carrying, say, `X_ANS_Act` (checked against the pinned v1.6.0 binary). On Envoy, set
-  `headers_with_underscores_action: REJECT_REQUEST`.
+  `headers_with_underscores_action: REJECT_REQUEST`; the Agent Router recipes do so through
+  Envoy Gateway's `ClientTrafficPolicy` (`headers.withUnderscoresAction: RejectRequest`), which
+  rejects the request before ext_authz runs. On agentgateway the order is reversed:
+  `extAuthz` runs before `authorization`, so a request the underscore rule later refuses has
+  already been verified and its proof `jti` recorded in the replay cache, as with the rate
+  limit below. The proof is spent, the request still never reaches the upstream, and the cost
+  is replay-cache capacity, bounded the same way.
 - Upstreams must be reachable only through the gateway; otherwise `X-ANS-*` can be forged.
 - A gateway rate limit does not protect the verifier or the replay cache. In agentgateway v1.6.0
   `localRateLimit` runs after `extAuthz` and `authorization`, and listener policies have no rate
