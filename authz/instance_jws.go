@@ -53,11 +53,17 @@ func jsonString(raw json.RawMessage) string {
 }
 
 // jsonInt reads a JSON integer; a fraction, exponent or non-number fails.
+// A quoted number fails too: json.Number would decode the string "1700000000",
+// and the reference implementation requires a JSON integer.
 func jsonInt(raw json.RawMessage) (int64, bool) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || (trimmed[0] != '-' && (trimmed[0] < '0' || trimmed[0] > '9')) {
+		return 0, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	dec.UseNumber()
 	var n json.Number
-	if raw == nil || dec.Decode(&n) != nil {
+	if dec.Decode(&n) != nil {
 		return 0, false
 	}
 	i, err := n.Int64()

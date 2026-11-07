@@ -157,7 +157,10 @@ func (it *instanceToken) checkLifetime(now int64) error {
 		return refuse(codeExpired, CategoryProofStale, fmt.Sprintf("token expired at %d", c.exp))
 	case c.iat > now+instanceIATSkew:
 		return refuse(codeClockSkew, CategoryProofStale, fmt.Sprintf("token iat %d is %ds in the future", c.iat, c.iat-now))
-	case c.exp-c.iat > instanceMaxTTL:
+	// Compare without subtracting: for an iat near the int64 minimum, exp-iat
+	// wraps negative and would pass the cap. iat is at most now+skew here, so
+	// iat+instanceMaxTTL cannot overflow.
+	case c.exp > c.iat+instanceMaxTTL:
 		return refuse(codeBadToken, CategoryMalformedProof, fmt.Sprintf("token lifetime exceeds %ds", instanceMaxTTL))
 	}
 	return nil

@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/pop"
@@ -83,7 +82,9 @@ func (v *Verifier) checkProofClaims(r *Request, payload map[string]json.RawMessa
 	if skew := int64(v.cfg.PoPSkew / time.Second); iat < now-skew || iat > now+skew {
 		return nil, refuse(codeClockSkew, CategoryProofStale, fmt.Sprintf("proof iat %d is %+ds from now", iat, iat-now))
 	}
-	if !strings.EqualFold(jsonString(payload["htm"]), r.Method) {
+	// Exact match, as the SDK compares certificate-mode proofs: RFC 9110
+	// method names are case-sensitive.
+	if jsonString(payload["htm"]) != r.Method {
 		return nil, refuse(codeBadDPoP, CategoryHTTPBindingMismatch, "htm does not match the request method")
 	}
 	want, _ := normalizeHTU(rawURL)

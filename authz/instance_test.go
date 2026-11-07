@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -675,7 +676,12 @@ func TestInstanceEdgeCases(t *testing.T) {
 		{name: "proof iat in the future", payload: func(p map[string]any) { p["iat"] = iv.Now + 500 }, code: "clock_skew", category: CategoryProofStale},
 		// now-iat wraps to a negative int64 for this iat, which an overflowing
 		// skew check reads as fresh.
-		{name: "proof iat 2^63 seconds in the past", payload: func(p map[string]any) { p["iat"] = iv.Now + math.MinInt64 }, code: "clock_skew", category: CategoryProofStale},
+		{name: "bad_dpop_iat_overflow", payload: func(p map[string]any) { p["iat"] = iv.Now + math.MinInt64 }, code: "clock_skew", category: CategoryProofStale},
+		// The reference requires a JSON integer (isinstance int); a quoted
+		// number, which json.Number would otherwise accept, is refused.
+		{name: "bad_dpop_iat_quoted", payload: func(p map[string]any) { p["iat"] = strconv.FormatInt(iv.Now, 10) }, code: "bad_dpop", category: CategoryMalformedProof},
+		// RFC 9110 method names are case-sensitive, as the SDK compares them.
+		{name: "proof htm in lower case", payload: func(p map[string]any) { p["htm"] = "post" }, code: "bad_dpop", category: CategoryHTTPBindingMismatch},
 		{name: "proof iat at the int64 minimum", payload: func(p map[string]any) { p["iat"] = int64(math.MinInt64) }, code: "clock_skew", category: CategoryProofStale},
 		{name: "proof iat zero", payload: func(p map[string]any) { p["iat"] = 0 }, code: "clock_skew", category: CategoryProofStale},
 		{name: "proof htu not absolute", payload: func(p map[string]any) { p["htu"] = "/mcp" }, code: "htu_mismatch", category: CategoryHTTPBindingMismatch},
@@ -683,6 +689,13 @@ func TestInstanceEdgeCases(t *testing.T) {
 		{name: "proof htu on another port", payload: func(p map[string]any) { p["htu"] = iv.TrustedHost + ":8443/mcp" }, code: "htu_mismatch", category: CategoryHTTPBindingMismatch},
 		{name: "proof digest malformed", payload: func(p map[string]any) { p["ans_content_digest"] = "short" }, code: "bad_dpop", category: CategoryMalformedProof},
 		{name: "proof signature not base64", proof: func(s string) string { return s[:strings.LastIndex(s, ".")] + ".!!" }, code: "bad_dpop", category: CategorySignatureInvalid},
+		{name: "bad_token_iat_quoted", claims: func(c map[string]any) { c["iat"] = strconv.FormatInt(iv.Now, 10) }, code: "bad_token", category: CategoryMalformedProof},
+		{name: "bad_token_exp_quoted", claims: func(c map[string]any) { c["exp"] = strconv.FormatInt(iv.Now+300, 10) }, code: "bad_token", category: CategoryMalformedProof},
+		{name: "bad_token_iat_bool", claims: func(c map[string]any) { c["iat"] = true }, code: "bad_token", category: CategoryMalformedProof},
+		{name: "bad_token_exp_bool", claims: func(c map[string]any) { c["exp"] = true }, code: "bad_token", category: CategoryMalformedProof},
+		// exp-iat wraps negative for this iat, which an overflowing cap reads
+		// as a short lifetime; the reference's integers do not wrap.
+		{name: "bad_token_lifetime_overflow", claims: func(c map[string]any) { c["iat"] = int64(math.MinInt64); c["exp"] = int64(4102444800) }, code: "bad_token", category: CategoryMalformedProof},
 		{name: "token iat in the future", claims: func(c map[string]any) { c["iat"] = iv.Now + 500; c["exp"] = iv.Now + 600 }, code: "clock_skew", category: CategoryProofStale},
 		{name: "unknown status-token issuer", code: "cert_not_current", category: CategoryBindingFailed},
 	}
