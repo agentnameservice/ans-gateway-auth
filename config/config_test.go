@@ -556,6 +556,23 @@ func TestConfigWarnings(t *testing.T) {
 			},
 		},
 		{
+			name: "transaction-token JWKS on a non-loopback listener", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.TransactionToken = authz.TransactionToken{Enabled: true, SigningKeyFile: "/k.pem",
+					Issuer: "https://gw.example.test", Audience: "up.example.test", TTL: time.Minute, Header: "Txn-Token"}
+				c.HTTPListen = "0.0.0.0:9192"
+			},
+			want: []string{"transactionToken is enabled and httpListen 0.0.0.0:9192 is not loopback; /.well-known/jwks.json is served there over plain HTTP, so an on-path host can substitute the upstreams' verification key"},
+		},
+		{
+			name: "transaction-token JWKS on loopback is fine", checkTimeout: 1500 * time.Millisecond,
+			mutate: func(c *Config) {
+				c.TransactionToken = authz.TransactionToken{Enabled: true, SigningKeyFile: "/k.pem",
+					Issuer: "https://gw.example.test", Audience: "up.example.test", TTL: time.Minute, Header: "Txn-Token"}
+				c.HTTPListen = "[::1]:9192"
+			},
+		},
+		{
 			name: "missing requiredContext", checkTimeout: 1500 * time.Millisecond,
 			mutate: func(c *Config) { c.RequiredContext = nil },
 			want:   []string{"requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests"},

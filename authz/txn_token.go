@@ -104,6 +104,14 @@ func (tt TransactionToken) validate(extra map[string]string) error {
 
 // LoadTxnSigningKey reads a PEM P-256 private key.
 func LoadTxnSigningKey(path string) (*ecdsa.PrivateKey, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("transactionToken.signingKeyFile: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("transactionToken.signingKeyFile %s: mode %04o is readable by group or others; chmod 600",
+			path, info.Mode().Perm())
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("transactionToken.signingKeyFile: %w", err)
@@ -233,6 +241,9 @@ type txnClaims struct {
 	AuthorizationDetails json.RawMessage   `json:"authorization_details,omitempty"`
 	AnsIssuer            *txnIssuer        `json:"ans_issuer,omitempty"`
 	Rctx                 txnRequestContext `json:"rctx"`
+	// notAfter, when set, caps exp: an instance token's own exp, so the
+	// transaction token never outlives the credential it was derived from.
+	notAfter int64
 }
 
 // mint signs claims after filling iss, aud, iat, exp, jti and txn.
@@ -250,6 +261,9 @@ func (m *TxnMinter) mint(c txnClaims, r *Request, now time.Time) (string, error)
 	c.Iss, c.Aud, c.Jti, c.Txn = m.cfg.Issuer, m.cfg.Audience, jti, txn
 	c.Iat = now.Unix()
 	c.Exp = c.Iat + int64(m.cfg.TTL/time.Second)
+	if c.notAfter > 0 {
+		c.Exp = min(c.Exp, c.notAfter)
+	}
 	c.Rctx = txnRequestContext{Method: r.Method, Path: pathOnly(r.Path)}
 	payload, err := json.Marshal(c)
 	if err != nil {
@@ -275,24 +289,23 @@ func (m *TxnMinter) randomID() (string, error) {
 	return b64url(b), nil
 }
 
-// instanceTxnClaims is the verified instance context: sub is the user, act
-// names the instance key (instance:<jkt>) and nests the token's own act,
-// when present, as the prior actor (RFC 8693 section 4.1).
+// instanceTxnClaims is the verified instance context: sub is the user and
+// act the single hop {"sub":"instance:<cnf.jkt>"}, the key that signed this
+// request. A child token's own act already names that key (checkAct), and
+// the parent instance it derives from is not named: one hop, and the child
+// token carries no parent jkt. exp is clamped to the instance token's exp.
 func instanceTxnClaims(it *instanceToken) (txnClaims, error) {
 	c := it.claims
-	act := map[string]any{"sub": instanceActorPrefix + c.jkt}
-	if c.act != nil {
-		act["act"] = c.act
-	}
-	actJSON, err := json.Marshal(act)
+	act, err := json.Marshal(map[string]string{"sub": instanceActorPrefix + c.jkt})
 	if err != nil {
 		return txnClaims{}, err
 	}
 	fp := sha256.Sum256(it.certDER)
 	claims := txnClaims{
-		Sub: c.sub, Act: actJSON, Cnf: txnConfirmation{JKT: c.jkt},
+		Sub: c.sub, Act: act, Cnf: txnConfirmation{JKT: c.jkt},
 		AuthorizationDetails: c.authorizationDetails,
 		AnsIssuer:            &txnIssuer{Host: c.iss, AnsName: c.ansName, CertFP: hex.EncodeToString(fp[:])},
+		notAfter:             c.exp,
 	}
 	if c.hasScope {
 		scope := c.scope
@@ -328,3 +341,6 @@ func (v *Verifier) attachTxn(d Decision, r *Request, claims txnClaims) Decision 
 	d.Headers[v.txn.HeaderName()] = tok
 	return d
 }
+
+// Config is the transactionToken configuration the minter was built for.
+func (m *TxnMinter) Config() TransactionToken { return m.cfg }

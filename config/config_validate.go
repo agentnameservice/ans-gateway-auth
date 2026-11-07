@@ -70,6 +70,10 @@ func (c Config) Warnings() []string {
 				"transparencyLogs %q fetches root keys over plaintext from non-loopback %s; an on-path host can inject trust, pin rootKeys", tl.Name, u.Host))
 		}
 	}
+	if c.TransactionToken.Enabled && !isLoopbackHost(hostOf(c.HTTPListen)) {
+		warnings = append(warnings, fmt.Sprintf(
+			"transactionToken is enabled and httpListen %s is not loopback; /.well-known/jwks.json is served there over plain HTTP, so an on-path host can substitute the upstreams' verification key", c.HTTPListen))
+	}
 	if c.RequiredContext == nil {
 		warnings = append(warnings, "requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests")
 	}

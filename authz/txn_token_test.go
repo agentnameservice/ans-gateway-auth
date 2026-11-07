@@ -143,7 +143,10 @@ func checkRandomIDs(t *testing.T, claims map[string]any, randomTxn bool) {
 }
 
 // TestTxnTokenInstanceModeClaims mints on an instance-mode allow with the
-// exact claim set, for a parent token and for a child carrying act.
+// exact claim set. act is always the single hop {"sub":"instance:<cnf.jkt>"}:
+// for a child (whose act already names that key) and for a parent alike. The
+// parent instance of a child is not named. exp is iat + ttl, below the
+// instance token's own exp.
 func TestTxnTokenInstanceModeClaims(t *testing.T) {
 	t.Parallel()
 	iv := loadInstanceVectors(t)
@@ -151,44 +154,70 @@ func TestTxnTokenInstanceModeClaims(t *testing.T) {
 	for _, vec := range iv.Vectors {
 		byName[vec.Name] = vec
 	}
-	const jkt = "JsUXOqv1rZTp0dSwDHb-cbOjgRbjI27Ma1mHnTTt-Ew"
-	for _, tc := range []struct {
-		vector, want string
-	}{
-		{"valid", `{"iss":"https://gw.example.test","aud":"upstream.example.test","iat":1800000000,"exp":1800000060,
-			"txn":"req-7f3a9c","sub":"user:demo-user-1","act":{"sub":"instance:` + jkt + `"},"cnf":{"jkt":"` + jkt + `"},
-			"scope":"mcp:diagnose_domain mcp:list_tools",
-			"authorization_details":[{"type":"site-debug","domains":["*.example-customer.com"]}],
-			"ans_issuer":{"host":"issuer.example.test","ans_name":"ans://v1.0.0.issuer.example.test",
-				"cert_fp":"695d9ff3de1993d7022fcce21c12cae48ee1631987afa4d45d6c087652432859"},
-			"rctx":{"method":"POST","path":"/mcp"}}`},
-		{"valid_child_with_act", `{"iss":"https://gw.example.test","aud":"upstream.example.test","iat":1800000000,"exp":1800000060,
-			"txn":"req-7f3a9c","sub":"user:demo-user-1","act":{"sub":"instance:` + jkt + `","act":{"sub":"instance:child-1"}},
-			"cnf":{"jkt":"` + jkt + `"},"scope":"mcp:diagnose_domain",
-			"authorization_details":[{"type":"site-debug","domains":["*.example-customer.com"]}],
-			"ans_issuer":{"host":"issuer.example.test","ans_name":"ans://v1.0.0.issuer.example.test",
-				"cert_fp":"695d9ff3de1993d7022fcce21c12cae48ee1631987afa4d45d6c087652432859"},
-			"rctx":{"method":"POST","path":"/mcp"}}`},
-	} {
-		t.Run(tc.vector, func(t *testing.T) {
+	for _, name := range []string{"valid", "valid_child_with_act"} {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			vec := byName[name]
+			e := vec.Expect
+			want, err := json.Marshal(map[string]any{
+				"iss": testTxnIssuer, "aud": testTxnAudience, "iat": iv.Now, "exp": iv.Now + 60,
+				"txn": testRequestID, "sub": e.Sub, "act": map[string]string{"sub": "instance:" + e.JKT},
+				"cnf": map[string]string{"jkt": e.JKT}, "scope": e.Scope,
+				"authorization_details": e.AuthorizationDetails,
+				"ans_issuer":            map[string]string{"host": e.Iss, "ans_name": e.AnsName, "cert_fp": e.Fingerprint},
+				"rctx":                  map[string]string{"method": "POST", "path": "/mcp"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "valid_child_with_act" {
+				requireJSON(t, "vector act", e.Act, `{"sub":"instance:`+e.JKT+`"}`)
+			}
 			m := mustMinter(t, txnConfig(), newTxnKey(t))
-			vec := byName[tc.vector]
 			r := vec.request(t)
 			r.RequestID = testRequestID
 			d := txnVerifier(t, iv, m).Verify(t.Context(), r)
 			if !d.Allowed {
 				t.Fatalf("denied: %+v", d.Deny)
 			}
-			tok := d.Headers[DefaultTxnHeader]
-			header, claims := decodeTxn(t, m, tok)
+			header, claims := decodeTxn(t, m, d.Headers[DefaultTxnHeader])
 			requireJSON(t, "header", header, `{"alg":"ES256","typ":"txntoken+jwt","kid":"`+m.KeyID()+`"}`)
 			checkRandomIDs(t, claims, false)
-			requireJSON(t, "claims", claims, tc.want)
+			requireJSON(t, "claims", claims, string(want))
 			if slices.Contains(d.RemoveHeaders, strings.ToLower(DefaultTxnHeader)) {
 				t.Fatal("the minted header is also removed")
 			}
 		})
+	}
+}
+
+// TestTxnTokenExpClampedToInstanceToken: an instance token expiring 10 s
+// after the request bounds the transaction token too.
+func TestTxnTokenExpClampedToInstanceToken(t *testing.T) {
+	t.Parallel()
+	iv := loadInstanceVectors(t)
+	m := mustMinter(t, txnConfig(), newTxnKey(t))
+	r := validReq(t, iv)
+	exp := int64(0)
+	if it, err := parseInstanceToken(validInstanceVector(t, iv).Token); err == nil {
+		exp = it.claims.exp
+	}
+	// Pin the verifier's clock 10 s before the instance token's exp, widening
+	// popSkew so the vector's proof (iat = the vectors' now) still verifies.
+	now := time.Unix(exp-10, 0)
+	cfg := iv.config()
+	cfg.PoPSkew = time.Duration(exp-iv.Now) * time.Second
+	v := buildTxnVerifier(t, cfg, iv.keys(t), m, &now)
+	d := v.Verify(t.Context(), r)
+	if !d.Allowed {
+		t.Fatalf("denied: %+v", d.Deny)
+	}
+	_, claims := decodeTxn(t, m, d.Headers[DefaultTxnHeader])
+	if got := int64(claims["exp"].(float64)); got != exp {
+		t.Fatalf("exp = %d, want the instance token's exp %d (iat %v + ttl 60 would be later)", got, exp, claims["iat"])
+	}
+	if got := int64(claims["iat"].(float64)); got != exp-10 {
+		t.Fatalf("iat = %d, want %d", got, exp-10)
 	}
 }
 
@@ -427,6 +456,12 @@ func TestWithTxnMinter(t *testing.T) {
 	if _, err := NewVerifier(cfg, iv.keys(t), &fakeCache{}, nil, nil); err == nil || !strings.Contains(err.Error(), "minter") {
 		t.Fatalf("transaction tokens on without a minter: err = %v", err)
 	}
+	other := cfg
+	other.TransactionToken.Header = "X-Other-Txn"
+	if _, err := NewVerifier(other, iv.keys(t), &fakeCache{}, nil, nil, WithTxnMinter(m)); err == nil ||
+		!strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a minter built for another transactionToken config: err = %v", err)
+	}
 }
 
 func writePEM(t *testing.T, blockType string, der []byte) string {
@@ -450,6 +485,21 @@ func TestLoadTxnSigningKey(t *testing.T) {
 	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
+	}
+	readable := writePEM(t, "EC PRIVATE KEY", sec1)
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o644} {
+		if err := os.Chmod(readable, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadTxnSigningKey(readable); err == nil || !strings.Contains(err.Error(), "readable by group or others") {
+			t.Fatalf("mode %o: err = %v, want a refusal", mode, err)
+		}
+	}
+	if err := os.Chmod(readable, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadTxnSigningKey(readable); err != nil {
+		t.Fatalf("mode 0400: %v", err)
 	}
 	for _, path := range []string{writePEM(t, "EC PRIVATE KEY", sec1), writePEM(t, "PRIVATE KEY", pkcs8)} {
 		got, err := LoadTxnSigningKey(path)

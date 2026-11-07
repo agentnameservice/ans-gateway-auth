@@ -111,7 +111,7 @@ instanceMode:                  # second caller mode; see "Instance mode" below
   issuers: []                  # with maxStatusAge: one per allowedIssuers host, e.g. [{host: authority.example.com, agentId: <uuid>, tl: prod-tl}]
 transactionToken:             # signed context for the upstream; see "Transaction tokens" below
   enabled: false
-  signingKeyFile: ""           # PEM P-256 key (EC PRIVATE KEY or PRIVATE KEY); required when enabled, never generated
+  signingKeyFile: ""           # PEM P-256 key (EC PRIVATE KEY or PRIVATE KEY), mode 0600 or tighter; required when enabled, never generated
   issuer: ""                   # https URL of this gateway, e.g. https://gw.webmesh.ai
   audience: ""                 # the upstream, e.g. dnsdoc.webmesh.ai
   ttl: 60s                     # exp - iat; whole seconds, at most 300s
@@ -188,7 +188,8 @@ names `typ` `instance+jwt` is refused while instance mode is off. The verifier c
 5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
    host, as for certificate-mode callers);
 6. `aud` is `expectedAud`, or the host of the matched authority;
-7. `act`, when present, names one actor and nests no further `act`;
+7. `act`, when present, names one actor, nests no further `act`, and that actor is the token's
+   own instance key, `instance:<cnf.jkt>` (`act_mismatch` otherwise);
 8. `maxInstancesPerSub`, when set, and last the proof's `jti` against the replay cache.
 
 An allowed instance request reaches the upstream with, each set with overwrite semantics:
@@ -208,7 +209,7 @@ Denials use the categories above; the decision log's `reason` starts with the re
 implementation's code (`expired`, `bad_token`, `bad_signature`, `bad_dpop`, `replay`, `revoked`,
 `cert_not_current`, `iss_mismatch`, `aud_mismatch`, `htu_mismatch`, `clock_skew`, `bad_alg`,
 `bad_status_token`, `status_expired`, `status_stale`, `depth_exceeded`, `bad_request`,
-`instance_cap`, `instance_disabled`). Policy refusals (`iss_mismatch` at `allowedIssuers` or
+`instance_cap`, `instance_disabled`, `act_mismatch`). Policy refusals (`iss_mismatch` at `allowedIssuers` or
 `allowedAnsNames`, `depth_exceeded`, `instance_cap`) are `403 EXPECTED_PEER_MISMATCH`.
 `examples/mcpecho/ans-authz-instance.yaml` is a working configuration. The token format follows ans-agent's
 `src/instance_token.py`; `testdata/instance-vectors.json` holds the two implementations to the same
@@ -284,11 +285,11 @@ The header is `{"alg":"ES256","typ":"txntoken+jwt","kid":<RFC 7638 thumbprint>}`
 | Claim | Value |
 |---|---|
 | `iss`, `aud` | `transactionToken.issuer`, `transactionToken.audience` |
-| `iat`, `exp` | now, now + `ttl` |
+| `iat`, `exp` | now, now + `ttl`; in instance mode never later than the instance token's own `exp` |
 | `jti` | 128 random bits |
-| `txn` | the gateway's request id (`x-request-id`), or 128 random bits when there is none |
+| `txn` | the gateway's request id (`x-request-id`), or 128 random bits when there is none. It is copied, not authenticated: a client that can set `x-request-id` chooses it, so use it to correlate logs, never to authorize |
 | `sub` | the user (`sub` of the instance token); in certificate mode, the caller's ANS name |
-| `act` | instance mode only: `{"sub":"instance:<cnf.jkt>"}`, with the instance token's own `act` nested inside as the prior actor (RFC 8693 section 4.1) |
+| `act` | instance mode only: the single hop `{"sub":"instance:<cnf.jkt>"}`, the key that signed the request. A child instance token's own `act` must already name that key (otherwise `act_mismatch`). The parent instance a child was minted from is not named: delegation is one hop, and a child token carries no parent key |
 | `cnf.jkt` | the key that signed the request's DPoP proof |
 | `scope`, `authorization_details` | copied from the instance token when present |
 | `ans_issuer` | instance mode only: `{host, ans_name, cert_fp}`, the issuer and the SHA-256 of its identity certificate |
@@ -296,7 +297,8 @@ The header is `{"alg":"ES256","typ":"txntoken+jwt","kid":<RFC 7638 thumbprint>}`
 
 The public key is served as a JWK Set (`kid`, `alg` ES256, `use` sig) at
 `GET /.well-known/jwks.json` on the health and metrics listener (`httpListen`, loopback by
-default), so an upstream on the same host can fetch it. The route exists only while transaction
+default), so an upstream on the same host can fetch it. Startup and `--check` warn when
+transaction tokens are on and `httpListen` is not loopback. The route exists only while transaction
 tokens are on. To rotate the key, publish the new key file and restart; upstreams should
 refetch the JWKS when they meet an unknown `kid`.
 
@@ -308,7 +310,10 @@ failure to mint denies the request (503 `INTERNAL_ERROR`) rather than allowing i
 token.
 
 Limits: the token is a bearer credential between the gateway and the upstream, so that hop
-should be loopback or TLS. Its `jti` is unique, but the upstream must keep its own replay cache
+should be loopback or TLS. `aud` separates tokens by upstream only when each `ans-authz` fronts
+one upstream: every upstream behind one `ans-authz` receives the same `aud`, and any of them can
+replay a token it received to another within `ttl`. Run one `ans-authz` (one
+`transactionToken.audience`) per upstream that must not accept another's tokens. Its `jti` is unique, but the upstream must keep its own replay cache
 if it needs single use within `ttl`.
 
 ### Authority rule (ANS-6 section 7.7)

@@ -86,6 +86,7 @@ const (
 	codeBadRequest       = "bad_request"
 	codeBadAlg           = "bad_alg"
 	codeDepthExceeded    = "depth_exceeded"
+	codeActMismatch      = "act_mismatch"
 	codeInstanceCap      = "instance_cap"
 	codeInstanceDisabled = "instance_disabled"
 )
@@ -379,12 +380,15 @@ func decodeInstanceClaims(payload map[string]json.RawMessage) (instanceClaims, e
 	if c.authorizationDetails != nil && !bytes.HasPrefix(bytes.TrimSpace(c.authorizationDetails), []byte("[")) {
 		return c, refuse(codeBadToken, CategoryMalformedProof, "authorization_details must be a list")
 	}
-	return c, checkAct(c.act)
+	return c, checkAct(c.act, c.jkt)
 }
 
 // checkAct enforces RFC 8693 actor claims one hop deep: act, when present,
-// is an object naming its actor in sub and carrying no nested act.
-func checkAct(raw json.RawMessage) error {
+// is an object naming its actor in sub, carrying no nested act, and its sub
+// is the token's own instance key, instance:<cnf.jkt>, as the issuer's
+// mint_child sets it (act_mismatch otherwise). The parent instance a child
+// derives from is not named anywhere in the token.
+func checkAct(raw json.RawMessage, jkt string) error {
 	if raw == nil {
 		return nil
 	}
@@ -395,8 +399,13 @@ func checkAct(raw json.RawMessage) error {
 	if _, nested := act["act"]; nested {
 		return refusePolicy(codeDepthExceeded, "act nests a second actor; one delegation hop is allowed")
 	}
-	if jsonString(act["sub"]) == "" {
+	sub := jsonString(act["sub"])
+	if sub == "" {
 		return refuse(codeBadToken, CategoryMalformedProof, "act.sub must name the actor")
+	}
+	if sub != instanceActorPrefix+jkt {
+		return refuse(codeActMismatch, CategoryTokenBindingMismatch, "act.sub "+echoValue(sub)+
+			" is not the token's instance key "+echoValue(instanceActorPrefix+jkt))
 	}
 	return nil
 }

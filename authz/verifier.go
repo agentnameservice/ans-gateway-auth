@@ -226,6 +226,10 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 		return nil, errors.New("authz: transactionToken is enabled but no minter was supplied (WithTxnMinter)")
 	case !cfg.TransactionToken.Enabled && v.txn != nil:
 		return nil, errors.New("authz: a transaction-token minter was supplied but transactionToken is not enabled")
+	case v.txn != nil && v.txn.Config() != cfg.TransactionToken:
+		// The header the verifier strips and the one the minter sets must be
+		// the same name, and iss, aud and ttl the configured ones.
+		return nil, errors.New("authz: the transaction-token minter's configuration does not match transactionToken")
 	}
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
