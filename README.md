@@ -234,10 +234,28 @@ instanceMode:
   id. It is used only when its `iat` is later than the cached token's, and it then replaces the
   cache entry; otherwise the cached token decides. Whichever token is used must have been issued
   within `maxStatusAge`, or the request is refused `status_stale` (fail closed).
+- A presented token that does not verify, or has expired, is refused (`bad_status_token`,
+  `status_expired`) even when the cache holds a fresh token: clients must present a valid,
+  unexpired TL status token. This is a deliberate deviation from "use the cache when the client's
+  token is worse"; the verifier never looks past a bad credential.
+- Root keys are not refreshed on demand in this mode. A TL root-key rotation is picked up by the
+  background status refresh (it refreshes the keys when a fetched token names an unknown key id)
+  within one refresh interval, `maxStatusAge`/2; until then a presented token under the new key
+  is refused `bad_status_token`.
 - A terminal issuer is refused `revoked` at once: a signed `REVOKED` or `EXPIRED` token on the
   request, or a TL that answers the background fetch with `410 Gone` or a signed terminal token.
-  The issuer stays refused until the TL serves a newer live token; nothing a client presents
-  clears it.
+  The background refresher writes the TL's current answer over the cache entry unconditionally,
+  so only a live answer from the TL clears a terminal entry. A presented token never does,
+  whatever its `iat`, and never overwrites one recorded while its request was in flight.
+- The TL answers `410 Gone` for a revoked or expired agent and for one superseded by a version
+  bump or re-registration. After either, the configured `agentId` is terminal and the issuer's
+  new tokens are refused (`revoked` for the old id, `iss_mismatch` for a status token naming the
+  new one). Update `issuers[].agentId` to the new agent id and restart `ans-authz`. The 410 is
+  logged with the issuer's host and agent id, and startup logs every configured `{host, agentId}`.
+- A `410` is unsigned: the verifier trusts it on the TL connection's TLS alone. An attacker with
+  network position between the verifier and the TL (or a TL endpoint without TLS) can therefore
+  force an immediate `revoked` for an issuer. This is a fail-closed denial of service, not a
+  bypass: no 410 or withheld response can make a revoked issuer pass.
 
 A revocation is therefore seen within `maxStatusAge` plus the TL's publish delay, about four
 minutes for the 240 s above. The cache is per process; each replica fetches for itself.

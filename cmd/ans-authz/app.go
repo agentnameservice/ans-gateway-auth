@@ -223,6 +223,8 @@ func (a *app) loadIssuerStatus(ctx context.Context) error {
 			Host: is.Host, AgentID: is.AgentID, Fetch: client.FetchStatusToken, Timeout: tl.Timeout,
 		})
 		a.metrics.PreregisterIssuer(is.Host)
+		a.logger.InfoContext(ctx, "instance-mode issuer status cache", "issuer", is.Host, "agent_id", is.AgentID,
+			"tl", is.TL, "max_status_age", im.MaxStatusAge)
 	}
 	a.statusCache = authz.NewMemoryStatusCache()
 	refresher, err := authz.NewStatusRefresher(a.statusCache, a.keyring, im.MaxStatusAge, a.metrics, a.logger, sources...)

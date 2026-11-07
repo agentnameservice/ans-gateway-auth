@@ -34,6 +34,10 @@ Before you start it, set four values in `ans-authz-instance.yaml`:
 If the TL cannot be reached at startup, `ans-authz` still starts, logs the issuer, and refuses
 its instance requests (`status_stale`) until a background fetch succeeds.
 
+A version bump or re-registration gives the issuer a new agent id, and the TL then answers `410`
+for the old one, so its instances are refused. Update `issuers[].agentId` to the new id and
+restart `ans-authz`; the log names the issuer's host and the agent id the TL refused.
+
 The `mcpAuthorization` rule in `config-mcp.yaml` matches `extauthz.ans_name`. For an instance
 caller, `ans_name` is the issuer's ANS name, so name the issuer there.
 

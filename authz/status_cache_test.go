@@ -230,39 +230,102 @@ func requireAllowed(t *testing.T, d Decision, what string) {
 	}
 }
 
-// TestMemoryStatusCacheOffer keeps one entry per agent and only moves it
-// forward: a later iat replaces it, an earlier or equal one does not, and a
-// terminal entry wins a tie.
-func TestMemoryStatusCacheOffer(t *testing.T) {
+// TestMemoryStatusCacheWrites splits the two write paths. OfferPresented
+// (a client's token) only moves a live entry forward and never replaces a
+// terminal one, whatever its iat. Install (the TL's own current answer)
+// replaces unconditionally, so a live TL token clears a terminal entry and a
+// terminal answer replaces a newer-iat live one.
+func TestMemoryStatusCacheWrites(t *testing.T) {
 	t.Parallel()
 	c := NewMemoryStatusCache()
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("empty cache returned an entry")
 	}
-	if !c.Offer(IssuerStatus{AgentID: "a", Iat: 100}) {
-		t.Fatal("first entry refused")
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 100}) {
+		t.Fatal("a presented token populated an agent the TL never answered for")
 	}
-	if c.Offer(IssuerStatus{AgentID: "a", Iat: 90}) || c.Offer(IssuerStatus{AgentID: "a", Iat: 100}) {
-		t.Fatal("an older or equal entry replaced the cached one")
+	c.Install(IssuerStatus{AgentID: "a", Iat: 100})
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 90}) || c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 100}) {
+		t.Fatal("an older or equal presented entry replaced the cached one")
 	}
-	if !c.Offer(IssuerStatus{AgentID: "a", Iat: 100, Terminal: true}) {
-		t.Fatal("a terminal entry with the same iat must win")
+	if !c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 101}) {
+		t.Fatal("a newer presented entry refused")
 	}
-	if c.Offer(IssuerStatus{AgentID: "a", Iat: 100}) {
-		t.Fatal("a live entry with the same iat replaced a terminal one")
+	c.Install(IssuerStatus{AgentID: "a", Iat: 50, Terminal: true})
+	if got, _ := c.Get("a"); !got.Terminal {
+		t.Fatal("Install of a terminal answer with a lower iat did not replace the live entry")
 	}
-	if !c.Offer(IssuerStatus{AgentID: "a", Iat: 101}) {
-		t.Fatal("a newer entry refused")
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 1 << 40}) {
+		t.Fatal("a presented entry with a higher iat replaced a terminal one")
 	}
-	if got, _ := c.Get("a"); got.Iat != 101 || got.Terminal {
-		t.Fatalf("Get = %+v", got)
+	if got, _ := c.Get("a"); !got.Terminal {
+		t.Fatalf("terminal entry lost: %+v", got)
 	}
-	if c.Offer(IssuerStatus{Iat: 1}) {
+	c.Install(IssuerStatus{AgentID: "a", Iat: 40})
+	if got, _ := c.Get("a"); got.Terminal || got.Iat != 40 {
+		t.Fatalf("Install of a live TL answer did not clear the terminal entry: %+v", got)
+	}
+	if c.OfferPresented(IssuerStatus{Iat: 1}) {
 		t.Fatal("an entry without an agent id was accepted")
 	}
-	if _, ok := c.Get("b"); ok {
-		t.Fatal("unknown agent returned an entry")
+	c.Install(IssuerStatus{Iat: 1})
+	if _, ok := c.Get(""); ok {
+		t.Fatal("Install stored an entry without an agent id")
 	}
+}
+
+// raceCache installs a terminal entry from the TL right after the request
+// path reads the cache, the window between Get and OfferPresented.
+type raceCache struct {
+	*MemoryStatusCache
+	onGet func()
+}
+
+func (c *raceCache) Get(agentID string) (IssuerStatus, bool) {
+	s, ok := c.MemoryStatusCache.Get(agentID)
+	if c.onGet != nil {
+		c.onGet()
+	}
+	return s, ok
+}
+
+// TestStatusCacheRevocationRaceKeepsTerminal: a request reads a live entry,
+// the refresher then installs a 410 (dated by the gateway clock, here far
+// below the presented token's TL iat), and the request offers its newer
+// presented token. The terminal entry must survive, and the next request is
+// refused revoked.
+func TestStatusCacheRevocationRaceKeepsTerminal(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	race := &raceCache{MemoryStatusCache: h.cache}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 30, Token: mustVerify(t, h, h.mint(scitt.StatusActive, -30))})
+	race.onGet = func() {
+		race.onGet = nil
+		h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 1000, Terminal: true})
+	}
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(h.config(), h.keys, noReplay, nil, nil, WithStatusCache(race))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	// The in-flight request decided on the live entry it read; it is the
+	// last one the race can admit.
+	_ = v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -5)))
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("a presented token overwrote the terminal entry: %+v", got)
+	}
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+func mustVerify(t *testing.T, h *statusHarness, raw []byte) *scitt.VerifiedStatusToken {
+	t.Helper()
+	st, err := scitt.VerifyStatusTokenAt(raw, h.keys, 0, h.iv.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 // TestStatusCacheBackgroundRefreshReplacesStaleEntry: with only a stale cached
@@ -440,9 +503,11 @@ func TestStatusCacheRevokedCachedRefuses(t *testing.T) {
 			if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
 				t.Fatalf("cache entry %+v is not terminal", got)
 			}
-			// Only a later signed token from the TL itself clears the entry.
+			// Only the TL's own live answer clears the entry, even one whose
+			// iat is below the gateway-clock date of the terminal entry (a
+			// TL clock that lags ours).
 			offset.Store(10)
-			f.set(h.mint(scitt.StatusActive, 5), nil)
+			f.set(h.mint(scitt.StatusActive, -5), nil)
 			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
 				t.Fatal(err)
 			}

@@ -118,6 +118,14 @@ func TestMetricsIssuerStatusRefresh(t *testing.T) {
 	if got := testutil.ToFloat64(m.issuerRefresh.WithLabelValues("never.example", authz.StatusRefreshFailure)); got != 0 {
 		t.Errorf("preregistered failures = %v", got)
 	}
+	// The staleness alert needs the gauge to exist at 0 for an issuer the
+	// TL never answered.
+	if n := testutil.CollectAndCount(m.issuerLastSuccess, "ans_authz_issuer_status_last_success_timestamp_seconds"); n != 3 {
+		t.Errorf("last-success series = %d, want 3 (two refreshed issuers and the preregistered one)", n)
+	}
+	if got := testutil.ToFloat64(m.issuerLastSuccess.WithLabelValues("never.example")); got != 0 {
+		t.Errorf("preregistered last success = %v, want 0", got)
+	}
 }
 
 func TestMetricsReplayBackend(t *testing.T) {

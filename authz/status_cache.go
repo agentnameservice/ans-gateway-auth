@@ -51,8 +51,9 @@ type IssuerStatus struct {
 	AgentID string
 	// Iat orders entries: a later iat replaces an earlier one.
 	Iat int64
-	// Terminal records that the TL reported the issuer REVOKED or EXPIRED;
-	// every request for it is refused until the TL serves a newer token.
+	// Terminal records that the TL reported the issuer REVOKED, EXPIRED or
+	// superseded (410, or a signed terminal token); every request for it is
+	// refused until the refresher installs a live answer from the TL.
 	Terminal bool
 	// Raw is the status token as the TL signed it, for a shared store that
 	// re-verifies; nil for a terminal entry learned from a 410.
@@ -61,13 +62,24 @@ type IssuerStatus struct {
 	Token *scitt.VerifiedStatusToken
 }
 
-// StatusCache holds the newest IssuerStatus per issuer agent id. Offer
-// installs an entry only when it is newer than the cached one (or carries
-// the same iat and is terminal) and reports whether it did. The in-memory
-// implementation serves one verifier process; a shared store can replace it.
+// StatusCache holds the current IssuerStatus per issuer agent id. It has two
+// write paths, kept apart so a client can never undo what the TL said:
+//
+//   - Install records the TL's own current answer, from the background
+//     refresher only, and replaces the entry unconditionally: the TL is
+//     authoritative, so a live answer clears a terminal entry and a terminal
+//     answer replaces any live one. Entries from the two clocks (a 410 dated
+//     by the gateway, a token dated by the TL) are never compared.
+//   - OfferPresented records a token a client presented after it verified.
+//     It never creates an entry, never replaces a terminal one, and replaces
+//     a live one only when its iat is later; it reports whether it did.
+//
+// The in-memory implementation serves one verifier process; a shared store
+// can replace it.
 type StatusCache interface {
 	Get(agentID string) (IssuerStatus, bool)
-	Offer(s IssuerStatus) bool
+	Install(s IssuerStatus)
+	OfferPresented(s IssuerStatus) bool
 }
 
 // MemoryStatusCache is the in-memory StatusCache.
@@ -91,14 +103,27 @@ func (c *MemoryStatusCache) Get(agentID string) (IssuerStatus, bool) {
 	return s, ok
 }
 
-// Offer implements StatusCache.
-func (c *MemoryStatusCache) Offer(s IssuerStatus) bool {
+// Install implements StatusCache.
+func (c *MemoryStatusCache) Install(s IssuerStatus) {
 	if s.AgentID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[s.AgentID] = s
+}
+
+// OfferPresented implements StatusCache. The check and the write share one
+// lock, so a terminal entry installed after the request read the cache still
+// wins.
+func (c *MemoryStatusCache) OfferPresented(s IssuerStatus) bool {
+	if s.AgentID == "" || s.Terminal {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cur, ok := c.entries[s.AgentID]; ok && (s.Iat < cur.Iat || (s.Iat == cur.Iat && (cur.Terminal || !s.Terminal))) {
+	cur, ok := c.entries[s.AgentID]
+	if !ok || cur.Terminal || s.Iat <= cur.Iat {
 		return false
 	}
 	c.entries[s.AgentID] = s
@@ -199,6 +224,7 @@ func (r *StatusRefresher) Hosts() []string {
 // Refresh fetches, verifies and caches one issuer's status token. A 410 from
 // the TL, or a validly signed REVOKED or EXPIRED token, caches a terminal
 // entry and is not an error. Any other failure leaves the cache unchanged.
+// A 410 is unsigned and trusted on the TL connection's TLS alone.
 func (r *StatusRefresher) Refresh(ctx context.Context, host string) error {
 	i, ok := r.byHost[host]
 	if !ok {
@@ -214,7 +240,8 @@ func (r *StatusRefresher) Refresh(ctx context.Context, host string) error {
 		return err
 	}
 	if result == StatusRefreshTerminal {
-		r.logger.WarnContext(ctx, "issuer is terminal at its TL; refusing its instance tokens", "issuer", src.Host, "agent_id", src.AgentID)
+		r.logger.WarnContext(ctx, "issuer status is revoked, expired or superseded at its TL (HTTP 410); if this issuer re-registered, update issuers[].agentId",
+			"issuer", src.Host, "agent_id", src.AgentID)
 	}
 	return nil
 }
@@ -226,7 +253,7 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 	now := r.now().Unix()
 	var te *scitt.TransportError
 	if errors.As(err, &te) && te.Type == scitt.TransportErrAgentTerminal {
-		r.cache.Offer(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
+		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
 		return StatusRefreshTerminal, nil
 	}
 	if err != nil {
@@ -241,7 +268,7 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 		// The SDK checks the signature before the status, so this is the
 		// TL's own statement; it withholds the payload, so the entry is
 		// dated by our clock.
-		r.cache.Offer(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
+		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
 		return StatusRefreshTerminal, nil
 	}
 	if err != nil {
@@ -250,7 +277,7 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 	if err := checkFetchedStatus(&st.Payload, src, now); err != nil {
 		return StatusRefreshFailure, err
 	}
-	r.cache.Offer(IssuerStatus{AgentID: src.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
 	return StatusRefreshSuccess, nil
 }
 
@@ -351,7 +378,7 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 			echoValue(it.claims.iss)+" from its transparency log yet")
 	case cached.Terminal:
 		return nil, refuse(codeRevoked, CategoryStatusInvalid, "issuer "+echoValue(it.claims.iss)+
-			" is revoked or expired at its transparency log")
+			" is revoked, expired or superseded at its transparency log")
 	}
 	chosen, fromClient := cached.Token, false
 	if presented.Payload.Iat > cached.Iat {
@@ -366,7 +393,7 @@ func (v *Verifier) cachedIssuerStatus(ctx context.Context, raw []byte, it *insta
 			"newest status token for issuer %s was issued %ds ago, over maxStatusAge %ds", echoValue(it.claims.iss), now-p.Iat, maxAge))
 	}
 	if fromClient {
-		v.statusCache.Offer(IssuerStatus{AgentID: agentID, Iat: p.Iat, Raw: slices.Clone(raw), Token: chosen})
+		v.statusCache.OfferPresented(IssuerStatus{AgentID: agentID, Iat: p.Iat, Raw: slices.Clone(raw), Token: chosen})
 	}
 	return chosen, nil
 }

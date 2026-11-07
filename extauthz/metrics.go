@@ -126,12 +126,14 @@ func (m *Metrics) IssuerStatusRefresh(issuer, result string, at time.Time) {
 	}
 }
 
-// PreregisterIssuer creates an issuer's refresh counters at zero so a
-// failure alert has a series before the first fetch.
+// PreregisterIssuer creates an issuer's refresh counters and its
+// last-success gauge at zero, so a staleness alert fires for an issuer the
+// TL never answered.
 func (m *Metrics) PreregisterIssuer(issuer string) {
 	for _, r := range []string{authz.StatusRefreshSuccess, authz.StatusRefreshFailure, authz.StatusRefreshTerminal} {
 		m.issuerRefresh.WithLabelValues(issuer, r)
 	}
+	m.issuerLastSuccess.WithLabelValues(issuer)
 }
 
 // CheckTimeout implements authz.Observer.

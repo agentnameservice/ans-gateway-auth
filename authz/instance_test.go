@@ -154,7 +154,7 @@ func (iv *instanceVectors) cacheVerifier(t *testing.T, vec instanceVector) *Veri
 		t.Fatalf("seed status token: %v", err)
 	}
 	cache := NewMemoryStatusCache()
-	cache.Offer(IssuerStatus{AgentID: st.Payload.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	cache.Install(IssuerStatus{AgentID: st.Payload.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
 	mem := replay.NewMemory(t.Context(), 1000, nil)
 	t.Cleanup(func() { _ = mem.Close() })
 	v, err := NewVerifier(cfg, keys, mem, nil, nil, WithStatusCache(cache))

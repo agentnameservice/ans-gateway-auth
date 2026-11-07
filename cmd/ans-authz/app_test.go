@@ -485,6 +485,7 @@ type statusTL struct {
 	line     string
 	token    atomic.Pointer[[]byte]
 	failing  atomic.Bool
+	gone     atomic.Bool
 	statuses atomic.Int64
 	total    atomic.Int64
 }
@@ -506,6 +507,10 @@ func newStatusTL(t *testing.T) *statusTL {
 			s.statuses.Add(1)
 			if s.failing.Load() {
 				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if s.gone.Load() {
+				w.WriteHeader(http.StatusGone)
 				return
 			}
 			w.Header().Set("Content-Type", "application/ans-status-token+cbor")
@@ -622,5 +627,34 @@ func TestAppIssuerStatusNoTLCallOnCheck(t *testing.T) {
 	}
 	if n := tl.total.Load() - before; n != 0 {
 		t.Fatalf("Check made %d TL requests, want 0", n)
+	}
+}
+
+// TestAppIssuerStatusSupersededLogs: a TL that answers 410 (revoked, expired
+// or superseded) caches a terminal entry and logs the issuer's host and agent
+// id with the re-registration hint; startup also lists every configured
+// issuer.
+func TestAppIssuerStatusSupersededLogs(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.gone.Store(true)
+	var logs recordingLog
+	a, err := newApp(context.Background(), loadConfig(t, instanceStatusYAML(tl.srv.URL)), logs.logger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.cache.Close() }()
+	if got, ok := a.statusCache.Get(testIssuerAgentID); !ok || !got.Terminal {
+		t.Fatalf("cache after a 410 = %+v, %v", got, ok)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		"issuer status is revoked, expired or superseded at its TL (HTTP 410); if this issuer re-registered, update issuers[].agentId",
+		"instance-mode issuer status cache",
+		"issuer=" + testIssuerHost,
+		"agent_id=" + testIssuerAgentID,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %q:\n%s", want, out)
+		}
 	}
 }
