@@ -54,10 +54,16 @@ type IssuerStatus struct {
 	Iat int64
 	// Terminal records that the TL reported the issuer REVOKED, EXPIRED or
 	// superseded (410, or a signed terminal token); every request for it is
-	// refused for the life of the process. Under ANS such an agent id does
-	// not return to ACTIVE, and a later ACTIVE answer may be a stale replica
-	// or a replayed response.
+	// refused. A REVOKED or 410 entry stays for the life of the process: a
+	// revoked agent id does not return to ACTIVE, and a later ACTIVE answer
+	// may be a stale replica or a replayed response. An EXPIRED entry is
+	// cleared by a later fetched ACTIVE or WARNING token, since the TL derives
+	// EXPIRED from the certificate's expiry and a renewal ends it.
 	Terminal bool
+	// Status is the terminal status a signed token reported (REVOKED or
+	// EXPIRED); empty for a live entry and for a 410, whose body the SDK
+	// drops, so a 410 is held as permanent.
+	Status scitt.AgentStatus
 	// Raw is the status token as the TL signed it, for a shared store that
 	// re-verifies; nil for a terminal entry learned from a 410.
 	Raw []byte
@@ -69,10 +75,12 @@ type IssuerStatus struct {
 // write paths, kept apart so a client can never undo what the TL said:
 //
 //   - Install records the TL's own current answer, from the background
-//     refresher only. It replaces a live entry unconditionally, so a terminal
-//     answer replaces any live one, and never replaces a terminal entry.
-//     Entries from the two clocks (a 410 dated by the gateway, a token dated
-//     by the TL) are never compared.
+//     refresher only, and reports whether it did. It replaces a live entry
+//     unconditionally, so a terminal answer replaces any live one. It never
+//     replaces a sticky terminal entry (REVOKED or 410); it replaces an
+//     EXPIRED one with another terminal answer or a verified ACTIVE or
+//     WARNING token. Entries from the two clocks (a 410 dated by the gateway,
+//     a token dated by the TL) are never compared.
 //   - OfferPresented records a token a client presented after it verified.
 //     It never creates an entry, never replaces a terminal one, and replaces
 //     a live one only when its iat is later; it reports whether it did.
@@ -82,7 +90,7 @@ type IssuerStatus struct {
 // MemoryStatusCache relies on its lock for that.
 type StatusCache interface {
 	Get(agentID string) (IssuerStatus, bool)
-	Install(s IssuerStatus)
+	Install(s IssuerStatus) bool
 	OfferPresented(s IssuerStatus) bool
 }
 
@@ -108,16 +116,31 @@ func (c *MemoryStatusCache) Get(agentID string) (IssuerStatus, bool) {
 }
 
 // Install implements StatusCache.
-func (c *MemoryStatusCache) Install(s IssuerStatus) {
+func (c *MemoryStatusCache) Install(s IssuerStatus) bool {
 	if s.AgentID == "" {
-		return
+		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cur, ok := c.entries[s.AgentID]; ok && cur.Terminal {
-		return
+	if cur, ok := c.entries[s.AgentID]; ok && cur.Terminal && !clears(cur, s) {
+		return false
 	}
 	c.entries[s.AgentID] = s
+	return true
+}
+
+// clears reports whether next may replace the terminal entry cur: only an
+// EXPIRED entry is replaced, by another terminal answer or by a verified
+// ACTIVE or WARNING token.
+func clears(cur, next IssuerStatus) bool {
+	if cur.Status != scitt.StatusExpired {
+		return false
+	}
+	if next.Terminal {
+		return true
+	}
+	return next.Token != nil && (next.Token.Payload.Status == scitt.StatusActive ||
+		next.Token.Payload.Status == scitt.StatusWarning)
 }
 
 // OfferPresented implements StatusCache. The check and the write share one
@@ -239,8 +262,10 @@ func (r *StatusRefresher) Hosts() []string {
 
 // Refresh fetches, verifies and caches one issuer's status token. A 410 from
 // the TL, or a validly signed REVOKED or EXPIRED token, caches a terminal
-// entry and is not an error. Any other failure leaves the cache unchanged.
-// A 410 is unsigned and trusted on the TL connection's TLS alone.
+// entry and is not an error. A live token the cache refuses, because the
+// issuer is held terminal, is a failure, as is anything else that leaves
+// the cache unchanged. A 410 is unsigned and trusted on the TL connection's
+// TLS alone.
 func (r *StatusRefresher) Refresh(ctx context.Context, host string) error {
 	i, ok := r.byHost[host]
 	if !ok {
@@ -269,6 +294,8 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 	now := r.now().Unix()
 	var te *scitt.TransportError
 	if errors.As(err, &te) && te.Type == scitt.TransportErrAgentTerminal {
+		// The SDK drops the 410's body, which names REVOKED or EXPIRED, so
+		// the entry has no Status and is held as permanent.
 		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
 		return StatusRefreshTerminal, nil
 	}
@@ -287,7 +314,7 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 		// decoder this module does not depend on directly): a wrong agent's
 		// terminal token fails closed, no worse than the unsigned 410 above.
 		// The entry is dated by our clock.
-		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true})
+		r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: now, Terminal: true, Status: tokErr.Status})
 		return StatusRefreshTerminal, nil
 	}
 	if err != nil {
@@ -299,8 +326,25 @@ func (r *StatusRefresher) refresh(ctx context.Context, src *IssuerStatusSource) 
 	if err := checkFetchedStatus(&st.Payload, src, now); err != nil {
 		return StatusRefreshFailure, err
 	}
-	r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	prev, _ := r.cache.Get(src.AgentID)
+	if !r.cache.Install(IssuerStatus{AgentID: src.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st}) {
+		held, _ := r.cache.Get(src.AgentID)
+		return StatusRefreshFailure, fmt.Errorf("issuer %s: TL reports %s, but agent id %s is held terminal (%s) "+
+			"for the life of the process; restart ans-authz to clear it", src.Host, st.Payload.Status, src.AgentID, heldAs(held))
+	}
+	if prev.Terminal {
+		r.logger.InfoContext(ctx, "issuer status recovered from EXPIRED: the TL reports it live again",
+			"issuer", src.Host, "agent_id", src.AgentID, "status", string(st.Payload.Status))
+	}
 	return StatusRefreshSuccess, nil
+}
+
+// heldAs names why an entry is terminal, for the stuck-issuer error.
+func heldAs(s IssuerStatus) string {
+	if s.Status == "" {
+		return "HTTP 410"
+	}
+	return string(s.Status)
 }
 
 // checkFetchedStatus requires the token the TL served to be about this

@@ -268,10 +268,31 @@ instanceMode:
   is refused `bad_status_token`.
 - A terminal issuer is refused `revoked` at once: a signed `REVOKED` or `EXPIRED` token on the
   request, or a TL that answers the background fetch with `410 Gone` or a signed terminal token.
-  A terminal entry stays terminal for the life of the process: under ANS a revoked, expired or
-  superseded agent id never returns to `ACTIVE`, so a later `ACTIVE` answer (a lagging TL replica,
-  a cache, a replayed response) cannot undo it. A presented token never does either, whatever its
-  `iat`, and never overwrites one recorded while its request was in flight.
+  How long the cache holds it depends on what the TL said:
+  - A signed `REVOKED` token: terminal for the life of the process. A revoked agent id never
+    returns to `ACTIVE`, so a later `ACTIVE` answer (a lagging TL replica, a cache, a replayed
+    response) cannot undo it.
+  - A signed `EXPIRED` token: terminal until a later background fetch returns a token that
+    verifies as `ACTIVE` or `WARNING` for the same agent id. The TL derives `EXPIRED` from the
+    certificate's expiry, so an issuer that renews late returns to `ACTIVE`; the verifier admits
+    it again and logs `issuer status recovered from EXPIRED: the TL reports it live again` at Info
+    with `issuer` and `agent_id`.
+  - A bare `410 Gone`: terminal for the life of the process, because ans-sdk-go does not expose
+    the 410's code, so the verifier cannot tell `REVOKED` from `EXPIRED`. Tracked in
+    https://github.com/agentnameservice/ans-sdk-go/issues/106.
+
+  A presented token never clears a terminal entry, whatever its `iat`, and never overwrites one
+  recorded while its request was in flight. While an issuer is held terminal, a live answer from
+  the TL counts as a failed refresh, not a success.
+- Late renewal after a `410`: when an issuer whose certificate lapsed renews under the same agent
+  id, restart `ans-authz` to clear the entry; there is no reload (the process re-reads its
+  configuration and its cache only at startup). The stuck state shows as the log line
+  `issuer status refresh failed` at Warn with `issuer`, `agent_id` and an `error` that ends
+  `is held terminal (HTTP 410) for the life of the process; restart ans-authz to clear it`, and in
+  metrics as `ans_authz_issuer_status_refresh_total{issuer,result="failure"}` rising while
+  `ans_authz_issuer_status_last_success_timestamp_seconds{issuer}` stops moving. A signed
+  `REVOKED` gives the same line with `(REVOKED)`; restart only after the issuer re-registers, and
+  update `issuers[].agentId` as below.
 - The TL answers `410 Gone` for a revoked or expired agent and for one superseded by a version
   bump or re-registration. After either, the configured `agentId` is terminal and the issuer's
   new tokens are refused (`revoked` for the old id, `iss_mismatch` for a status token naming the

@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -236,8 +237,8 @@ func requireAllowed(t *testing.T, d Decision, what string) {
 // (a client's token) only moves a live entry forward and never replaces a
 // terminal one, whatever its iat. Install (the TL's own current answer)
 // replaces a live entry unconditionally, so a terminal answer replaces a
-// newer-iat live one, but never replaces a terminal entry: under ANS a
-// revoked, expired or superseded agent id does not return to ACTIVE.
+// newer-iat live one, but never replaces a sticky terminal entry (REVOKED
+// or a 410): under ANS a revoked agent id does not return to ACTIVE.
 func TestMemoryStatusCacheWrites(t *testing.T) {
 	t.Parallel()
 	c := NewMemoryStatusCache()
@@ -528,11 +529,12 @@ func TestStatusCacheRevokedCachedRefuses(t *testing.T) {
 			}
 			// A later ACTIVE answer for the same agent id (a lagging TL
 			// replica, a cache, a replayed response) leaves it terminal: the
-			// entry lasts for the life of the process.
+			// entry lasts for the life of the process, and the refresh
+			// reports failure rather than success.
 			offset.Store(10)
 			f.set(h.mint(scitt.StatusActive, -5), nil)
-			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
-				t.Fatal(err)
+			if err := r.Refresh(t.Context(), h.issuer()); err == nil {
+				t.Fatal("an ACTIVE answer for a terminal agent id reported success")
 			}
 			requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
 		})
@@ -1214,5 +1216,223 @@ func TestStatusPayloadNames(t *testing.T) {
 	}
 	if _, ok := statusPayloadNames([]byte("junk")); ok {
 		t.Error("a non-COSE input parsed")
+	}
+}
+
+// i1Refresher is h.refresher with a logger that writes to buf.
+func i1Refresher(t *testing.T, h *statusHarness, f *fetcher, offset *atomic.Int64, obs StatusObserver,
+	buf *syncBuffer) *StatusRefresher {
+	t.Helper()
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, obs, slog.New(slog.NewTextHandler(buf, nil)),
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: f.fetch, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now+offset.Load(), 0) }
+	return r
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a reader.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestStatusCacheSignedRevokedSticky: a signed REVOKED token from the TL is
+// recorded REVOKED and stays terminal for the life of the process; a later
+// ACTIVE fetch for the same agent id is not installed.
+func TestStatusCacheSignedRevokedSticky(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := i1Refresher(t, h, f, &offset, nil, &syncBuffer{})
+	f.set(h.mint(scitt.StatusRevoked, -5), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusRevoked {
+		t.Fatalf("entry after a signed REVOKED = %+v", got)
+	}
+	offset.Store(10)
+	f.set(h.mint(scitt.StatusActive, 5), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err == nil {
+		t.Fatal("an ACTIVE fetch for a revoked agent id reported success")
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusRevoked {
+		t.Fatalf("a later ACTIVE fetch cleared REVOKED: %+v", got)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+// TestStatusCacheSignedExpiredRecovers: a signed EXPIRED token is terminal
+// but clearable. A presented ACTIVE token cannot clear it; a later fetched
+// token that verifies ACTIVE does, the issuer is admitted again, and the
+// recovery is logged at Info with the issuer and agent id.
+func TestStatusCacheSignedExpiredRecovers(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	logs := &syncBuffer{}
+	obs := &recStatusObserver{}
+	r := i1Refresher(t, h, f, &offset, obs, logs)
+	f.set(h.mint(scitt.StatusActive, -30), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	f.set(h.mint(scitt.StatusExpired, -10), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusExpired {
+		t.Fatalf("entry after a signed EXPIRED = %+v", got)
+	}
+	v := h.verifier()
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("a presented ACTIVE token cleared EXPIRED: %+v", got)
+	}
+
+	f.set(h.mint(scitt.StatusActive, 0), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("renewed issuer: %v", err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Terminal {
+		t.Fatalf("a fetched ACTIVE token left EXPIRED in place: %+v", got)
+	}
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), "after renewal")
+	if got := strings.Join(obs.results(), ","); got != "success,terminal,success" {
+		t.Fatalf("observed %s", got)
+	}
+	out := logs.String()
+	for _, want := range []string{"level=INFO", "issuer status recovered from EXPIRED", "issuer=" + h.issuer(),
+		"agent_id=" + h.iv.AgentID} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStatusCacheBare410Sticky: a bare 410 does not say whether the agent
+// was revoked or expired (the SDK drops the TL's code), so it is held
+// terminal for the life of the process, even after a later ACTIVE fetch.
+func TestStatusCacheBare410Sticky(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := i1Refresher(t, h, f, &offset, nil, &syncBuffer{})
+	f.set(nil, &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone})
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	offset.Store(10)
+	f.set(h.mint(scitt.StatusActive, 5), nil)
+	_ = r.Refresh(t.Context(), h.issuer())
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != "" {
+		t.Fatalf("entry after 410 then ACTIVE = %+v, want a terminal entry with no status", got)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+// TestStatusRefresherStuckReportsFailure: while an issuer is held terminal,
+// a live answer from the TL is a failed refresh (observer, error and log),
+// never a success, so last_success_timestamp stops moving and the log says
+// to restart.
+func TestStatusRefresherStuckReportsFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		fetch func(h *statusHarness) ([]byte, error)
+	}{
+		{"bare 410", func(*statusHarness) ([]byte, error) {
+			return nil, &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone}
+		}},
+		{"signed REVOKED", func(h *statusHarness) ([]byte, error) { return h.mint(scitt.StatusRevoked, -5), nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newStatusHarness(t)
+			f := &fetcher{}
+			var offset atomic.Int64
+			obs := &recStatusObserver{}
+			logs := &syncBuffer{}
+			r := i1Refresher(t, h, f, &offset, obs, logs)
+			f.set(h.mint(scitt.StatusActive, -30), nil)
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatal(err)
+			}
+			f.set(tc.fetch(h))
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatal(err)
+			}
+			offset.Store(10)
+			f.set(h.mint(scitt.StatusActive, 5), nil)
+			err := r.Refresh(t.Context(), h.issuer())
+			if err == nil || !strings.Contains(err.Error(), "held terminal") {
+				t.Fatalf("Refresh while stuck = %v, want a failure saying it is held terminal", err)
+			}
+			if got := strings.Join(obs.results(), ","); got != "success,terminal,failure" {
+				t.Fatalf("observed %s", got)
+			}
+			if out := logs.String(); !strings.Contains(out, "issuer status refresh failed") || !strings.Contains(out, "restart ans-authz") {
+				t.Fatalf("log lacks the stuck-terminal failure:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestMemoryStatusCacheExpiredClearable: Install reports whether it wrote.
+// An EXPIRED entry is replaced by another terminal answer or a verified
+// ACTIVE or WARNING token, never by a tokenless or non-live one; REVOKED
+// and 410 entries are never replaced.
+func TestMemoryStatusCacheExpiredClearable(t *testing.T) {
+	t.Parallel()
+	tok := func(s scitt.AgentStatus) *scitt.VerifiedStatusToken {
+		return &scitt.VerifiedStatusToken{Payload: scitt.StatusTokenPayload{Status: s}}
+	}
+	expired := IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusExpired}
+	for _, tc := range []struct {
+		name string
+		cur  IssuerStatus
+		next IssuerStatus
+		want bool
+	}{
+		{"expired, then ACTIVE", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, true},
+		{"expired, then WARNING", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusWarning)}, true},
+		{"expired, then revoked", expired, IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusRevoked}, true},
+		{"expired, then no token", expired, IssuerStatus{AgentID: "a"}, false},
+		{"expired, then DEPRECATED", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusDeprecated)}, false},
+		{"revoked, then ACTIVE", IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusRevoked},
+			IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, false},
+		{"410, then ACTIVE", IssuerStatus{AgentID: "a", Terminal: true},
+			IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, false},
+	} {
+		c := NewMemoryStatusCache()
+		if !c.Install(tc.cur) {
+			t.Fatalf("%s: first Install refused", tc.name)
+		}
+		if got := c.Install(tc.next); got != tc.want {
+			t.Errorf("%s: Install = %v, want %v", tc.name, got, tc.want)
+		}
+		if got, _ := c.Get("a"); (got.Terminal == tc.cur.Terminal && got.Status == tc.cur.Status && got.Token == nil) == tc.want {
+			t.Errorf("%s: entry %+v does not match Install's report", tc.name, got)
+		}
+	}
+	if NewMemoryStatusCache().Install(IssuerStatus{}) {
+		t.Error("Install without an agent id reported a write")
 	}
 }
