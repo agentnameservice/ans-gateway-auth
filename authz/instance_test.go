@@ -134,6 +134,38 @@ func (iv *instanceVectors) verifier(t *testing.T, cfg Config, keys KeyProvider) 
 	return v
 }
 
+// cacheVerifier runs a maxStatusAge vector in status-cache mode, the only
+// mode maxStatusAge selects. The cache is seeded with the vector's own status
+// token, as if the TL had served it, so the presented token is never newer
+// than the cache and the verdict rests on that token's age, as the vector
+// intends.
+func (iv *instanceVectors) cacheVerifier(t *testing.T, vec instanceVector) *Verifier {
+	t.Helper()
+	cfg := iv.config()
+	cfg.InstanceMode.MaxStatusAge = time.Duration(vec.MaxStatusAge) * time.Second
+	cfg.InstanceMode.Issuers = []InstanceIssuer{{Host: iv.AllowedIssuers[0], AgentID: iv.AgentID, TL: "test-tl"}}
+	raw, err := base64.StdEncoding.DecodeString(vec.StatusToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := iv.keys(t)
+	st, err := scitt.VerifyStatusTokenAt(raw, keys, 0, iv.Now)
+	if err != nil {
+		t.Fatalf("seed status token: %v", err)
+	}
+	cache := NewMemoryStatusCache()
+	cache.Offer(IssuerStatus{AgentID: st.Payload.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	mem := replay.NewMemory(t.Context(), 1000, nil)
+	t.Cleanup(func() { _ = mem.Close() })
+	v, err := NewVerifier(cfg, keys, mem, nil, nil, WithStatusCache(cache))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	now := time.Unix(iv.Now, 0)
+	v.now = func() time.Time { return now }
+	return v
+}
+
 func (vec *instanceVector) request(t *testing.T) *Request {
 	t.Helper()
 	u, err := url.Parse(vec.URL)
@@ -224,8 +256,10 @@ func TestInstanceVectors(t *testing.T) {
 		t.Run(vec.Name, func(t *testing.T) {
 			t.Parallel()
 			cfg := iv.config()
-			cfg.InstanceMode.MaxStatusAge = time.Duration(vec.MaxStatusAge) * time.Second
 			v := iv.verifier(t, cfg, iv.keys(t))
+			if vec.MaxStatusAge > 0 {
+				v = iv.cacheVerifier(t, vec)
+			}
 			if vec.PresentTwice {
 				if d := v.Verify(t.Context(), vec.request(t)); !d.Allowed {
 					t.Fatalf("first presentation denied: %+v", d.Deny)

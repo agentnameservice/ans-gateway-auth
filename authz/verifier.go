@@ -141,6 +141,22 @@ type Verifier struct {
 	instances *instanceCap
 	// allowedNames is allowedAnsNames in canonical form, for instance mode.
 	allowedNames map[string]bool
+	// statusCache holds the issuers' TL status tokens when
+	// instanceMode.maxStatusAge is set; nil otherwise.
+	statusCache StatusCache
+	// issuerAgents maps each instanceMode.issuers host to its agent id.
+	issuerAgents map[string]string
+}
+
+// VerifierOption configures optional NewVerifier wiring.
+type VerifierOption func(*Verifier)
+
+// WithStatusCache supplies the issuer status cache the background
+// StatusRefresher fills. Without it, a verifier whose instance mode sets
+// maxStatusAge holds its own empty cache, so every instance request is
+// status_stale (fail closed).
+func WithStatusCache(c StatusCache) VerifierOption {
+	return func(v *Verifier) { v.statusCache = c }
 }
 
 // extraHeader is one configured extraIdentityHeaders entry.
@@ -152,7 +168,8 @@ type extraHeader struct {
 // NewVerifier validates cfg and wires the verifier. A nil Observer selects
 // NoopObserver and a nil logger discards the rate-limited misconfiguration
 // logs.
-func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger) (*Verifier, error) {
+func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer, logger *slog.Logger,
+	opts ...VerifierOption) (*Verifier, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -198,12 +215,34 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 		}
 	}
 	v.instances = newInstanceCap(cfg.InstanceMode.MaxInstancesPerSub)
+	for _, opt := range opts {
+		opt(v)
+	}
+	v.wireStatusCache()
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
 		now:      func() time.Time { return v.now() },
 		last:     make(map[string]time.Time),
 	}
 	return v, nil
+}
+
+// wireStatusCache turns the issuer status cache on exactly when instance mode
+// bounds status age, holding an empty (fail-closed) cache when none was
+// supplied.
+func (v *Verifier) wireStatusCache() {
+	im := v.cfg.InstanceMode
+	if !im.Enabled || im.MaxStatusAge <= 0 {
+		v.statusCache = nil
+		return
+	}
+	if v.statusCache == nil {
+		v.statusCache = NewMemoryStatusCache()
+	}
+	v.issuerAgents = make(map[string]string, len(im.Issuers))
+	for _, is := range im.Issuers {
+		v.issuerAgents[is.Host] = is.AgentID
+	}
 }
 
 // Verify decides one request within cfg.CheckTimeout. It never returns an

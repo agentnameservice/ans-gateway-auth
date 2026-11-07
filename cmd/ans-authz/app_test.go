@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/agentnameservice/ans-sdk-go/examples/a2a-no-mtls/demokit"
 	"github.com/alicebob/miniredis/v2"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
@@ -468,5 +470,157 @@ func TestNewAppRejectsInvalidWiring(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+const (
+	testIssuerHost    = "issuer.example.test"
+	testIssuerAgentID = "00000000-0000-4000-8000-000000000001"
+)
+
+// statusTL is a fake transparency log serving root keys and one issuer's
+// status token, counting every request.
+type statusTL struct {
+	srv      *httptest.Server
+	line     string
+	token    atomic.Pointer[[]byte]
+	failing  atomic.Bool
+	statuses atomic.Int64
+	total    atomic.Int64
+}
+
+func newStatusTL(t *testing.T) *statusTL {
+	t.Helper()
+	tlKey, bundle, err := demokit.Provision("ans://v1.0.0."+testIssuerHost, testIssuerAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &statusTL{line: c2spLine(t, "status-tl", &tlKey.PublicKey)}
+	s.token.Store(&bundle.StatusToken)
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.total.Add(1)
+		switch r.URL.Path {
+		case "/root-keys":
+			_, _ = w.Write([]byte(s.line + "\n"))
+		case "/v1/agents/" + testIssuerAgentID + "/status-token":
+			s.statuses.Add(1)
+			if s.failing.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/ans-status-token+cbor")
+			_, _ = w.Write(*s.token.Load())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func instanceStatusYAML(baseURL string) string {
+	return configYAML(remoteTL(baseURL),
+		"instanceMode:",
+		"  enabled: true",
+		"  allowedIssuers: ["+testIssuerHost+"]",
+		"  maxStatusAge: 240s",
+		"  issuers:",
+		"  - {host: "+testIssuerHost+", agentId: "+testIssuerAgentID+", tl: remote}")
+}
+
+// TestAppIssuerStatusStartupFetch fetches each issuer's status token before
+// serving and exposes the refresh in metrics.
+func TestAppIssuerStatusStartupFetch(t *testing.T) {
+	tl := newStatusTL(t)
+	a, cancel := startApp(t, loadConfig(t, instanceStatusYAML(tl.srv.URL)))
+	defer func() { cancel(); _ = a.Wait() }()
+	if n := tl.statuses.Load(); n != 1 {
+		t.Fatalf("startup made %d status-token fetches, want 1", n)
+	}
+	got, ok := a.statusCache.Get(testIssuerAgentID)
+	if !ok || got.Token == nil || got.Token.Payload.AgentID != testIssuerAgentID {
+		t.Fatalf("cache after startup = %+v, %v", got, ok)
+	}
+	_, body := httpGet(t, "http://"+a.HTTPAddr()+"/metrics")
+	for _, want := range []string{
+		`ans_authz_issuer_status_refresh_total{issuer="` + testIssuerHost + `",result="success"} 1`,
+		`ans_authz_issuer_status_last_success_timestamp_seconds{issuer="` + testIssuerHost + `"}`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("metrics lack %s:\n%s", want, body)
+		}
+	}
+}
+
+// TestAppIssuerStatusStartupFailureFailsClosed starts with the TL's status
+// route down: startup succeeds after retrying, logs the issuer, and the cache
+// stays empty (every request for it is status_stale) until a fetch succeeds.
+func TestAppIssuerStatusStartupFailureFailsClosed(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.failing.Store(true)
+	var logs recordingLog
+	cfg := loadConfig(t, instanceStatusYAML(tl.srv.URL))
+	a, err := newApp(context.Background(), cfg, logs.logger())
+	if err != nil {
+		t.Fatalf("newApp with the TL status route down: %v", err)
+	}
+	defer func() { _ = a.cache.Close() }()
+	if tl.statuses.Load() < 2 {
+		t.Fatalf("startup made %d status-token attempts, want retries", tl.statuses.Load())
+	}
+	if _, ok := a.statusCache.Get(testIssuerAgentID); ok {
+		t.Fatal("cache populated although every fetch failed")
+	}
+	if !strings.Contains(logs.String(), "no issuer status after startupTimeout") || !strings.Contains(logs.String(), testIssuerHost) {
+		t.Fatalf("log lacks the failed issuer:\n%s", logs.String())
+	}
+}
+
+// TestAppIssuerStatusBackgroundRefresh: Start runs the refresher, so a TL
+// that recovers after startup fills the cache without any request.
+func TestAppIssuerStatusBackgroundRefresh(t *testing.T) {
+	tl := newStatusTL(t)
+	tl.failing.Store(true)
+	cfg := loadConfig(t, instanceStatusYAML(tl.srv.URL))
+	a, cancel := startApp(t, cfg)
+	defer func() { cancel(); _ = a.Wait() }()
+	tl.failing.Store(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := a.statusCache.Get(testIssuerAgentID); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never filled the cache (%d attempts)", tl.statuses.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestAppIssuerStatusNoTLCallOnCheck sends instance-mode Check calls over
+// gRPC and counts TL requests: none.
+func TestAppIssuerStatusNoTLCallOnCheck(t *testing.T) {
+	tl := newStatusTL(t)
+	a, cancel := startApp(t, loadConfig(t, instanceStatusYAML(tl.srv.URL)))
+	defer func() { cancel(); _ = a.Wait() }()
+	conn, err := grpc.NewClient(a.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := authv3.NewAuthorizationClient(conn)
+	before := tl.total.Load()
+	req := httptest.NewRequest(http.MethodPost, "http://"+testAuthority+"/mcp", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "DPoP eyJ0eXAiOiJpbnN0YW5jZStqd3QifQ.e30.sig")
+	req.Header.Set("Dpop", "x.y.z")
+	req.Header.Set("X-Ans-Status-Token", "AAAA")
+	for range 5 {
+		resp, err := client.Check(context.Background(), checkRequestFrom(req, []byte("{}")))
+		if err != nil || codes.Code(resp.GetStatus().GetCode()) == codes.OK {
+			t.Fatalf("instance Check: %v %v", resp.GetStatus(), err)
+		}
+	}
+	if n := tl.total.Load() - before; n != 0 {
+		t.Fatalf("Check made %d TL requests, want 0", n)
 	}
 }

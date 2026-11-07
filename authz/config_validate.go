@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/agentnameservice/ans-sdk-go/verify"
 )
@@ -82,8 +84,72 @@ func (m InstanceMode) validate() error {
 	if m.MaxStatusAge < 0 {
 		return errors.New("authz: instanceMode.maxStatusAge must be zero (off) or positive")
 	}
+	return m.validateIssuers()
+}
+
+// MinMaxStatusAge is the smallest positive maxStatusAge: the background
+// refresh runs every maxStatusAge/2, and a shorter interval mostly loads the
+// transparency log.
+const MinMaxStatusAge = 10 * time.Second
+
+// validateIssuers requires, with maxStatusAge set, one issuers entry per
+// allowedIssuers host and nothing else: each names a UUID agent id and a
+// transparency log (whose existence package config checks).
+func (m InstanceMode) validateIssuers() error {
+	if m.MaxStatusAge == 0 {
+		if len(m.Issuers) > 0 {
+			return errors.New("authz: instanceMode.issuers needs maxStatusAge: the status cache bounds the age it serves")
+		}
+		return nil
+	}
+	if m.MaxStatusAge < MinMaxStatusAge {
+		return fmt.Errorf("authz: instanceMode.maxStatusAge must be at least %s", MinMaxStatusAge)
+	}
+	seen := make(map[string]bool, len(m.Issuers))
+	for i, is := range m.Issuers {
+		switch {
+		case !slices.Contains(m.AllowedIssuers, is.Host):
+			return fmt.Errorf("authz: instanceMode.issuers[%d]: host %q is not in allowedIssuers", i, is.Host)
+		case seen[is.Host]:
+			return fmt.Errorf("authz: instanceMode.issuers[%d]: host %q is listed twice", i, is.Host)
+		case !isUUID(is.AgentID):
+			return fmt.Errorf("authz: instanceMode.issuers[%d]: agentId %q must be the issuer's ANS agent id, a UUID", i, is.AgentID)
+		case is.TL == "":
+			return fmt.Errorf("authz: instanceMode.issuers[%d]: tl must name a transparencyLogs entry", i)
+		}
+		seen[is.Host] = true
+	}
+	for _, host := range m.AllowedIssuers {
+		if !seen[host] {
+			return fmt.Errorf("authz: instanceMode.issuers has no entry for allowedIssuers host %q; with maxStatusAge set, every issuer's status is fetched from its TL", host)
+		}
+	}
 	return nil
 }
+
+// isUUID reports whether s is a UUID in its 8-4-4-4-12 hex form, the agent id
+// the TL's status-token route accepts.
+func isUUID(s string) bool {
+	groups := strings.Split(s, "-")
+	if len(groups) != len(uuidGroupLens) {
+		return false
+	}
+	for i, g := range groups {
+		if len(g) != uuidGroupLens[i] {
+			return false
+		}
+		for j := range len(g) {
+			c := g[j]
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// uuidGroupLens are the hex-digit counts of a UUID's dash-separated groups.
+var uuidGroupLens = [...]int{8, 4, 4, 4, 12} //nolint:gochecknoglobals // immutable UUID layout
 
 // bareLowercaseHost reports whether s is a lowercase DNS name: dot-separated
 // labels of a-z, 0-9 and inner hyphens, with no scheme, port or path.

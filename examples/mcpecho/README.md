@@ -20,11 +20,19 @@ bin/ans-authz --config examples/mcpecho/ans-authz-instance.yaml
 agentgateway -f examples/agentgateway/config-mcp.yaml
 ```
 
-Before you start it, set three values in `ans-authz-instance.yaml`:
+Before you start it, set four values in `ans-authz-instance.yaml`:
 
 - `allowedIssuers`: your issuer's host.
+- `issuers`: for that host, the issuer's ANS agent id and the `transparencyLogs` entry that serves
+  its status token. The verifier fetches `<baseURL>/v1/agents/<agentId>/status-token` at startup
+  and every `maxStatusAge`/2 (two minutes for the shipped 240 s), so a revoked issuer's instances
+  are refused within `maxStatusAge` plus the TL's publish delay, whatever status token a client
+  sends.
 - `expectedAud`: the host your clients mint tokens for.
 - `transparencyLogs`: the log that signs the issuer's status token.
+
+If the TL cannot be reached at startup, `ans-authz` still starts, logs the issuer, and refuses
+its instance requests (`status_stale`) until a background fetch succeeds.
 
 The `mcpAuthorization` rule in `config-mcp.yaml` matches `extauthz.ans_name`. For an instance
 caller, `ans_name` is the issuer's ANS name, so name the issuer there.

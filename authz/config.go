@@ -75,12 +75,32 @@ type InstanceMode struct {
 	// the cap off. The count is per verifier process, not shared across
 	// replicas.
 	MaxInstancesPerSub int `yaml:"maxInstancesPerSub"`
-	// MaxStatusAge, when positive, refuses an issuer status token issued
-	// longer ago than this (STATUS_INVALID, reason status_stale), and lets
-	// its iat lead the verifier's clock by at most 60 s so a future-dated
-	// token cannot extend its freshness. Zero means the token is accepted
-	// until its own exp.
+	// MaxStatusAge, when positive, refuses a request unless the issuer
+	// status token in use was issued at most this long ago (STATUS_INVALID,
+	// reason status_stale), and lets a token's iat lead the verifier's clock
+	// by at most 60 s so a future-dated token cannot extend its freshness.
+	// It also turns on the gateway-owned status cache: the verifier fetches
+	// each issuer's status token from the TL in the background every
+	// MaxStatusAge/2 and uses the presented token only when it is newer.
+	// Every allowedIssuers host then needs an Issuers entry. Zero means the
+	// presented token is accepted until its own exp; not recommended.
 	MaxStatusAge time.Duration `yaml:"maxStatusAge"`
+	// Issuers maps each allowed issuer host to the TL agent whose status
+	// token the verifier keeps warm. Required for every allowedIssuers host
+	// when MaxStatusAge is positive.
+	Issuers []InstanceIssuer `yaml:"issuers"`
+}
+
+// InstanceIssuer names the TL record behind one allowed issuer host.
+type InstanceIssuer struct {
+	// Host is the issuer, as it appears in allowedIssuers.
+	Host string `yaml:"host"`
+	// AgentID is the issuer's ANS agent ID (a UUID): the verifier fetches
+	// <tl baseURL>/v1/agents/<agentId>/status-token.
+	AgentID string `yaml:"agentId"`
+	// TL names the transparencyLogs entry to fetch it from; that entry
+	// needs a baseURL.
+	TL string `yaml:"tl"`
 }
 
 // RequiredContext names a context-extension key and value the gateway must

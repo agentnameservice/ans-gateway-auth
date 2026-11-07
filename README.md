@@ -107,7 +107,8 @@ instanceMode:                  # second caller mode; see "Instance mode" below
   allowedIssuers: []           # bare lowercase hosts, e.g. [authority.example.com]; required when enabled
   expectedAud: ""              # bare host the token's aud must name; empty = host of the matched authority
   maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
-  maxStatusAge: 0s             # refuse an issuer status token older than this (status_stale); 0 = until its exp, not recommended
+  maxStatusAge: 0s             # e.g. 240s: keep issuers' status warm, refuse status older than this (status_stale); 0 = until its exp, not recommended
+  issuers: []                  # with maxStatusAge: one per allowedIssuers host, e.g. [{host: authority.example.com, agentId: <uuid>, tl: prod-tl}]
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -174,10 +175,9 @@ names `typ` `instance+jwt` is refused while instance mode is off. The verifier c
    host is `iss`), is `ACTIVE` or `WARNING`, and lists the SHA-256 of the `x5c` certificate in
    `validIdentityCerts` (as `SHA256:<hex>` or raw 32 bytes); the certificate is inside its
    validity dates and carries `ans_name` as a URI SAN. Its `iat` may lead the verifier's clock by
-   600 s; with `maxStatusAge` set, by 60 s, and a token issued more than `maxStatusAge` ago is
-   refused (`status_stale`), so a revocation is seen within that bound instead of at the status
-   token's own `exp`. 0 is not recommended for instance mode: a revocation then lands only when
-   the issuer's status token expires (about an hour on the TL);
+   600 s; with `maxStatusAge` set, by 60 s, and the status is judged as described under "Issuer
+   status cache" below. 0 is not recommended for instance mode: a revocation then lands only
+   when the issuer's status token expires (about an hour on the TL);
 5. when `allowedAnsNames` is set, the issuer's `ans_name` is in it (compared on version and
    host, as for certificate-mode callers);
 6. `aud` is `expectedAud`, or the host of the matched authority;
@@ -206,6 +206,44 @@ implementation's code (`expired`, `bad_token`, `bad_signature`, `bad_dpop`, `rep
 `examples/mcpecho/ans-authz-instance.yaml` is a working configuration. The token format follows ans-agent's
 `src/instance_token.py`; `testdata/instance-vectors.json` holds the two implementations to the same
 verdicts. The per-sub cap is counted per process, not across replicas.
+
+#### Issuer status cache
+
+With `maxStatusAge` set, the verifier owns each issuer's status, so revocation latency no longer
+depends on what a client presents. Every `allowedIssuers` host needs an `issuers` entry naming
+the issuer's ANS agent id (a UUID) and a `transparencyLogs` entry with a `baseURL`:
+
+```yaml
+instanceMode:
+  enabled: true
+  allowedIssuers: [authority.example.com]
+  maxStatusAge: 240s
+  issuers:
+  - {host: authority.example.com, agentId: 3f8e2a1c-0000-4000-8000-000000000001, tl: prod-tl}
+```
+
+- At startup, before serving, it fetches `GET <baseURL>/v1/agents/<agentId>/status-token` for each
+  issuer, retrying until `startupTimeout`. An issuer still unreachable then is logged and startup
+  continues; every request for it is refused `status_stale` until a fetch succeeds.
+- In the background, one loop per issuer refetches every `maxStatusAge`/2, up to 20% sooner
+  (jitter), and backs off from 1 s to at most 30 s after a failure. A fetched token passes the
+  same signature check, under the same root keys, as one on a request, and must name the
+  configured agent id and host; otherwise the cache keeps what it had.
+- On a request the verifier never calls the TL and never refreshes root keys. The presented
+  status token must still verify under the cached root keys and name the issuer's configured agent
+  id. It is used only when its `iat` is later than the cached token's, and it then replaces the
+  cache entry; otherwise the cached token decides. Whichever token is used must have been issued
+  within `maxStatusAge`, or the request is refused `status_stale` (fail closed).
+- A terminal issuer is refused `revoked` at once: a signed `REVOKED` or `EXPIRED` token on the
+  request, or a TL that answers the background fetch with `410 Gone` or a signed terminal token.
+  The issuer stays refused until the TL serves a newer live token; nothing a client presents
+  clears it.
+
+A revocation is therefore seen within `maxStatusAge` plus the TL's publish delay, about four
+minutes for the 240 s above. The cache is per process; each replica fetches for itself.
+`ans_authz_issuer_status_refresh_total{issuer,result}` counts fetches by `success`, `failure` and
+`terminal`, and `ans_authz_issuer_status_last_success_timestamp_seconds{issuer}` is the time of the
+last one the TL answered; alert when it falls `maxStatusAge` behind.
 
 ### Authority rule (ANS-6 section 7.7)
 

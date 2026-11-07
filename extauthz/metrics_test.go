@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/agentnameservice/ans-gateway-auth/authz"
 	"github.com/agentnameservice/ans-gateway-auth/replay"
 )
 
@@ -83,6 +84,39 @@ func TestMetricsKeyRefresh(t *testing.T) {
 		if got := testutil.ToFloat64(m.keyRefresh.WithLabelValues(tt.tl, tt.result)); got != tt.want {
 			t.Errorf("key_refresh{tl=%s,result=%s} = %v, want %v", tt.tl, tt.result, got, tt.want)
 		}
+	}
+}
+
+func TestMetricsIssuerStatusRefresh(t *testing.T) {
+	t.Parallel()
+	m := NewMetrics()
+	m.IssuerStatusRefresh("issuer.example", authz.StatusRefreshSuccess, time.Unix(1000, 0))
+	m.IssuerStatusRefresh("issuer.example", authz.StatusRefreshFailure, time.Unix(1100, 0))
+	m.IssuerStatusRefresh("issuer.example", authz.StatusRefreshFailure, time.Unix(1200, 0))
+	m.IssuerStatusRefresh("other.example", authz.StatusRefreshTerminal, time.Unix(1300, 0))
+	for _, tt := range []struct {
+		issuer, result string
+		want           float64
+	}{
+		{"issuer.example", authz.StatusRefreshSuccess, 1},
+		{"issuer.example", authz.StatusRefreshFailure, 2},
+		{"other.example", authz.StatusRefreshTerminal, 1},
+	} {
+		if got := testutil.ToFloat64(m.issuerRefresh.WithLabelValues(tt.issuer, tt.result)); got != tt.want {
+			t.Errorf("issuer_status_refresh_total{%s,%s} = %v, want %v", tt.issuer, tt.result, got, tt.want)
+		}
+	}
+	// The success gauge moves only on success; a terminal answer is a
+	// successful contact with the TL.
+	if got := testutil.ToFloat64(m.issuerLastSuccess.WithLabelValues("issuer.example")); got != 1000 {
+		t.Errorf("last success = %v, want 1000", got)
+	}
+	if got := testutil.ToFloat64(m.issuerLastSuccess.WithLabelValues("other.example")); got != 1300 {
+		t.Errorf("terminal last success = %v, want 1300", got)
+	}
+	m.PreregisterIssuer("never.example")
+	if got := testutil.ToFloat64(m.issuerRefresh.WithLabelValues("never.example", authz.StatusRefreshFailure)); got != 0 {
+		t.Errorf("preregistered failures = %v", got)
 	}
 }
 

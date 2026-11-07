@@ -76,6 +76,11 @@ func validConfig() Config {
 	return c
 }
 
+func instanceWithIssuer(tl string) authz.InstanceMode {
+	return authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"}, MaxStatusAge: 4 * time.Minute,
+		Issuers: []authz.InstanceIssuer{{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: tl}}}
+}
+
 func TestDefault(t *testing.T) {
 	t.Parallel()
 	want := Config{
@@ -131,6 +136,10 @@ instanceMode:
   expectedAud: gw.example.com
   maxInstancesPerSub: 3
   maxStatusAge: 5m
+  issuers:
+    - host: issuer.example.test
+      agentId: 00000000-0000-4000-8000-000000000001
+      tl: local
 transparencyLogs:
   - name: local
     baseURL: http://127.0.0.1:18081
@@ -169,7 +178,8 @@ readiness:
 			RequiredContext:      &authz.RequiredContext{Key: "ans-authz", Value: "body-forwarded"},
 			RequireTokenClaims:   false,
 			InstanceMode: authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
-				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3, MaxStatusAge: 5 * time.Minute},
+				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3, MaxStatusAge: 5 * time.Minute,
+				Issuers: []authz.InstanceIssuer{{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "local"}}},
 		},
 		TransparencyLogs: []TransparencyLog{
 			{Name: "local", BaseURL: "http://127.0.0.1:18081", AllowInsecure: true, Timeout: 500 * time.Millisecond},
@@ -327,6 +337,21 @@ func TestConfigValidate(t *testing.T) {
 		{name: "transparency log timeout zero", mutate: func(c *Config) {
 			c.TransparencyLogs[0].Timeout = 0
 		}, wantErr: "timeout must be positive"},
+		{name: "instance issuer on a known TL with a baseURL", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("tl")
+		}},
+		{name: "instance issuer on an unknown TL", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("nope")
+		}, wantErr: `instanceMode.issuers[0]: tl "nope" is not a transparencyLogs entry`},
+		{name: "instance issuer on a TL without a baseURL", mutate: func(c *Config) {
+			c.TransparencyLogs[0].BaseURL = ""
+			c.TransparencyLogs[0].RootKeys = []string{rootKey}
+			c.InstanceMode = instanceWithIssuer("tl")
+		}, wantErr: `instanceMode.issuers[0]: tl "tl" has no baseURL`},
+		{name: "instance issuers ignored while instance mode is off", mutate: func(c *Config) {
+			c.InstanceMode = instanceWithIssuer("nope")
+			c.InstanceMode.Enabled = false
+		}},
 		{name: "transparency log timeout negative", mutate: func(c *Config) {
 			c.TransparencyLogs[0].Timeout = -time.Second
 		}, wantErr: "timeout must be positive"},

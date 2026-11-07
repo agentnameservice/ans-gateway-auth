@@ -100,8 +100,9 @@ const (
 	instanceIATSkew int64 = 120
 	// statusIATSkew is how far a status token's iat may lead our clock.
 	statusIATSkew int64 = 600
-	// boundedStatusIATSkew replaces statusIATSkew when maxStatusAge is set,
-	// so a future-dated status token cannot stretch its freshness window.
+	// boundedStatusIATSkew replaces statusIATSkew when maxStatusAge is set
+	// (the status cache is on), so a future-dated status token cannot
+	// stretch its freshness window or pin the cache ahead.
 	boundedStatusIATSkew int64 = 60
 	// instanceReplayGrace extends a proof's replay entry past its freshness
 	// window, as the SDK does for certificate-mode proofs.
@@ -519,34 +520,25 @@ func checkBodyDigest(claim string, body []byte) error {
 	return nil
 }
 
-// issuerStatus verifies the issuer's status token against the cached TL root
-// keys (refreshing once for an unknown kid, as certificate mode does) and
-// checks that it vouches for the x5c certificate under the token's name.
+// issuerStatus picks and checks the status token a request is judged on:
+// with the status cache on (maxStatusAge set), the newer of the cached and
+// presented tokens; otherwise the presented token, verified against the
+// cached TL root keys (refreshing once for an unknown kid, as certificate
+// mode does). Either way it must vouch for the x5c certificate under the
+// token's name.
 func (v *Verifier) issuerStatus(ctx context.Context, raw []byte, it *instanceToken,
 	now int64) (*scitt.VerifiedStatusToken, error) {
-	st, err := scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
-	if kid, unknown := unknownKeyID(err); unknown && v.keyAvailable(ctx, kid) {
-		st, err = scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
+	var st *scitt.VerifiedStatusToken
+	var err error
+	if v.statusCache != nil {
+		st, err = v.cachedIssuerStatus(ctx, raw, it, now)
+	} else {
+		st, err = v.presentedIssuerStatus(ctx, raw, now)
 	}
 	if err != nil {
-		return nil, statusFailure(ctx, err)
+		return nil, err
 	}
 	p := &st.Payload
-	if now >= p.Exp {
-		return nil, refuse(codeStatusExpired, CategoryStatusInvalid, fmt.Sprintf("status token expired at %d", p.Exp))
-	}
-	maxAge := int64(v.cfg.InstanceMode.MaxStatusAge / time.Second)
-	skew := statusIATSkew
-	if maxAge > 0 {
-		skew = boundedStatusIATSkew
-	}
-	if p.Iat > now+skew {
-		return nil, refuse(codeClockSkew, CategoryStatusInvalid, fmt.Sprintf("status token iat %d is %ds ahead", p.Iat, p.Iat-now))
-	}
-	if maxAge > 0 && now-p.Iat > maxAge {
-		return nil, refuse(codeStatusStale, CategoryStatusInvalid,
-			fmt.Sprintf("status token issued %ds ago, over maxStatusAge %ds", now-p.Iat, maxAge))
-	}
 	if err := checkIssuerNames(p, it); err != nil {
 		return nil, err
 	}
@@ -560,6 +552,34 @@ func (v *Verifier) issuerStatus(ctx context.Context, raw []byte, it *instanceTok
 		return nil, refuse(codeCertNotCurrent, CategoryBindingFailed, "x5c certificate is not in the issuer's validIdentityCerts")
 	}
 	return st, nil
+}
+
+// presentedIssuerStatus is the maxStatusAge-0 path: the presented token
+// alone, bounded only by its own exp.
+func (v *Verifier) presentedIssuerStatus(ctx context.Context, raw []byte, now int64) (*scitt.VerifiedStatusToken, error) {
+	st, err := scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
+	if kid, unknown := unknownKeyID(err); unknown && v.keyAvailable(ctx, kid) {
+		st, err = scitt.VerifyStatusTokenAt(raw, v.keys, 0, now)
+	}
+	if err != nil {
+		return nil, statusFailure(ctx, err)
+	}
+	if err := checkStatusClock(&st.Payload, now, statusIATSkew); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// checkStatusClock refuses an expired status token or one whose iat leads
+// our clock by more than skew seconds.
+func checkStatusClock(p *scitt.StatusTokenPayload, now, skew int64) error {
+	if now >= p.Exp {
+		return refuse(codeStatusExpired, CategoryStatusInvalid, fmt.Sprintf("status token expired at %d", p.Exp))
+	}
+	if p.Iat > now+skew {
+		return refuse(codeClockSkew, CategoryStatusInvalid, fmt.Sprintf("status token iat %d is %ds ahead", p.Iat, p.Iat-now))
+	}
+	return nil
 }
 
 func statusFailure(ctx context.Context, err error) error {

@@ -12,6 +12,10 @@ func validConfig() Config {
 	return c
 }
 
+func validIssuer() InstanceIssuer {
+	return InstanceIssuer{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "tl"}
+}
+
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -80,8 +84,60 @@ func TestConfigValidate(t *testing.T) {
 		}, wantErr: "maxStatusAge"},
 		{name: "instance max status age set", mutate: func(c *Config) {
 			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
-				MaxStatusAge: 5 * time.Minute}
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer()}}
 		}},
+		{name: "instance max status age without issuers", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute}
+		}, wantErr: `instanceMode.issuers has no entry for allowedIssuers host "issuer.example.test"`},
+		{name: "instance max status age below the minimum", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 9 * time.Second, Issuers: []InstanceIssuer{validIssuer()}}
+		}, wantErr: "maxStatusAge must be at least 10s"},
+		{name: "instance issuers without max status age", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				Issuers: []InstanceIssuer{validIssuer()}}
+		}, wantErr: "instanceMode.issuers needs maxStatusAge"},
+		{name: "instance issuer entry not allowlisted", mutate: func(c *Config) {
+			other := validIssuer()
+			other.Host = "other.example.test"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer(), other}}
+		}, wantErr: `instanceMode.issuers[1]: host "other.example.test" is not in allowedIssuers`},
+		{name: "instance issuer entry duplicated", mutate: func(c *Config) {
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{validIssuer(), validIssuer()}}
+		}, wantErr: "instanceMode.issuers[1]: host \"issuer.example.test\" is listed twice"},
+		{name: "instance issuer agent id not a UUID", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "../root-keys"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id with a misplaced dash", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "000000000-000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id with a non-hex digit", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.AgentID = "0000000g-0000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: agentId"},
+		{name: "instance issuer agent id in upper case", mutate: func(c *Config) {
+			ok := validIssuer()
+			ok.AgentID = "ABCDEF00-0000-4000-8000-000000000001"
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{ok}}
+		}},
+		{name: "instance issuer without a TL", mutate: func(c *Config) {
+			bad := validIssuer()
+			bad.TL = ""
+			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
+				MaxStatusAge: 5 * time.Minute, Issuers: []InstanceIssuer{bad}}
+		}, wantErr: "instanceMode.issuers[0]: tl"},
 		{name: "instance cap negative", mutate: func(c *Config) {
 			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
 				MaxInstancesPerSub: -1}

@@ -28,9 +28,15 @@ type Metrics struct {
 	keyRefresh    *prometheus.CounterVec
 	replayLatency *prometheus.HistogramVec
 	replayErrors  *prometheus.CounterVec
+
+	issuerRefresh     *prometheus.CounterVec
+	issuerLastSuccess *prometheus.GaugeVec
 }
 
-var _ authz.Observer = (*Metrics)(nil)
+var (
+	_ authz.Observer       = (*Metrics)(nil)
+	_ authz.StatusObserver = (*Metrics)(nil)
+)
 
 // NewMetrics creates the verifier metrics and registers them, together with
 // the Go runtime and process collectors, on a fresh registry.
@@ -69,11 +75,22 @@ func NewMetrics() *Metrics {
 			Name:      "replay_backend_errors_total",
 			Help:      "Replay-cache backend failures by operation; request cancellations and deadlines are excluded.",
 		}, []string{"op"}),
+		issuerRefresh: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "issuer_status_refresh_total",
+			Help:      "Background issuer status-token fetches by issuer and result (success, failure, terminal).",
+		}, []string{"issuer", "result"}),
+		issuerLastSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "issuer_status_last_success_timestamp_seconds",
+			Help:      "Unix time of the last issuer status fetch the TL answered (a token or a terminal 410).",
+		}, []string{"issuer"}),
 	}
 	m.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		m.decisions, m.checkDuration, m.checkTimeouts, m.keyRefresh, m.replayLatency, m.replayErrors,
+		m.issuerRefresh, m.issuerLastSuccess,
 	)
 	// Pre-create the series operators alert on so they exist at zero.
 	m.replayErrors.WithLabelValues("check_and_store")
@@ -98,6 +115,23 @@ func (m *Metrics) KeyRefresh(tl string, _ int, err error) {
 		result = "failure"
 	}
 	m.keyRefresh.WithLabelValues(tl, result).Inc()
+}
+
+// IssuerStatusRefresh implements authz.StatusObserver. A terminal answer is a
+// successful contact with the TL, so it moves the success timestamp.
+func (m *Metrics) IssuerStatusRefresh(issuer, result string, at time.Time) {
+	m.issuerRefresh.WithLabelValues(issuer, result).Inc()
+	if result != authz.StatusRefreshFailure {
+		m.issuerLastSuccess.WithLabelValues(issuer).Set(float64(at.Unix()))
+	}
+}
+
+// PreregisterIssuer creates an issuer's refresh counters at zero so a
+// failure alert has a series before the first fetch.
+func (m *Metrics) PreregisterIssuer(issuer string) {
+	for _, r := range []string{authz.StatusRefreshSuccess, authz.StatusRefreshFailure, authz.StatusRefreshTerminal} {
+		m.issuerRefresh.WithLabelValues(issuer, r)
+	}
 }
 
 // CheckTimeout implements authz.Observer.

@@ -33,9 +33,20 @@ instanceMode:
   # At most this many distinct instance keys per issuer sub while their
   # tokens live (Sybil bound). Per process.
   maxInstancesPerSub: 5
-  # Refuse an issuer status token older than this, so a revocation is seen
-  # within five minutes rather than at the status token's own exp.
-  maxStatusAge: 5m
+  # The verifier keeps each issuer's TL status token itself, fetched in the
+  # background every maxStatusAge/2 (2 min here, up to 20% sooner), and
+  # refuses a request (status_stale) when neither its cached token nor the
+  # one the client presents was issued within maxStatusAge. A revocation is
+  # then seen within maxStatusAge plus the TL's publish delay, whatever the
+  # client sends. No request ever calls the TL.
+  maxStatusAge: 240s
+  # One entry per allowedIssuers host: the issuer's ANS agent id (a UUID)
+  # and the transparencyLogs entry, with a baseURL, that serves its
+  # /v1/agents/<agentId>/status-token.
+  issuers:
+  - host: issuer.example.test
+    agentId: 00000000-0000-4000-8000-000000000001
+    tl: local-tl
 
 # Instance mode maps agent_id and jkt to the instance key, so a gateway
 # keying its MCP session on this header gives every instance its own session.
