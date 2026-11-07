@@ -47,3 +47,24 @@ caller, `ans_name` is the issuer's ANS name, so name the issuer there.
 
 The token format, the order of the checks and every reason code are described in the top-level
 README, under "Instance mode".
+
+## Transaction tokens
+
+To give `mcpecho` a signed context instead of bare headers, generate a key once and enable
+`transactionToken` in `ans-authz-instance.yaml` (the block is there, commented out):
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out /etc/ans-authz/txn.pem
+chmod 600 /etc/ans-authz/txn.pem
+```
+
+Every allowed call then reaches `mcpecho` with a `Txn-Token` header whose `aud` is
+`transactionToken.audience`. Fetch the verification key from the verifier's health listener:
+
+```bash
+curl -s http://127.0.0.1:9192/.well-known/jwks.json
+```
+
+An upstream should authorize on that token's `sub`, `act` and `scope`, not on the `X-ANS-*`
+headers it also receives. The claims are listed in the top-level README, under "Transaction
+tokens".

@@ -48,6 +48,17 @@ instanceMode:
     agentId: 00000000-0000-4000-8000-000000000001
     tl: local-tl
 
+# A signed, 60-second token for the upstream on every allow; upstreams
+# authorize on it rather than on the X-ANS-* headers. The verification key is
+# served at http://127.0.0.1:9192/.well-known/jwks.json.
+# transactionToken:
+#   enabled: true
+#   signingKeyFile: /etc/ans-authz/txn.pem   # PEM P-256 key; never generated
+#   issuer: https://gateway.example.test
+#   audience: mcpecho.example.test
+#   ttl: 60s
+#   header: Txn-Token
+
 # Instance mode maps agent_id and jkt to the instance key, so a gateway
 # keying its MCP session on this header gives every instance its own session.
 extraIdentityHeaders:

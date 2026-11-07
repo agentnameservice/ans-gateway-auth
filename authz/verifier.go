@@ -146,6 +146,8 @@ type Verifier struct {
 	statusCache StatusCache
 	// issuerAgents maps each instanceMode.issuers host to its agent id.
 	issuerAgents map[string]string
+	// txn mints transaction tokens; nil when transactionToken is off.
+	txn *TxnMinter
 }
 
 // VerifierOption configures optional NewVerifier wiring.
@@ -219,6 +221,12 @@ func NewVerifier(cfg Config, keys KeyProvider, cache replay.Cache, obs Observer,
 		opt(v)
 	}
 	v.wireStatusCache()
+	switch {
+	case cfg.TransactionToken.Enabled && v.txn == nil:
+		return nil, errors.New("authz: transactionToken is enabled but no minter was supplied (WithTxnMinter)")
+	case !cfg.TransactionToken.Enabled && v.txn != nil:
+		return nil, errors.New("authz: a transaction-token minter was supplied but transactionToken is not enabled")
+	}
 	v.limiter = &logLimiter{
 		interval: misconfigurationLogInterval,
 		now:      func() time.Time { return v.now() },
@@ -297,7 +305,8 @@ func (v *Verifier) verify(ctx context.Context, r *Request) Decision {
 	if err != nil {
 		return denied(withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err))
 	}
-	return v.allow(id, headers, tokenPresented)
+	return v.attachTxn(v.allow(id, headers, tokenPresented), r,
+		txnClaims{Sub: id.AnsName, Cnf: txnConfirmation{JKT: id.JKT}})
 }
 
 // htuBase returns the scheme://authority the proof must have been minted for,

@@ -12,6 +12,11 @@ func validConfig() Config {
 	return c
 }
 
+func validTxn() TransactionToken {
+	return TransactionToken{Enabled: true, SigningKeyFile: "/etc/ans-authz/txn.pem", Issuer: "https://gw.example.test",
+		Audience: "upstream.example.test", TTL: 60 * time.Second, Header: "Txn-Token"}
+}
+
 func validIssuer() InstanceIssuer {
 	return InstanceIssuer{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "tl"}
 }
@@ -142,6 +147,59 @@ func TestConfigValidate(t *testing.T) {
 			c.InstanceMode = InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
 				MaxInstancesPerSub: -1}
 		}, wantErr: "maxInstancesPerSub"},
+		{name: "transaction token defaults", mutate: func(c *Config) {
+			if c.TransactionToken.TTL != 60*time.Second || c.TransactionToken.Header != "Txn-Token" || c.TransactionToken.Enabled {
+				t.Errorf("transactionToken defaults = %+v", c.TransactionToken)
+			}
+		}},
+		{name: "transaction token enabled", mutate: func(c *Config) { c.TransactionToken = validTxn() }},
+		{name: "transaction token without a key file", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.SigningKeyFile = ""
+		}, wantErr: "transactionToken.signingKeyFile is required"},
+		{name: "transaction token without an issuer", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Issuer = ""
+		}, wantErr: "transactionToken.issuer"},
+		{name: "transaction token issuer not a URL", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Issuer = "gw.example.test"
+		}, wantErr: "transactionToken.issuer"},
+		{name: "transaction token without an audience", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.Audience = ""
+		}, wantErr: "transactionToken.audience is required"},
+		{name: "transaction token ttl zero", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 0
+		}, wantErr: "transactionToken.ttl must be positive and at most 5m0s"},
+		{name: "transaction token ttl over the maximum", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 301 * time.Second
+		}, wantErr: "transactionToken.ttl must be positive and at most 5m0s"},
+		{name: "transaction token ttl at the maximum", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 300 * time.Second
+		}},
+		{name: "transaction token ttl below a second", mutate: func(c *Config) {
+			c.TransactionToken = validTxn()
+			c.TransactionToken.TTL = 500 * time.Millisecond
+		}, wantErr: "whole number of seconds"},
+		{name: "transaction token header empty", mutate: func(c *Config) {
+			c.TransactionToken.Header = ""
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header invalid", mutate: func(c *Config) {
+			c.TransactionToken.Header = "Txn Token"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with an identity header", mutate: func(c *Config) {
+			c.TransactionToken.Header = "x-ans-name"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with a credential header", mutate: func(c *Config) {
+			c.TransactionToken.Header = "authorization"
+		}, wantErr: "transactionToken.header"},
+		{name: "transaction token header collides with an extra identity header", mutate: func(c *Config) {
+			c.ExtraIdentityHeaders = map[string]string{"txn-token": "agent_id"}
+		}, wantErr: "transactionToken.header"},
 		{name: "neither trusted hosts nor external authority", mutate: func(c *Config) {
 			c.TrustedHosts = nil
 		}, wantErr: "trustedHosts or externalAuthority"},

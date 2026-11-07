@@ -2,12 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -656,5 +666,129 @@ func TestAppIssuerStatusSupersededLogs(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("log lacks %q:\n%s", want, out)
 		}
+	}
+}
+
+// writeTxnKey writes a fresh P-256 signing key as SEC1 PEM.
+func writeTxnKey(t *testing.T) (string, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "txn.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, key
+}
+
+func txnYAML(tl, keyFile string) string {
+	return configYAML(tl,
+		"transactionToken:",
+		"  enabled: true",
+		"  signingKeyFile: "+keyFile,
+		"  issuer: https://gw.example.test",
+		"  audience: upstream.example.test")
+}
+
+// TestAppTransactionTokenJWKS: a certificate-mode allow over gRPC carries a
+// Txn-Token that verifies under the key /.well-known/jwks.json serves, and
+// that key is the configured file's.
+func TestAppTransactionTokenJWKS(t *testing.T) {
+	tr := newTrust(t)
+	keyFile, key := writeTxnKey(t)
+	a, cancel := startApp(t, loadConfig(t, txnYAML(pinnedTL(tr.line), keyFile)))
+	defer func() { cancel(); _ = a.Wait() }()
+
+	resp, err := http.Get("http://" + a.HTTPAddr() + "/.well-known/jwks.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/jwk-set+json" {
+		t.Fatalf("jwks = %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	var jwks struct {
+		Keys []struct {
+			X   string `json:"x"`
+			Y   string `json:"y"`
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+			Use string `json:"use"`
+			D   string `json:"d"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil || len(jwks.Keys) != 1 {
+		t.Fatalf("jwks body: %v %+v", err, jwks)
+	}
+	k := jwks.Keys[0]
+	if k.Alg != "ES256" || k.Use != "sig" || k.D != "" || k.Kid == "" {
+		t.Fatalf("jwk = %+v", k)
+	}
+	xb, _ := base64.RawURLEncoding.DecodeString(k.X)
+	yb, _ := base64.RawURLEncoding.DecodeString(k.Y)
+	pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{4}, xb...), yb...))
+	if err != nil || !pub.Equal(&key.PublicKey) {
+		t.Fatalf("jwks key is not the configured key: %v", err)
+	}
+
+	conn, err := grpc.NewClient(a.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	signed := tr.signedCheckRequest(t, http.MethodPost, "/echo", []byte(`{"a":1}`))
+	signed.GetAttributes().GetRequest().GetHttp().GetHeaders()["txn-token"] = "forged"
+	out, err := authv3.NewAuthorizationClient(conn).Check(context.Background(), signed)
+	if err != nil || codes.Code(out.GetStatus().GetCode()) != codes.OK {
+		t.Fatalf("signed: %v %v", out.GetStatus(), err)
+	}
+	var tok string
+	for _, h := range out.GetOkResponse().GetHeaders() {
+		if h.GetHeader().GetKey() == "Txn-Token" {
+			tok = h.GetHeader().GetValue()
+		}
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		t.Fatalf("Txn-Token = %q", tok)
+	}
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if len(sig) != 64 || !ecdsa.Verify(pub, digest[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])) {
+		t.Fatal("Txn-Token does not verify under the JWKS key")
+	}
+	hdr, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	if !strings.Contains(string(hdr), `"kid":"`+k.Kid+`"`) || !strings.Contains(string(hdr), `"typ":"txntoken+jwt"`) {
+		t.Fatalf("header %s does not name kid %s", hdr, k.Kid)
+	}
+	payload, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	if !strings.Contains(string(payload), `"sub":"`+testAnsName+`"`) {
+		t.Fatalf("payload %s", payload)
+	}
+}
+
+// TestAppJWKSAbsentWhenDisabled: no transaction tokens, no JWKS route.
+func TestAppJWKSAbsentWhenDisabled(t *testing.T) {
+	tr := newTrust(t)
+	a, cancel := startApp(t, loadConfig(t, configYAML(pinnedTL(tr.line))))
+	defer func() { cancel(); _ = a.Wait() }()
+	if code, _ := httpGet(t, "http://"+a.HTTPAddr()+"/.well-known/jwks.json"); code != http.StatusNotFound {
+		t.Fatalf("jwks with transaction tokens off = %d, want 404", code)
+	}
+}
+
+// TestNewAppTransactionTokenKeyErrors: an unreadable or wrong key file stops
+// startup, never falling back to a generated key.
+func TestNewAppTransactionTokenKeyErrors(t *testing.T) {
+	tr := newTrust(t)
+	cfg := loadConfig(t, txnYAML(pinnedTL(tr.line), filepath.Join(t.TempDir(), "missing.pem")))
+	if _, err := newApp(context.Background(), cfg, discardLogger()); err == nil || !strings.Contains(err.Error(), "transactionToken.signingKeyFile") {
+		t.Fatalf("missing key file: err = %v", err)
 	}
 }

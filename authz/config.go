@@ -51,6 +51,10 @@ type Config struct {
 	// a local agent instance presenting a short-lived instance token signed by
 	// an ANS-registered issuer's identity-certificate key. Off by default.
 	InstanceMode InstanceMode `yaml:"instanceMode"`
+	// TransactionToken mints a signed, short-lived token for the upstream on
+	// every allow, in both caller modes. Off by default; its header is
+	// stripped from every allowed request either way.
+	TransactionToken TransactionToken `yaml:"transactionToken"`
 }
 
 // InstanceMode configures the second caller mode. A request selects it by
@@ -119,5 +123,6 @@ func DefaultConfig() Config {
 		StripIdentityHeaders: true,
 		CheckTimeout:         DefaultCheckTimeout,
 		RequireTokenClaims:   true,
+		TransactionToken:     TransactionToken{TTL: DefaultTxnTTL, Header: DefaultTxnHeader},
 	}
 }

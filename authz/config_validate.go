@@ -57,7 +57,8 @@ func (c Config) Validate() error {
 	if rc := c.RequiredContext; rc != nil && (rc.Key == "" || rc.Value == "") {
 		return errors.New("authz: requiredContext needs both key and value")
 	}
-	return cmp.Or(c.InstanceMode.validate(), validateExtraIdentityHeaders(c.ExtraIdentityHeaders))
+	return cmp.Or(c.InstanceMode.validate(), validateExtraIdentityHeaders(c.ExtraIdentityHeaders),
+		c.TransactionToken.validate(c.ExtraIdentityHeaders))
 }
 
 // validate checks instance mode only when it is enabled: at least one issuer,

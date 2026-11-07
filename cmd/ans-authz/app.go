@@ -55,6 +55,8 @@ type app struct {
 	// status tokens warm; nil unless instanceMode.maxStatusAge is set.
 	statusCache     *authz.MemoryStatusCache
 	statusRefresher *authz.StatusRefresher
+	// txn mints transaction tokens; nil unless transactionToken.enabled.
+	txn *authz.TxnMinter
 	// clients holds each transparency log's HTTP client by name, for the
 	// status refresher; logs without a baseURL have none.
 	clients map[string]*scitt.HTTPClient
@@ -77,6 +79,9 @@ type app struct {
 // startupTimeout) and builds the verifier. Nothing listens yet.
 func newApp(ctx context.Context, cfg config.Config, logger *slog.Logger) (*app, error) {
 	a := &app{cfg: cfg, logger: logger, metrics: extauthz.NewMetrics(), clients: make(map[string]*scitt.HTTPClient)}
+	if err := a.loadTxnMinter(); err != nil {
+		return nil, err
+	}
 
 	sources := make([]authz.KeySource, 0, len(cfg.TransparencyLogs))
 	for _, tl := range cfg.TransparencyLogs {
@@ -124,6 +129,9 @@ func (a *app) buildServer(logger *slog.Logger) error {
 	if a.statusCache != nil {
 		verifierOpts = append(verifierOpts, authz.WithStatusCache(a.statusCache))
 	}
+	if a.txn != nil {
+		verifierOpts = append(verifierOpts, authz.WithTxnMinter(a.txn))
+	}
 	verifier, err := authz.NewVerifier(a.cfg.Config, a.keyring, a.cache, a.metrics, logger, verifierOpts...)
 	if err != nil {
 		return err
@@ -145,6 +153,33 @@ func (a *app) buildServer(logger *slog.Logger) error {
 	}
 	a.server = extauthz.NewServer(verifier, opts...)
 	return nil
+}
+
+// loadTxnMinter reads the transaction-token signing key from its file. A
+// missing or unusable key stops startup; no key is ever generated.
+func (a *app) loadTxnMinter() error {
+	tt := a.cfg.TransactionToken
+	if !tt.Enabled {
+		return nil
+	}
+	key, err := authz.LoadTxnSigningKey(tt.SigningKeyFile)
+	if err != nil {
+		return err
+	}
+	if a.txn, err = authz.NewTxnMinter(tt, key); err != nil {
+		return err
+	}
+	a.logger.Info("transaction tokens enabled", "issuer", tt.Issuer, "audience", tt.Audience,
+		"ttl", tt.TTL, "header", tt.Header, "kid", a.txn.KeyID())
+	return nil
+}
+
+// jwks serves the transaction-token public key for upstreams to verify
+// against.
+func (a *app) jwks(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/jwk-set+json")
+	w.Header().Set("Cache-Control", "max-age=300")
+	_, _ = w.Write(a.txn.JWKS())
 }
 
 // serverTLS loads the gRPC listener's TLS material up front, so unusable
@@ -342,6 +377,9 @@ func (a *app) Start(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.Handle("GET /metrics", a.metrics.Handler())
+	if a.txn != nil {
+		mux.HandleFunc("GET /.well-known/jwks.json", a.jwks)
+	}
 	a.httpSrv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: httpReadHeaderTimeout,

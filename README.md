@@ -109,6 +109,13 @@ instanceMode:                  # second caller mode; see "Instance mode" below
   maxInstancesPerSub: 0        # distinct instance keys one sub may hold while their tokens live; 0 = off
   maxStatusAge: 0s             # e.g. 240s: keep issuers' status warm, refuse status older than this (status_stale); 0 = until its exp, not recommended
   issuers: []                  # with maxStatusAge: one per allowedIssuers host, e.g. [{host: authority.example.com, agentId: <uuid>, tl: prod-tl}]
+transactionToken:             # signed context for the upstream; see "Transaction tokens" below
+  enabled: false
+  signingKeyFile: ""           # PEM P-256 key (EC PRIVATE KEY or PRIVATE KEY); required when enabled, never generated
+  issuer: ""                   # https URL of this gateway, e.g. https://gw.webmesh.ai
+  audience: ""                 # the upstream, e.g. dnsdoc.webmesh.ai
+  ttl: 60s                     # exp - iat; whole seconds, at most 300s
+  header: Txn-Token
 maxContentBytes: 1048576
 requireReceipt: true
 allowedAnsNames: []            # optional allowlist
@@ -262,6 +269,47 @@ minutes for the 240 s above. The cache is per process; each replica fetches for 
 `ans_authz_issuer_status_refresh_total{issuer,result}` counts fetches by `success`, `failure` and
 `terminal`, and `ans_authz_issuer_status_last_success_timestamp_seconds{issuer}` is the time of the
 last one the TL answered; alert when it falls `maxStatusAge` behind.
+
+### Transaction tokens
+
+With `transactionToken.enabled`, every allow, in either caller mode, carries a short-lived
+JWT ([draft-ietf-oauth-transaction-tokens](https://datatracker.ietf.org/doc/draft-ietf-oauth-transaction-tokens/))
+in `Txn-Token` (or `transactionToken.header`), set with overwrite semantics. **Upstreams must
+authorize on this token, not on the `X-ANS-*` headers.** Those headers stay as information only:
+any hop between the gateway and the upstream can set a header, but only the gateway's key can
+sign the token, and its `aud` names one upstream.
+
+The header is `{"alg":"ES256","typ":"txntoken+jwt","kid":<RFC 7638 thumbprint>}`. The claims:
+
+| Claim | Value |
+|---|---|
+| `iss`, `aud` | `transactionToken.issuer`, `transactionToken.audience` |
+| `iat`, `exp` | now, now + `ttl` |
+| `jti` | 128 random bits |
+| `txn` | the gateway's request id (`x-request-id`), or 128 random bits when there is none |
+| `sub` | the user (`sub` of the instance token); in certificate mode, the caller's ANS name |
+| `act` | instance mode only: `{"sub":"instance:<cnf.jkt>"}`, with the instance token's own `act` nested inside as the prior actor (RFC 8693 section 4.1) |
+| `cnf.jkt` | the key that signed the request's DPoP proof |
+| `scope`, `authorization_details` | copied from the instance token when present |
+| `ans_issuer` | instance mode only: `{host, ans_name, cert_fp}`, the issuer and the SHA-256 of its identity certificate |
+| `rctx` | `{method, path}` of the request, without the query |
+
+The public key is served as a JWK Set (`kid`, `alg` ES256, `use` sig) at
+`GET /.well-known/jwks.json` on the health and metrics listener (`httpListen`, loopback by
+default), so an upstream on the same host can fetch it. The route exists only while transaction
+tokens are on. To rotate the key, publish the new key file and restart; upstreams should
+refetch the JWKS when they meet an unknown `kid`.
+
+An upstream checks: the signature under the JWKS key named by `kid`; `typ`; `iss`; `aud` is its
+own name; `exp` (allow a few seconds of skew); then authorizes on `sub`, `act`, `scope` and
+`authorization_details`. A client-supplied header of the configured name is overwritten on every
+allow and removed when minting is off, so it never reaches the upstream in either mode. A
+failure to mint denies the request (503 `INTERNAL_ERROR`) rather than allowing it without a
+token.
+
+Limits: the token is a bearer credential between the gateway and the upstream, so that hop
+should be loopback or TLS. Its `jti` is unique, but the upstream must keep its own replay cache
+if it needs single use within `ttl`.
 
 ### Authority rule (ANS-6 section 7.7)
 

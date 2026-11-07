@@ -237,6 +237,13 @@ func (v *Verifier) instanceDecision(ctx context.Context, r *Request, base, tok s
 	if err := v.admitInstance(ctx, it, proof, now); err != nil {
 		return Decision{}, err
 	}
+	claims, err := instanceTxnClaims(it)
+	if err != nil {
+		return Decision{}, &deniedError{denial: withDetail(deny(http.StatusServiceUnavailable, CategoryInternalError), err)}
+	}
+	if d = v.attachTxn(d, r, claims); !d.Allowed {
+		return Decision{}, &deniedError{denial: d.Deny}
+	}
 	return d, nil
 }
 

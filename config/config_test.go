@@ -140,6 +140,13 @@ instanceMode:
     - host: issuer.example.test
       agentId: 00000000-0000-4000-8000-000000000001
       tl: local
+transactionToken:
+  enabled: true
+  signingKeyFile: /etc/ans-authz/txn.pem
+  issuer: https://gw.example.test
+  audience: upstream.example.test
+  ttl: 90s
+  header: X-Txn-Token
 transparencyLogs:
   - name: local
     baseURL: http://127.0.0.1:18081
@@ -180,6 +187,8 @@ readiness:
 			InstanceMode: authz.InstanceMode{Enabled: true, AllowedIssuers: []string{"issuer.example.test"},
 				ExpectedAud: "gw.example.com", MaxInstancesPerSub: 3, MaxStatusAge: 5 * time.Minute,
 				Issuers: []authz.InstanceIssuer{{Host: "issuer.example.test", AgentID: "00000000-0000-4000-8000-000000000001", TL: "local"}}},
+			TransactionToken: authz.TransactionToken{Enabled: true, SigningKeyFile: "/etc/ans-authz/txn.pem",
+				Issuer: "https://gw.example.test", Audience: "upstream.example.test", TTL: 90 * time.Second, Header: "X-Txn-Token"},
 		},
 		TransparencyLogs: []TransparencyLog{
 			{Name: "local", BaseURL: "http://127.0.0.1:18081", AllowInsecure: true, Timeout: 500 * time.Millisecond},

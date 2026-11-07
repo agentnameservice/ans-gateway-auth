@@ -784,7 +784,9 @@ func TestVerifyCallerContext(t *testing.T) {
 
 func TestVerifyAllowContract(t *testing.T) {
 	t.Parallel()
-	instanceRemovals := []string{"x-ans-instance-sub", "x-ans-act", "x-ans-scope", "x-ans-authorization-details"}
+	// The instance-only headers and the transaction-token header (minting
+	// off here) are stripped in every mode.
+	instanceRemovals := []string{"x-ans-instance-sub", "x-ans-act", "x-ans-scope", "x-ans-authorization-details", "txn-token"}
 	tests := []struct {
 		name       string
 		strip      bool
