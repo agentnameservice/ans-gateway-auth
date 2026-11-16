@@ -10,6 +10,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /out/ans-authz /ans-authz
+COPY LICENSE NOTICE /usr/share/licenses/ans/
+COPY LICENSES/MIT.txt /usr/share/licenses/ans/LICENSES/MIT.txt
+LABEL org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 # The image ships no configuration: mount one at /etc/ans-authz/config.yaml.
 # The gRPC listener keeps the loopback default unless the mounted file or
 # ANS_AUTHZ_GRPC_LISTEN says otherwise; the HTTP listener binds all interfaces
