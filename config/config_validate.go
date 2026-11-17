@@ -32,6 +32,9 @@ func (c Config) Validate() error {
 	if err := c.validateTransparencyLogs(); err != nil {
 		return err
 	}
+	if err := c.validateIssuerLogs(); err != nil {
+		return err
+	}
 	if err := c.Replay.validate(c.CheckTimeout); err != nil {
 		return err
 	}
@@ -67,6 +70,10 @@ func (c Config) Warnings() []string {
 				"transparencyLogs %q fetches root keys over plaintext from non-loopback %s; an on-path host can inject trust, pin rootKeys", tl.Name, u.Host))
 		}
 	}
+	if c.TransactionToken.Enabled && !isLoopbackHost(hostOf(c.HTTPListen)) {
+		warnings = append(warnings, fmt.Sprintf(
+			"transactionToken is enabled and httpListen %s is not loopback; /.well-known/jwks.json is served there over plain HTTP, so an on-path host can substitute the upstreams' verification key", c.HTTPListen))
+	}
 	if c.RequiredContext == nil {
 		warnings = append(warnings, "requiredContext is not set; a route that stops forwarding the request body cannot be detected for body-less requests")
 	}
@@ -76,12 +83,24 @@ func (c Config) Warnings() []string {
 	if c.GRPC.TokenClaimsNamespace == envoyJWTAuthnNamespace {
 		warnings = append(warnings, "grpc.tokenClaimsNamespace is envoy.filters.http.jwt_authn, which every filter in the chain can write; forwarded cnf.jkt claims are only as trustworthy as that chain")
 	}
+	if im := c.InstanceMode; im.Enabled && im.MaxStatusAge == 0 {
+		warnings = append(warnings, "instanceMode.maxStatusAge is 0; a presented status token is trusted until its own exp (about an hour), so an issuer's revocation can take that long to land; set maxStatusAge, e.g. 240s")
+	}
+	if im := c.InstanceMode; im.Enabled && im.MaxStatusAge > maxUsefulStatusAge {
+		warnings = append(warnings, fmt.Sprintf(
+			"instanceMode.maxStatusAge %s is over %s, longer than a TL status token usually lives; status_stale cannot fire before status_expired, and a 410 is noticed only every maxStatusAge/2",
+			im.MaxStatusAge, maxUsefulStatusAge))
+	}
 	if r := c.Replay.Redis; c.Replay.Type == ReplayTypeRedis && r != nil && !r.TLS && !isLoopbackHost(hostOf(r.Addr)) {
 		warnings = append(warnings, fmt.Sprintf(
 			"replay.redis.tls is false for non-loopback %s; proof identifiers and the keyspace sentinel travel in plaintext", r.Addr))
 	}
 	return warnings
 }
+
+// maxUsefulStatusAge is about the lifetime of a TL status token; a longer
+// maxStatusAge never refuses status_stale before the token's exp does.
+const maxUsefulStatusAge = time.Hour
 
 // hostOf strips the port from a host:port address.
 func hostOf(addr string) string {
@@ -106,6 +125,34 @@ func (c Config) validateTransparencyLogs() error {
 		names[tl.Name] = true
 	}
 	return nil
+}
+
+// validateIssuerLogs requires every instanceMode.issuers entry to name a
+// transparency log with a baseURL, the log its status token is fetched from.
+func (c Config) validateIssuerLogs() error {
+	if !c.InstanceMode.Enabled {
+		return nil
+	}
+	for i, is := range c.InstanceMode.Issuers {
+		tl, ok := c.TransparencyLog(is.TL)
+		switch {
+		case !ok:
+			return fmt.Errorf("config: instanceMode.issuers[%d]: tl %q is not a transparencyLogs entry", i, is.TL)
+		case tl.BaseURL == "":
+			return fmt.Errorf("config: instanceMode.issuers[%d]: tl %q has no baseURL to fetch the status token from", i, is.TL)
+		}
+	}
+	return nil
+}
+
+// TransparencyLog returns the transparencyLogs entry with this name.
+func (c Config) TransparencyLog(name string) (TransparencyLog, bool) {
+	for _, tl := range c.TransparencyLogs {
+		if tl.Name == name {
+			return tl, true
+		}
+	}
+	return TransparencyLog{}, false
 }
 
 func (tl TransparencyLog) validate(checkTimeout time.Duration) error {

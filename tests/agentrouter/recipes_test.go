@@ -389,3 +389,61 @@ func walk(node any, visit func(key string, value map[string]any)) {
 		}
 	}
 }
+
+// TestRecipesRejectUnderscoreHeaders requires every Envoy Gateway recipe that
+// fronts the verifier to pin ClientTrafficPolicy headers.withUnderscoresAction
+// to RejectRequest on the Gateway it protects. Envoy Gateway v1.9.2 (the one
+// Agent Router v1.2.0 pins) already defaults to REJECT_REQUEST, but raw Envoy
+// defaults to ALLOW; the recipe states the rule so a changed default or a
+// copied listener cannot let a client's X_ANS_Act reach an upstream that folds
+// header names onto the verifier's X-ANS-Act.
+func TestRecipesRejectUnderscoreHeaders(t *testing.T) {
+	t.Parallel()
+	for _, rel := range []string{
+		"standalone/aigw-ans-llm.yaml",
+		"standalone/aigw-ans-mcp.yaml",
+		"kubernetes/securitypolicy-gateway.yaml",
+	} {
+		path := filepath.Join(recipesDir(t), rel)
+		docs := yamlDocs(t, path)
+		gateways := map[string]bool{}
+		for _, doc := range docs {
+			if doc["kind"] == "Gateway" {
+				gateways[dig(t, doc, "metadata")["name"].(string)] = true
+			}
+			if doc["kind"] == "SecurityPolicy" {
+				for _, ref := range dig(t, doc, "spec")["targetRefs"].([]any) {
+					if m, _ := ref.(map[string]any); m["kind"] == "Gateway" {
+						gateways[m["name"].(string)] = true
+					}
+				}
+			}
+		}
+		if len(gateways) == 0 {
+			t.Fatalf("%s: no Gateway found to protect", rel)
+		}
+		covered := map[string]bool{}
+		for _, doc := range docs {
+			if doc["kind"] != "ClientTrafficPolicy" {
+				continue
+			}
+			spec := dig(t, doc, "spec")
+			if dig(t, spec, "headers")["withUnderscoresAction"] != "RejectRequest" {
+				t.Errorf("%s: ClientTrafficPolicy headers.withUnderscoresAction = %v, want RejectRequest",
+					rel, dig(t, spec, "headers")["withUnderscoresAction"])
+				continue
+			}
+			refs, _ := spec["targetRefs"].([]any)
+			for _, ref := range refs {
+				if m, _ := ref.(map[string]any); m["kind"] == "Gateway" {
+					covered[m["name"].(string)] = true
+				}
+			}
+		}
+		for gw := range gateways {
+			if !covered[gw] {
+				t.Errorf("%s: Gateway %q has no ClientTrafficPolicy rejecting underscore headers", rel, gw)
+			}
+		}
+	}
+}

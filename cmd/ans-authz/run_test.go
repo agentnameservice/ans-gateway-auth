@@ -2,8 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +108,7 @@ func TestRunStartupFailures(t *testing.T) {
 		want string
 	}{
 		{name: "transparency log unreachable", yaml: configYAML(remoteTL(failing.URL)), want: "no root keys after"},
+		{name: "transaction token key file missing", yaml: txnYAML(pinnedTL(tr.line), "/nonexistent/txn.pem"), want: "transactionToken.signingKeyFile"},
 		{
 			name: "grpc port taken", yaml: configYAML(pinnedTL(tr.line)),
 			args: []string{"--grpc-listen", taken.Addr().String()}, want: "grpc listen",
@@ -115,6 +123,56 @@ func TestRunStartupFailures(t *testing.T) {
 			}
 			if !strings.Contains(stderr.String(), tt.want) {
 				t.Fatalf("stderr = %s, want %q", stderr.String(), tt.want)
+			}
+		})
+	}
+}
+
+// TestRunCheckLoadsTxnKey: --check reads the transaction-token signing key
+// as startup does, so a key startup would refuse fails --check too.
+func TestRunCheckLoadsTxnKey(t *testing.T) {
+	tr := newTrust(t)
+	good, _ := writeTxnKey(t)
+	readable := filepath.Join(t.TempDir(), "readable.pem")
+	raw, err := os.ReadFile(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readable, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readable, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(p384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCurve := filepath.Join(t.TempDir(), "p384.pem")
+	if err := os.WriteFile(wrongCurve, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, key, want string
+		code            int
+	}{
+		{"usable key", good, "configuration OK", exitOK},
+		{"missing key", filepath.Join(t.TempDir(), "missing.pem"), "transactionToken.signingKeyFile", exitUsage},
+		{"group-readable key", readable, "readable by group or others", exitUsage},
+		{"P-384 key", wrongCurve, "P-256", exitUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr syncBuffer
+			args := []string{"--config", writeConfig(t, txnYAML(pinnedTL(tr.line), tc.key)), "--check"}
+			if got := run(context.Background(), args, &stdout, &stderr); got != tc.code {
+				t.Fatalf("exit = %d, want %d; stdout %s stderr %s", got, tc.code, stdout.String(), stderr.String())
+			}
+			if out := stdout.String() + stderr.String(); !strings.Contains(out, tc.want) {
+				t.Fatalf("output %q, want %q", out, tc.want)
 			}
 		})
 	}

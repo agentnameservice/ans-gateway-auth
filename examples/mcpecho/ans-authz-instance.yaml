@@ -1,0 +1,78 @@
+# ans-authz configuration for instance-mode callers in front of mcpecho
+# (local development). Pair it with examples/agentgateway/config-mcp.yaml,
+# whose MCP listener on 127.0.0.1:3000 forwards to mcpecho on :3001.
+#
+# Two caller modes share this verifier. A caller with its own ANS identity
+# certificate takes certificate mode, unchanged. A local agent instance with
+# only a P-256 key presents `Authorization: DPoP <instance token>` signed by
+# an issuer listed below, a bare-jwk DPoP proof, and the issuer's
+# X-ANS-Status-Token, with no X-SCITT-Receipt.
+transparencyLogs:
+- name: local-tl
+  baseURL: http://localhost:18081
+  allowInsecure: true          # plain http is for local stacks only
+  # rootKeys:                  # pin the TL root keys that sign the issuer's status token
+  # - ans-local-dev+01234567+AgI...
+
+trustedHosts:
+- http://127.0.0.1:3000        # config-mcp.yaml
+
+requiredContext:
+  key: ans-authz
+  value: body-forwarded
+requireTokenClaims: false
+
+instanceMode:
+  enabled: true
+  # The issuers whose instance tokens are accepted: the host in each
+  # issuer's ans:// name, never a URL. Checked before any key or TL lookup.
+  allowedIssuers: [issuer.example.test]
+  # The aud every token must carry; empty means the host of the matched
+  # trustedHosts entry (here 127.0.0.1). Name your gateway's public host.
+  expectedAud: gateway.example.test
+  # At most this many distinct instance keys per issuer sub while their
+  # tokens live (Sybil bound). Per process.
+  maxInstancesPerSub: 5
+  # The verifier keeps each issuer's TL status token itself, fetched in the
+  # background every maxStatusAge/2 (2 min here, up to 20% sooner), and
+  # refuses a request (status_stale) when neither its cached token nor the
+  # one the client presents was issued within maxStatusAge. A revocation is
+  # then seen within maxStatusAge plus the TL's publish delay, whatever the
+  # client sends. No request ever calls the TL.
+  maxStatusAge: 240s
+  # One entry per allowedIssuers host: the issuer's ANS agent id (a UUID)
+  # and the transparencyLogs entry, with a baseURL, that serves its
+  # /v1/agents/<agentId>/status-token.
+  issuers:
+  - host: issuer.example.test
+    agentId: 00000000-0000-4000-8000-000000000001
+    tl: local-tl
+
+# A signed, 60-second token for the upstream on every allow; upstreams
+# authorize on it rather than on the X-ANS-* headers. The verification key is
+# served at http://127.0.0.1:9192/.well-known/jwks.json.
+# transactionToken:
+#   enabled: true
+#   signingKeyFile: /etc/ans-authz/txn.pem   # PEM P-256 key; never generated
+#   issuer: https://gateway.example.test
+#   audience: mcpecho.example.test
+#   ttl: 60s
+#   header: Txn-Token
+
+# Instance mode maps agent_id and jkt to the instance key, so a gateway
+# keying its MCP session on this header gives every instance its own session.
+extraIdentityHeaders:
+  x-mcp-session-subject: agent_id
+
+maxContentBytes: 1048576
+requireReceipt: true
+popSkew: 120s
+stripIdentityHeaders: true
+checkTimeout: 1500ms
+replay:
+  type: memory
+  maxEntries: 100000
+grpc:
+  listen: 127.0.0.1:9191
+httpListen: 127.0.0.1:9192
+logLevel: info

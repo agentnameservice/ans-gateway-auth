@@ -130,6 +130,18 @@ func (k *Keyring) Get(kid [4]byte) (*scitt.TrustedKey, error) {
 	return nil, &scitt.SignatureError{Type: scitt.SigErrUnknownKeyID, Kid: kid, Message: "unknown key ID"}
 }
 
+// HoldsKey reports whether kid resolves, as Get resolves it, to the named
+// source, so a status token that verified under kid was signed by that
+// source's transparency log.
+func (k *Keyring) HoldsKey(source string, kid [4]byte) bool {
+	for i := range k.sources {
+		if tk, err := k.sources[i].Lookup.Get(kid); err == nil && tk != nil {
+			return k.sources[i].Name == source
+		}
+	}
+	return false
+}
+
 // RefreshFor refreshes the stale refreshable sources on behalf of a request
 // whose kid is unknown. One fetch runs at a time, on a background context
 // bounded by each source's Timeout, so a cancelled caller cannot fail it for
