@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.9
 
 require (
-	github.com/agentnameservice/ans-sdk-go v0.1.20
+	github.com/agentnameservice/ans-sdk-go v0.2.0
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
@@ -22,7 +22,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
-	github.com/fxamacker/cbor/v2 v2.9.6 // indirect
+	github.com/fxamacker/cbor/v2 v2.10.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/miekg/dns v1.1.73 // indirect
