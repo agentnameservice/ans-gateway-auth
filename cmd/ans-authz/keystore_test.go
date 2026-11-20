@@ -89,7 +89,7 @@ func TestKeyStoreStatic(t *testing.T) {
 	}
 }
 
-func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
+func TestKeyStoreRefreshKeepsCachedKeys(t *testing.T) {
 	t.Parallel()
 	pinned, a, b := newTestKey(t, "pinned"), newTestKey(t, "a"), newTestKey(t, "b")
 	log := &fakeLog{lines: []string{a.line}}
@@ -101,15 +101,14 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 		serve    []string
 		err      error
 		wantKeys []testKey
-		wantGone []testKey
 		wantErr  bool
 	}{
 		{name: "first fetch adds a", serve: []string{a.line}, wantKeys: []testKey{pinned, a}},
-		{name: "log rotates to b and withdraws a", serve: []string{b.line}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}},
-		{name: "fetch failure keeps the previous snapshot", serve: nil, err: errors.New("503"), wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
-		{name: "unparseable payload keeps the previous snapshot", serve: []string{"<html>", "503 Service Unavailable"}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
-		{name: "empty payload keeps the previous snapshot", serve: []string{}, wantKeys: []testKey{pinned, b}, wantGone: []testKey{a}, wantErr: true},
-		{name: "log serves the pinned key only", serve: []string{pinned.line}, wantKeys: []testKey{pinned}, wantGone: []testKey{a, b}},
+		{name: "log serves b and omits a", serve: []string{b.line}, wantKeys: []testKey{pinned, a, b}},
+		{name: "fetch failure keeps the previous snapshot", serve: nil, err: errors.New("503"), wantKeys: []testKey{pinned, a, b}, wantErr: true},
+		{name: "unparseable payload keeps the previous snapshot", serve: []string{"<html>", "503 Service Unavailable"}, wantKeys: []testKey{pinned, a, b}, wantErr: true},
+		{name: "empty payload keeps the previous snapshot", serve: []string{}, wantKeys: []testKey{pinned, a, b}, wantErr: true},
+		{name: "log serves the pinned key only", serve: []string{pinned.line}, wantKeys: []testKey{pinned, a, b}},
 	}
 	var lastRefreshed = s.LastRefreshed()
 	for _, st := range steps {
@@ -121,11 +120,6 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 		for _, k := range st.wantKeys {
 			if _, err := s.Get(k.kid); err != nil {
 				t.Fatalf("%s: Get(%s) = %v, want present", st.name, k.line[:6], err)
-			}
-		}
-		for _, k := range st.wantGone {
-			if _, err := s.Get(k.kid); err == nil {
-				t.Fatalf("%s: withdrawn key still trusted", st.name)
 			}
 		}
 		if s.Len() != len(st.wantKeys) {
@@ -150,7 +144,7 @@ func TestKeyStoreRefreshReplacesFetchedKeys(t *testing.T) {
 		t.Fatalf("key-set changes must be logged: %s", logs)
 	}
 	if !strings.Contains(logs, `level=WARN msg="root keys refreshed"`) || !strings.Contains(logs, fmt.Sprintf("a/%x", a.kid)) {
-		t.Fatalf("withdrawing a key must be logged at WARN naming the key: %s", logs)
+		t.Fatalf("a response that omits a cached key must be logged at WARN naming the key: %s", logs)
 	}
 	if !strings.Contains(logs, fmt.Sprintf("b/%x", b.kid)) {
 		t.Fatalf("adding a key must be logged naming the key: %s", logs)

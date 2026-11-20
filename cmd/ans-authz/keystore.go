@@ -12,13 +12,11 @@ import (
 )
 
 // keyStore is one transparency log's trusted keys: the pinned set from the
-// configuration plus whatever the log served at the last successful fetch.
-// Every refresh replaces the fetched set instead of accumulating, so a key
-// the log withdraws stops being trusted at the next refresh rather than
-// surviving until a restart. Pinned keys are never dropped.
+// configuration plus every key the log has served since startup. Refreshes
+// merge additively and never drop a cached key, even one a later response
+// omits (ANS-6 section 4.5, ANS-4 section 5.1).
 type keyStore struct {
 	name   string
-	pinned *scitt.KeyStore
 	client scitt.Client
 	logger *slog.Logger
 
@@ -29,7 +27,7 @@ type keyStore struct {
 }
 
 func newKeyStore(name string, pinned *scitt.KeyStore, client scitt.Client, logger *slog.Logger) *keyStore {
-	return &keyStore{name: name, pinned: pinned, client: client, logger: logger, current: pinned}
+	return &keyStore{name: name, client: client, logger: logger, current: pinned}
 }
 
 // Get implements scitt.KeyLookup over the current snapshot.
@@ -40,11 +38,12 @@ func (s *keyStore) Get(kid [4]byte) (*scitt.TrustedKey, error) {
 	return current.Get(kid)
 }
 
-// DoRefresh fetches the log's root keys and installs pinned ∪ fetched as the
-// new snapshot. A static store (no client) is a no-op; a failed fetch, or one
-// in which no line parsed, keeps the previous snapshot and does not count as a
-// refresh. Every change to the fetched set is logged, at WARN when a key was
-// withdrawn or a kid collided with a key of another name.
+// DoRefresh fetches the log's root keys and merges them into the current
+// snapshot. A static store (no client) is a no-op; a failed fetch, or one in
+// which no line parsed, keeps the previous snapshot and does not count as a
+// refresh. Every change to the served set is logged, at WARN when the response
+// omits a previously served key (which stays trusted) or a kid collided with a
+// key of another name.
 func (s *keyStore) DoRefresh(ctx context.Context) error {
 	if s.client == nil {
 		return nil
@@ -54,14 +53,15 @@ func (s *keyStore) DoRefresh(ctx context.Context) error {
 		s.logger.WarnContext(ctx, "root-key fetch failed", "error", err)
 		return fmt.Errorf("fetch root keys: %w", err)
 	}
-	merged, result := s.pinned.MergeFrom(lines)
-	if result.Added+result.SkippedDuplicate == 0 {
-		return fmt.Errorf("fetch root keys: none of %d lines parsed", len(lines))
-	}
 	fetched := parseKids(lines)
-	now := time.Now()
 	s.mu.Lock()
 	previous, previousFetched := s.current, s.fetched
+	merged, result := previous.MergeFrom(lines)
+	if result.Added+result.SkippedDuplicate == 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("fetch root keys: none of %d lines parsed", len(lines))
+	}
+	now := time.Now()
 	s.current, s.fetched, s.lastRefreshed = merged, fetched, &now
 	s.mu.Unlock()
 	added, removed := onlyIn(fetched, previousFetched), onlyIn(previousFetched, fetched)
