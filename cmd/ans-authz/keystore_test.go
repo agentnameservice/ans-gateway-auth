@@ -47,6 +47,7 @@ func (*fakeLog) FetchStatusToken(context.Context, string) ([]byte, error) {
 type testKey struct {
 	line string
 	kid  [4]byte
+	pub  *ecdsa.PublicKey
 }
 
 func newTestKey(t *testing.T, name string) testKey {
@@ -62,7 +63,7 @@ func newTestKey(t *testing.T, name string) testKey {
 	sum := sha256.Sum256(spki)
 	var kid [4]byte
 	copy(kid[:], sum[:4])
-	return testKey{line: c2spLine(t, name, &priv.PublicKey), kid: kid}
+	return testKey{line: c2spLine(t, name, &priv.PublicKey), kid: kid, pub: &priv.PublicKey}
 }
 
 func mustStore(t *testing.T, lines ...string) *scitt.KeyStore {
@@ -109,6 +110,7 @@ func TestKeyStoreRefreshKeepsCachedKeys(t *testing.T) {
 		{name: "unparseable payload keeps the previous snapshot", serve: []string{"<html>", "503 Service Unavailable"}, wantKeys: []testKey{pinned, a, b}, wantErr: true},
 		{name: "empty payload keeps the previous snapshot", serve: []string{}, wantKeys: []testKey{pinned, a, b}, wantErr: true},
 		{name: "log serves the pinned key only", serve: []string{pinned.line}, wantKeys: []testKey{pinned, a, b}},
+		{name: "a's kid under another name keeps the cached key", serve: []string{c2spLine(t, "other", a.pub)}, wantKeys: []testKey{pinned, a, b}},
 	}
 	var lastRefreshed = s.LastRefreshed()
 	for _, st := range steps {
@@ -148,5 +150,11 @@ func TestKeyStoreRefreshKeepsCachedKeys(t *testing.T) {
 	}
 	if !strings.Contains(logs, fmt.Sprintf("b/%x", b.kid)) {
 		t.Fatalf("adding a key must be logged naming the key: %s", logs)
+	}
+	if tk, err := s.Get(a.kid); err != nil || tk.Name != "a" {
+		t.Fatalf("Get(a) = %v, %v; the first-seen key must win a kid collision", tk, err)
+	}
+	if !strings.Contains(logs, fmt.Sprintf("collisions=[%x]", a.kid)) {
+		t.Fatalf("a kid collision must be logged naming the kid: %s", logs)
 	}
 }

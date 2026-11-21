@@ -64,17 +64,17 @@ func (s *keyStore) DoRefresh(ctx context.Context) error {
 	now := time.Now()
 	s.current, s.fetched, s.lastRefreshed = merged, fetched, &now
 	s.mu.Unlock()
-	added, removed := onlyIn(fetched, previousFetched), onlyIn(previousFetched, fetched)
-	if len(added)+len(removed)+result.SkippedUnparseable+len(result.Collisions) == 0 {
+	added, omitted := onlyIn(fetched, previousFetched), onlyIn(previousFetched, fetched)
+	if len(added)+len(omitted)+result.SkippedUnparseable+len(result.Collisions) == 0 {
 		return nil
 	}
 	level := slog.LevelInfo
-	if len(removed) > 0 || len(result.Collisions) > 0 {
+	if len(omitted) > 0 || len(result.Collisions) > 0 {
 		level = slog.LevelWarn
 	}
 	s.logger.Log(ctx, level, "root keys refreshed",
 		"log", s.name, "keys_before", previous.Len(), "keys_after", merged.Len(), "fetched", len(lines),
-		"added", added, "removed", removed, "unparseable", result.SkippedUnparseable, "collisions", result.Collisions)
+		"added", added, "omitted", omitted, "unparseable", result.SkippedUnparseable, "collisions", result.Collisions)
 	return nil
 }
 
