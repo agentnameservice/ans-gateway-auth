@@ -134,11 +134,11 @@ two-second ext_authz budget, when root keys are fetched over plaintext from a no
 
 ### Trust material
 
-A transparency log's trusted keys are the pinned `rootKeys` plus whatever its `/root-keys`
-endpoint served at the last successful fetch. Each refresh replaces the fetched set rather than
-accumulating, so a key the log withdraws stops being trusted at the next refresh (every
-`keyRefreshInterval`, or on demand when a proof names an unknown key id, bounded by cooldowns).
-Pinned keys are never dropped and fetched keys are trusted exactly like pinned ones, so the log
+A transparency log's trusted keys are the pinned `rootKeys` plus every key its `/root-keys`
+endpoint has served since startup. Each refresh (every `keyRefreshInterval`, or on demand when a
+proof names an unknown key id, bounded by cooldowns) merges the response into the cached set: a
+key the response omits stays trusted and is logged at WARN, since ANS-6 section 4.5 makes the
+set append-only. Fetched keys are trusted exactly like pinned ones, so the log
 endpoint's TLS identity is part of the trust chain: use `https://` with a certificate you trust,
 and treat `allowInsecure` as a loopback development setting. Status tokens are accepted up to
 ten minutes past their expiry (an SDK constant), so revocation latency at the verifier is the
