@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.1](https://github.com/agentnameservice/ans-gateway-auth/compare/v0.1.0...v0.1.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **authz:** keep cached root keys when a refresh omits them ([#25](https://github.com/agentnameservice/ans-gateway-auth/issues/25)) ([ea3cd3b](https://github.com/agentnameservice/ans-gateway-auth/commit/ea3cd3b9d9a6b5e16990da46dff22043a1735abe))
+
+
+### Miscellaneous
+
+* adopt ANS governance and contribution licensing ([#5](https://github.com/agentnameservice/ans-gateway-auth/issues/5)) ([b116a31](https://github.com/agentnameservice/ans-gateway-auth/commit/b116a31af17c5238a5a9549f579350b2bc18b9fc))
+* **deps:** Bump actions/setup-go ([#26](https://github.com/agentnameservice/ans-gateway-auth/issues/26)) ([814d220](https://github.com/agentnameservice/ans-gateway-auth/commit/814d2205a3aebd4b52782106c3a7056fa5741449))
+* **deps:** Bump github.com/agentnameservice/ans-sdk-go ([#22](https://github.com/agentnameservice/ans-gateway-auth/issues/22)) ([b5398da](https://github.com/agentnameservice/ans-gateway-auth/commit/b5398da01e473e97cf29c84efa5ff0b30cd0db41))
+* **deps:** Bump golang from `972b411` to `4fa7c96` ([#21](https://github.com/agentnameservice/ans-gateway-auth/issues/21)) ([3c5ff45](https://github.com/agentnameservice/ans-gateway-auth/commit/3c5ff454029fb43a6ce7a9e1b5e8bf545ac5cdac))
+
 ## 0.1.0 (2026-11-05)
 
 
