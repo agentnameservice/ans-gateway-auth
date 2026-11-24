@@ -98,6 +98,26 @@ func TestKeyringGet(t *testing.T) {
 	}
 }
 
+// TestKeyringHoldsKey names the source Get resolves a kid through, so a
+// kid two logs share belongs only to the first.
+func TestKeyringHoldsKey(t *testing.T) {
+	t.Parallel()
+	first := newMapLookup(trustedKey("first", 1))
+	second := newMapLookup(trustedKey("second", 2), trustedKey("second-too", 1))
+	k := mustKeyring(t, NoopObserver{}, KeySource{Name: "one", Lookup: first}, KeySource{Name: "two", Lookup: second})
+	for _, tc := range []struct {
+		source string
+		kid    byte
+		want   bool
+	}{
+		{"one", 1, true}, {"two", 1, false}, {"two", 2, true}, {"one", 2, false}, {"one", 9, false}, {"absent", 1, false},
+	} {
+		if got := k.HoldsKey(tc.source, kidOf(tc.kid)); got != tc.want {
+			t.Errorf("HoldsKey(%q, %d) = %v, want %v", tc.source, tc.kid, got, tc.want)
+		}
+	}
+}
+
 func TestKeyringRefreshForSingleFlight(t *testing.T) {
 	const (
 		timeout       = 50 * time.Millisecond

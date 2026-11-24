@@ -1,0 +1,1438 @@
+package authz
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"log/slog"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
+)
+
+// The tests below drive the gateway-owned issuer status cache: tokens the
+// verifier fetched from the TL in the background, compared by iat with the
+// one the client presents. They reuse the cross-language "valid" vector's
+// instance token and DPoP proof, and mint the status tokens themselves under
+// a test TL key, so each case controls iat, exp and status exactly.
+
+const testMaxStatusAge = 240 * time.Second
+
+// Minimal CBOR encoding (RFC 8949) for minting status tokens in tests, so the
+// module needs no direct CBOR dependency.
+func cborHead(major byte, n uint64) []byte {
+	switch {
+	case n < 24:
+		return []byte{major<<5 | byte(n)}
+	case n <= 0xff:
+		return []byte{major<<5 | 24, byte(n)}
+	case n <= 0xffff:
+		return []byte{major<<5 | 25, byte(n >> 8), byte(n)}
+	case n <= 0xffffffff:
+		b := []byte{major<<5 | 26, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(b[1:], uint32(n))
+		return b
+	default:
+		b := make([]byte, 9)
+		b[0] = major<<5 | 27
+		binary.BigEndian.PutUint64(b[1:], n)
+		return b
+	}
+}
+
+func cborInt(v int64) []byte {
+	if v >= 0 {
+		return cborHead(0, uint64(v))
+	}
+	return cborHead(1, uint64(-1-v))
+}
+
+func cborBytes(b []byte) []byte { return append(cborHead(2, uint64(len(b))), b...) }
+func cborText(s string) []byte  { return append(cborHead(3, uint64(len(s))), s...) }
+
+func cborArray(items ...[]byte) []byte {
+	out := cborHead(4, uint64(len(items)))
+	for _, it := range items {
+		out = append(out, it...)
+	}
+	return out
+}
+
+// cborMap takes alternating encoded keys and values.
+func cborMap(kv ...[]byte) []byte {
+	out := cborHead(5, uint64(len(kv)/2))
+	for _, it := range kv {
+		out = append(out, it...)
+	}
+	return out
+}
+
+// statusHarness is one issuer, one test TL key and one shared status cache.
+type statusHarness struct {
+	t       *testing.T
+	iv      *instanceVectors
+	vec     instanceVector
+	tlKey   *ecdsa.PrivateKey
+	line    string
+	kid     [4]byte
+	keys    *countingKeys
+	cache   *MemoryStatusCache
+	ansName string
+	certFP  [32]byte
+}
+
+func newStatusHarness(t *testing.T) *statusHarness {
+	t.Helper()
+	iv := loadInstanceVectors(t)
+	vec := validInstanceVector(t, iv)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(spki)
+	var kid [4]byte
+	copy(kid[:], sum[:4])
+	line := "status-tl+" + hex.EncodeToString(kid[:]) + "+" + base64.StdEncoding.EncodeToString(spki)
+	store, err := scitt.NewKeyStore(append([]string{line}, iv.RootKeys...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := parseInstanceToken(vec.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &statusHarness{
+		t: t, iv: iv, vec: vec, tlKey: key, line: line, kid: kid,
+		keys:    &countingKeys{inner: mustKeyring(t, NoopObserver{}, KeySource{Name: "test-tl", Lookup: store})},
+		cache:   NewMemoryStatusCache(),
+		ansName: vec.Expect.AnsName, certFP: sha256.Sum256(it.certDER),
+	}
+}
+
+func (h *statusHarness) issuer() string { return h.iv.AllowedIssuers[0] }
+
+// mintFor signs a status token under the harness TL key; iat and exp are
+// offsets in seconds from the vectors' fixed clock.
+func (h *statusHarness) mintFor(agentID, ansName string, status scitt.AgentStatus, iatOff, expOff int64) []byte {
+	h.t.Helper()
+	protected := cborMap(cborInt(1), cborInt(-7), cborInt(4), cborBytes(h.kid[:]))
+	payload := cborMap(
+		cborInt(1), cborText(agentID),
+		cborInt(2), cborText(string(status)),
+		cborInt(3), cborInt(h.iv.Now+iatOff),
+		cborInt(4), cborInt(h.iv.Now+expOff),
+		cborInt(5), cborText(ansName),
+		cborInt(6), cborArray(cborMap(cborInt(1), cborBytes(h.certFP[:]))),
+	)
+	digest, err := scitt.ComputeSigStructureDigest(protected, payload)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	r, s, err := ecdsa.Sign(rand.Reader, h.tlKey, digest[:])
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	sig := make([]byte, es256SigLen)
+	r.FillBytes(sig[:p256CoordLen])
+	s.FillBytes(sig[p256CoordLen:])
+	return append(cborHead(6, 18), cborArray(cborBytes(protected), cborMap(), cborBytes(payload), cborBytes(sig))...)
+}
+
+func (h *statusHarness) mint(status scitt.AgentStatus, iatOff int64) []byte {
+	return h.mintFor(h.iv.AgentID, h.ansName, status, iatOff, iatOff+3600)
+}
+
+func (h *statusHarness) config() Config {
+	cfg := h.iv.config()
+	cfg.InstanceMode.MaxStatusAge = testMaxStatusAge
+	cfg.InstanceMode.Issuers = []InstanceIssuer{{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl"}}
+	return cfg
+}
+
+// verifier shares the harness cache, never reports a replay (so one vector
+// request can be presented many times) and runs on the vectors' clock.
+func (h *statusHarness) verifier() *Verifier {
+	h.t.Helper()
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(h.config(), h.keys, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		h.t.Fatalf("NewVerifier: %v", err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	return v
+}
+
+func (h *statusHarness) request(statusToken []byte) *Request {
+	h.t.Helper()
+	r := h.vec.request(h.t)
+	r.Header.Set(scitt.HeaderStatusToken, base64.StdEncoding.EncodeToString(statusToken))
+	return r
+}
+
+// fetcher is a scripted StatusFetcher that counts calls.
+type fetcher struct {
+	mu    sync.Mutex
+	raw   []byte
+	err   error
+	calls atomic.Int64
+}
+
+func (f *fetcher) set(raw []byte, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.raw, f.err = raw, err
+}
+
+func (f *fetcher) fetch(context.Context, string) ([]byte, error) {
+	f.calls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.raw, nil
+}
+
+// refresher builds a StatusRefresher over the harness cache whose clock is
+// the vectors' clock shifted by *offset seconds.
+func (h *statusHarness) refresher(f StatusFetcher, offset *atomic.Int64, obs StatusObserver) *StatusRefresher {
+	h.t.Helper()
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, obs, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: f, Timeout: time.Second})
+	if err != nil {
+		h.t.Fatalf("NewStatusRefresher: %v", err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now+offset.Load(), 0) }
+	return r
+}
+
+func requireAllowed(t *testing.T, d Decision, what string) {
+	t.Helper()
+	if !d.Allowed {
+		t.Fatalf("%s: denied %+v", what, d.Deny)
+	}
+}
+
+// TestMemoryStatusCacheWrites splits the two write paths. OfferPresented
+// (a client's token) only moves a live entry forward and never replaces a
+// terminal one, whatever its iat. Install (the TL's own current answer)
+// replaces a live entry unconditionally, so a terminal answer replaces a
+// newer-iat live one, but never replaces a sticky terminal entry (REVOKED
+// or a 410): under ANS a revoked agent id does not return to ACTIVE.
+func TestMemoryStatusCacheWrites(t *testing.T) {
+	t.Parallel()
+	c := NewMemoryStatusCache()
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("empty cache returned an entry")
+	}
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 100}) {
+		t.Fatal("a presented token populated an agent the TL never answered for")
+	}
+	c.Install(IssuerStatus{AgentID: "a", Iat: 100})
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 90}) || c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 100}) {
+		t.Fatal("an older or equal presented entry replaced the cached one")
+	}
+	if !c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 101}) {
+		t.Fatal("a newer presented entry refused")
+	}
+	c.Install(IssuerStatus{AgentID: "a", Iat: 50, Terminal: true})
+	if got, _ := c.Get("a"); !got.Terminal {
+		t.Fatal("Install of a terminal answer with a lower iat did not replace the live entry")
+	}
+	if c.OfferPresented(IssuerStatus{AgentID: "a", Iat: 1 << 40}) {
+		t.Fatal("a presented entry with a higher iat replaced a terminal one")
+	}
+	if got, _ := c.Get("a"); !got.Terminal {
+		t.Fatalf("terminal entry lost: %+v", got)
+	}
+	// A stale or replayed ACTIVE answer, older or newer, cannot undo it.
+	for _, iat := range []int64{40, 1 << 41} {
+		c.Install(IssuerStatus{AgentID: "a", Iat: iat})
+		if got, _ := c.Get("a"); !got.Terminal {
+			t.Fatalf("Install of a live answer (iat %d) cleared the terminal entry: %+v", iat, got)
+		}
+	}
+	if c.OfferPresented(IssuerStatus{Iat: 1}) {
+		t.Fatal("an entry without an agent id was accepted")
+	}
+	c.Install(IssuerStatus{Iat: 1})
+	if _, ok := c.Get(""); ok {
+		t.Fatal("Install stored an entry without an agent id")
+	}
+}
+
+// raceCache installs a terminal entry from the TL right after the request
+// path reads the cache, the window between Get and OfferPresented.
+type raceCache struct {
+	*MemoryStatusCache
+	onGet func()
+}
+
+func (c *raceCache) Get(agentID string) (IssuerStatus, bool) {
+	s, ok := c.MemoryStatusCache.Get(agentID)
+	if c.onGet != nil {
+		c.onGet()
+	}
+	return s, ok
+}
+
+// TestStatusCacheRevocationRaceKeepsTerminal: a request reads a live entry,
+// the refresher then installs a 410 (dated by the gateway clock, here far
+// below the presented token's TL iat), and the request offers its newer
+// presented token. The terminal entry must survive, and the next request is
+// refused revoked.
+func TestStatusCacheRevocationRaceKeepsTerminal(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	race := &raceCache{MemoryStatusCache: h.cache}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 30, Token: mustVerify(t, h, h.mint(scitt.StatusActive, -30))})
+	race.onGet = func() {
+		race.onGet = nil
+		h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 1000, Terminal: true})
+	}
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(h.config(), h.keys, noReplay, nil, nil, WithStatusCache(race))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	// The in-flight request decided on the live entry it read; it is the
+	// last one the race can admit.
+	_ = v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -5)))
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("a presented token overwrote the terminal entry: %+v", got)
+	}
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+func mustVerify(t *testing.T, h *statusHarness, raw []byte) *scitt.VerifiedStatusToken {
+	t.Helper()
+	st, err := scitt.VerifyStatusTokenAt(raw, h.keys, 0, h.iv.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// TestStatusCacheBackgroundRefreshReplacesStaleEntry: with only a stale cached
+// token and a stale presented one, a background refresh installs a fresh
+// token and the same request is then admitted.
+func TestStatusCacheBackgroundRefreshReplacesStaleEntry(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := h.refresher(f.fetch, &offset, nil)
+	f.set(h.mint(scitt.StatusActive, -400), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	v := h.verifier()
+	stale := h.request(h.mint(scitt.StatusActive, -300))
+	requireInstanceDenial(t, v.Verify(t.Context(), stale), codeStatusStale)
+
+	f.set(h.mint(scitt.StatusActive, -5), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-5 {
+		t.Fatalf("cached iat = %d, want %d", got.Iat, h.iv.Now-5)
+	}
+	requireAllowed(t, v.Verify(t.Context(), stale), "after a background refresh")
+}
+
+// TestStatusCacheClientNewerIsUsedAndCached: a fresh presented token newer
+// than a stale cached one is used, and then replaces the cache entry.
+func TestStatusCacheClientNewerIsUsedAndCached(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -400), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	v := h.verifier()
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -10))), "fresh presented token")
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-10 || got.Token == nil || len(got.Raw) == 0 {
+		t.Fatalf("presented token not cached: %+v", got)
+	}
+	// The cached copy now admits a request whose own token is stale.
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -500))), "stale presented token, fresh cache")
+}
+
+// TestStatusCacheClientOlderUsesCache: a presented token older than the
+// cached one is ignored in favour of the cache, both when that admits (a stale
+// presented token) and when it refuses (the newer cached token no longer
+// lists the certificate).
+func TestStatusCacheClientOlderUsesCache(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := h.refresher(f.fetch, &offset, nil)
+	f.set(h.mint(scitt.StatusActive, -20), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	v := h.verifier()
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -300))), "stale presented, fresh cache")
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-20 {
+		t.Fatalf("an older presented token replaced the cache: iat %d", got.Iat)
+	}
+
+	// A newer cached token that rotated the certificate out wins over an
+	// older presented one that still lists it.
+	h.certFP = [32]byte{1}
+	f.set(h.mint(scitt.StatusActive, -10), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	h.certFP = sha256.Sum256(mustCertDER(t, h.vec.Token))
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -30))), codeCertNotCurrent)
+}
+
+func mustCertDER(t *testing.T, tok string) []byte {
+	t.Helper()
+	it, err := parseInstanceToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return it.certDER
+}
+
+// TestStatusCachePresentedExpiredRefused: an expired presented token is
+// refused status_expired even when the cache holds a fresh one. The request
+// fails closed on any presented token that does not verify; it never falls
+// back past a bad one.
+func TestStatusCachePresentedExpiredRefused(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -5), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	expired := h.mintFor(h.iv.AgentID, h.ansName, scitt.StatusActive, -7200, -3600)
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(expired)), codeStatusExpired)
+}
+
+// TestStatusCacheCachedExpiredRefused: the cached token wins (its iat is
+// newer than the presented one) but has passed its exp while still within
+// maxStatusAge, which a status token shorter-lived than maxStatusAge allows.
+// It is refused status_expired; the age check alone would admit it.
+func TestStatusCacheCachedExpiredRefused(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	raw := h.mintFor(h.iv.AgentID, h.ansName, scitt.StatusActive, -10, -1)
+	st, err := scitt.VerifyStatusTokenAt(raw, h.keys, 0, h.iv.Now-10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: st.Payload.Iat, Raw: raw, Token: st})
+	d := h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -20)))
+	requireInstanceDenial(t, d, codeStatusExpired)
+}
+
+// TestStatusCacheBothStale refuses when neither token is within maxStatusAge.
+func TestStatusCacheBothStale(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -250), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	for _, iat := range []int64{-260, -241} { // older and newer than the cache, both stale
+		d := h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, iat)))
+		requireInstanceDenial(t, d, codeStatusStale)
+		if d.Deny.Category != CategoryStatusInvalid {
+			t.Fatalf("Category = %q", d.Deny.Category)
+		}
+	}
+}
+
+// TestStatusCacheNeverFetchedFailsClosed: until the first background fetch
+// succeeds, every request for the issuer is status_stale, even one carrying a
+// fresh token, and that token is not cached.
+func TestStatusCacheNeverFetchedFailsClosed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeStatusStale)
+	if _, ok := h.cache.Get(h.iv.AgentID); ok {
+		t.Fatal("a presented token populated an issuer the TL was never reached for")
+	}
+}
+
+// TestStatusCacheRevokedCachedRefuses: once the TL reports the issuer
+// terminal (a 410 or a signed REVOKED token), a presented ACTIVE token is
+// refused revoked, whether older or newer than that report.
+func TestStatusCacheRevokedCachedRefuses(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		fetch func(h *statusHarness) ([]byte, error)
+	}{
+		{"TL answers 410 Gone", func(*statusHarness) ([]byte, error) {
+			return nil, &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone}
+		}},
+		{"TL serves a signed REVOKED token", func(h *statusHarness) ([]byte, error) {
+			return h.mint(scitt.StatusRevoked, -5), nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newStatusHarness(t)
+			f := &fetcher{}
+			var offset atomic.Int64
+			r := h.refresher(f.fetch, &offset, nil)
+			f.set(h.mint(scitt.StatusActive, -30), nil)
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatal(err)
+			}
+			v := h.verifier()
+			requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -60))), "before revocation")
+
+			f.set(tc.fetch(h))
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatalf("a terminal answer is not a refresh failure: %v", err)
+			}
+			for _, iat := range []int64{-60, -1} {
+				d := v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, iat)))
+				requireInstanceDenial(t, d, codeRevoked)
+			}
+			if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+				t.Fatalf("cache entry %+v is not terminal", got)
+			}
+			// A later ACTIVE answer for the same agent id (a lagging TL
+			// replica, a cache, a replayed response) leaves it terminal: the
+			// entry lasts for the life of the process, and the refresh
+			// reports failure rather than success.
+			offset.Store(10)
+			f.set(h.mint(scitt.StatusActive, -5), nil)
+			if err := r.Refresh(t.Context(), h.issuer()); err == nil {
+				t.Fatal("an ACTIVE answer for a terminal agent id reported success")
+			}
+			requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+		})
+	}
+}
+
+// TestStatusRefresherTerminalFailsClosed pins the signed-terminal path: the
+// SDK withholds a terminal token's payload, so a REVOKED token the TL serves
+// for another agent still marks the issuer revoked (fail closed, like a 410).
+func TestStatusRefresherTerminalFailsClosed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	f.set(h.mintFor("00000000-0000-4000-8000-0000000000ff", h.ansName, scitt.StatusRevoked, -1, 3600), nil)
+	if err := h.refresher(f.fetch, new(atomic.Int64), nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("cache entry %+v, want terminal", got)
+	}
+}
+
+// TestStatusCachePresentedRevokedRefuses: a signed REVOKED token from the
+// client is refused at once even while the cache holds a fresh ACTIVE one.
+func TestStatusCachePresentedRevokedRefuses(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -5), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusRevoked, -100))), codeRevoked)
+}
+
+// TestStatusCachePresentedForAnotherAgent refuses a status token naming an
+// agent other than the one the issuer is pinned to, so the cache always
+// covers the token in use.
+func TestStatusCachePresentedForAnotherAgent(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -5), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	other := h.mintFor("00000000-0000-4000-8000-0000000000ff", h.ansName, scitt.StatusActive, -1, 3600)
+	d := h.verifier().Verify(t.Context(), h.request(other))
+	requireInstanceDenial(t, d, codeIssMismatch)
+	if d.Deny.Category != CategoryBindingFailed {
+		t.Fatalf("Category = %q", d.Deny.Category)
+	}
+}
+
+// TestStatusCacheOtherTLCannotVouch: issuers[].tl binds which transparency
+// log may vouch for an issuer. A status token another configured TL signed,
+// naming the issuer's agent, is refused on the request path and never
+// cached, and the refresher refuses one too.
+func TestStatusCacheOtherTLCannotVouch(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	other := newStatusHarness(t)
+	other.iv, other.vec, other.ansName, other.certFP = h.iv, h.vec, h.ansName, h.certFP
+	otherStore, err := scitt.NewKeyStore([]string{other.line})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := h.keys.inner.(*Keyring)
+	h.keys = &countingKeys{inner: mustKeyring(t, NoopObserver{},
+		inner.sources[0], KeySource{Name: "other-tl", Lookup: otherStore})}
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := h.refresher(f.fetch, &offset, nil)
+	f.set(h.mint(scitt.StatusActive, -30), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	v := h.verifier()
+	d := v.Verify(t.Context(), h.request(other.mint(scitt.StatusActive, -1)))
+	requireInstanceDenial(t, d, codeBadStatusToken)
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-30 {
+		t.Fatalf("another TL's token entered the cache: iat %d", got.Iat)
+	}
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), "the issuer's own TL")
+
+	f.set(other.mint(scitt.StatusActive, -1), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err == nil || !strings.Contains(err.Error(), "test-tl") {
+		t.Fatalf("Refresh of another TL's token = %v, want a failure naming test-tl", err)
+	}
+}
+
+// TestStatusCacheOpaqueKeysFailClosed: a key provider that cannot say which
+// transparency log holds a key cannot bind issuers[].tl, so cache mode
+// refuses rather than trusting every log.
+func TestStatusCacheOpaqueKeysFailClosed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now - 30, Token: mustVerify(t, h, h.mint(scitt.StatusActive, -30))})
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(h.config(), opaqueKeys{h.keys}, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeBadStatusToken)
+}
+
+// opaqueKeys hides HoldsKey from the provider it wraps.
+type opaqueKeys struct{ inner KeyProvider }
+
+func (o opaqueKeys) Get(kid [4]byte) (*scitt.TrustedKey, error) { return o.inner.Get(kid) }
+func (o opaqueKeys) RefreshFor(ctx context.Context) bool        { return o.inner.RefreshFor(ctx) }
+
+// TestStatusCacheAgentIDCase: a UUID's case carries no meaning, so a
+// configured upper-case agentId matches the lower-case id the TL and the
+// issuer's presented token carry, on the refresh and the request path.
+func TestStatusCacheAgentIDCase(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	upper := strings.ToUpper(lower)
+	mint := func(iatOff int64) []byte { return h.mintFor(lower, h.ansName, scitt.StatusActive, iatOff, iatOff+3600) }
+	f := &fetcher{}
+	f.set(mint(-30), nil)
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, nil, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: upper, TL: "test-tl", Fetch: f.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now, 0) }
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh with an upper-case agentId: %v", err)
+	}
+	cfg := h.config()
+	cfg.InstanceMode.Issuers[0].AgentID = upper
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(cfg, h.keys, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	requireAllowed(t, v.Verify(t.Context(), h.request(mint(-1))), "upper-case agentId, lower-case token")
+	requireAllowed(t, v.Verify(t.Context(), h.request(mint(-40))), "cached entry under the canonical id")
+}
+
+// TestStatusCachePresentedFutureIatNotCached: a presented token that fails a
+// check is never cached, so a future-dated token cannot pin the cache ahead.
+func TestStatusCachePresentedFutureIatNotCached(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	f.set(h.mint(scitt.StatusActive, -5), nil)
+	if err := h.refresher(f.fetch, &offset, nil).Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, 120))), codeClockSkew)
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Iat != h.iv.Now-5 {
+		t.Fatalf("a refused presented token entered the cache: iat %d", got.Iat)
+	}
+}
+
+// TestStatusCacheTLDownFailsClosedThenRecovers: the TL goes down after a
+// successful fetch; once the cached token passes maxStatusAge every request
+// is status_stale, and the first successful refresh after the TL returns
+// admits again.
+func TestStatusCacheTLDownFailsClosedThenRecovers(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	obs := &recStatusObserver{}
+	r := h.refresher(f.fetch, &offset, obs)
+	offset.Store(-300) // the last good fetch, five minutes before "now"
+	f.set(h.mint(scitt.StatusActive, -300), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	v := h.verifier()
+	presented := h.request(h.mint(scitt.StatusActive, -300))
+
+	offset.Store(0)
+	f.set(nil, &scitt.TransportError{Type: scitt.TransportErrHTTPError, StatusCode: http.StatusServiceUnavailable})
+	if err := r.Refresh(t.Context(), h.issuer()); err == nil {
+		t.Fatal("Refresh with the TL down succeeded")
+	}
+	requireInstanceDenial(t, v.Verify(t.Context(), presented), codeStatusStale)
+
+	f.set(h.mint(scitt.StatusActive, 0), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	requireAllowed(t, v.Verify(t.Context(), presented), "after the TL returned")
+	if got := obs.results(); strings.Join(got, ",") != "success,failure,success" {
+		t.Fatalf("observed %v", got)
+	}
+}
+
+// countingTL is a fake transparency log over HTTP that counts every request
+// by path.
+type countingTL struct {
+	srv   *httptest.Server
+	mu    sync.Mutex
+	hits  map[string]int
+	token []byte
+	code  int
+}
+
+func newCountingTL(t *testing.T, rootKey string, agentID string) *countingTL {
+	t.Helper()
+	tl := &countingTL{hits: map[string]int{}, code: http.StatusOK}
+	tl.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tl.mu.Lock()
+		defer tl.mu.Unlock()
+		tl.hits[r.URL.Path]++
+		switch r.URL.Path {
+		case "/root-keys":
+			_, _ = w.Write([]byte(rootKey + "\n"))
+		case "/v1/agents/" + agentID + "/status-token":
+			w.Header().Set("Content-Type", "application/ans-status-token+cbor")
+			w.WriteHeader(tl.code)
+			_, _ = w.Write(tl.token)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(tl.srv.Close)
+	return tl
+}
+
+func (tl *countingTL) total() int {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	n := 0
+	for _, c := range tl.hits {
+		n += c
+	}
+	return n
+}
+
+func (tl *countingTL) set(code int, token []byte) {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	tl.code, tl.token = code, token
+}
+
+// TestStatusCacheNoTLCallOnRequestPath fetches through the SDK's HTTP client
+// against a counting fake TL: the fetch hits it, and no Verify call does,
+// whether the cache admits, the presented token is newer, nothing is cached
+// yet, or the presented token names an unknown TL key.
+func TestStatusCacheNoTLCallOnRequestPath(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	tl := newCountingTL(t, h.line, h.iv.AgentID)
+	client, err := scitt.NewHTTPClient(tl.srv.URL, scitt.WithAllowInsecureTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offset atomic.Int64
+	r := h.refresher(client.FetchStatusToken, &offset, nil)
+	tl.set(http.StatusOK, h.mint(scitt.StatusActive, -100))
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	if n := tl.total(); n != 1 {
+		t.Fatalf("fetch made %d TL requests, want 1", n)
+	}
+	v := h.verifier()
+	before := tl.total()
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -200))), "cache admits")
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -10))), "newer presented")
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -600))), "stale presented, cache refreshed by the newer one")
+	unknown := newStatusHarness(t) // a fresh harness: nothing fetched yet for its cache
+	requireInstanceDenial(t, unknown.verifier().Verify(t.Context(), unknown.request(unknown.mint(scitt.StatusActive, -1))), codeStatusStale)
+	// A presented token under a TL key the verifier lacks is refused without
+	// an on-demand root-key refresh: the background refresher learns new keys.
+	refreshes := h.keys.refreshes.Load()
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(unknown.mint(scitt.StatusActive, -1))), codeBadStatusToken)
+	if n := h.keys.refreshes.Load() - refreshes; n != 0 {
+		t.Fatalf("Verify triggered %d root-key refreshes, want 0", n)
+	}
+	if n := tl.total() - before; n != 0 {
+		t.Fatalf("Verify made %d TL requests, want 0", n)
+	}
+}
+
+// TestStatusRefresherRejects keeps every unusable answer out of the cache.
+func TestStatusRefresherRejects(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	other := newStatusHarness(t) // another TL key, not trusted by h
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+		err  error
+		want string
+	}{
+		{"fetch fails", nil, errors.New("connection refused"), "connection refused"},
+		{"not a status token", []byte("junk"), nil, "status token"},
+		{"unknown TL key", other.mint(scitt.StatusActive, -1), nil, "unknown key"},
+		{"another agent", h.mintFor("00000000-0000-4000-8000-0000000000ff", h.ansName, scitt.StatusActive, -1, 3600), nil, "agent"},
+		{"another host", h.mintFor(h.iv.AgentID, "ans://v1.0.0.other.example.test", scitt.StatusActive, -1, 3600), nil, "other.example.test"},
+		{"unparseable name", h.mintFor(h.iv.AgentID, "not-a-name", scitt.StatusActive, -1, 3600), nil, "not-a-name"},
+		{"future iat", h.mint(scitt.StatusActive, 61), nil, "ahead"},
+		{"expired", h.mintFor(h.iv.AgentID, h.ansName, scitt.StatusActive, -7200, -3600), nil, "expired"},
+	} {
+		f := &fetcher{}
+		f.set(tc.raw, tc.err)
+		var offset atomic.Int64
+		obs := &recStatusObserver{}
+		err := h.refresher(f.fetch, &offset, obs).Refresh(t.Context(), h.issuer())
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: Refresh = %v, want an error containing %q", tc.name, err, tc.want)
+		}
+		if _, ok := h.cache.Get(h.iv.AgentID); ok {
+			t.Fatalf("%s: rejected token cached", tc.name)
+		}
+		if got := obs.results(); len(got) != 1 || got[0] != StatusRefreshFailure {
+			t.Errorf("%s: observed %v", tc.name, got)
+		}
+	}
+	if err := h.refresher((&fetcher{}).fetch, new(atomic.Int64), nil).Refresh(t.Context(), "unknown.example.test"); err == nil {
+		t.Fatal("Refresh for an unconfigured issuer succeeded")
+	}
+}
+
+// TestStatusRefresherUnknownKidRefreshesKeys refreshes the root keys once in
+// the background when a fetched token names a kid the keyring lacks.
+func TestStatusRefresherUnknownKidRefreshesKeys(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	lookup := newMapLookup()
+	ring := mustKeyring(t, NoopObserver{}, KeySource{Name: "tl", Lookup: lookup, Timeout: time.Second,
+		Refresh: func(context.Context) error {
+			tk, err := scitt.ParseC2SPKey(h.line)
+			if err != nil {
+				return err
+			}
+			lookup.add(tk)
+			return nil
+		}})
+	f := &fetcher{}
+	f.set(h.mint(scitt.StatusActive, -1), nil)
+	r, err := NewStatusRefresher(h.cache, ring, testMaxStatusAge, nil, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "tl", Fetch: f.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now, 0) }
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if lookup.Len() != 1 {
+		t.Fatal("root keys were not refreshed")
+	}
+}
+
+// TestStatusRefresherRun refreshes in the background every maxStatusAge/2
+// (jittered, never later), backs off after failures, recovers, and stops with
+// its context.
+func TestStatusRefresherRun(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	obs := &recStatusObserver{}
+	r := h.refresher(f.fetch, &offset, obs)
+	if r.interval != testMaxStatusAge/2 {
+		t.Fatalf("interval = %s, want maxStatusAge/2", r.interval)
+	}
+	for range 100 {
+		if w := r.jittered(); w > r.interval || w < r.interval*8/10 {
+			t.Fatalf("jittered wait %s outside [0.8, 1] x %s", w, r.interval)
+		}
+	}
+	if got := r.backoff(1); got != r.backoffInitial {
+		t.Fatalf("backoff(1) = %s", got)
+	}
+	if got := r.backoff(64); got != r.backoffMax {
+		t.Fatalf("backoff(64) = %s, want the cap %s", got, r.backoffMax)
+	}
+	r.interval, r.backoffInitial, r.backoffMax = 20*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond
+
+	f.set(nil, errors.New("down"))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	waitFor(t, "failed attempts", func() bool { return f.calls.Load() >= 3 })
+	f.set(h.mint(scitt.StatusActive, -1), nil)
+	waitFor(t, "a successful refresh", func() bool { _, ok := h.cache.Get(h.iv.AgentID); return ok })
+	n := f.calls.Load()
+	waitFor(t, "scheduled refreshes", func() bool { return f.calls.Load() >= n+2 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop with its context")
+	}
+	stopped := f.calls.Load()
+	time.Sleep(50 * time.Millisecond)
+	if f.calls.Load() != stopped {
+		t.Fatal("Run kept fetching after its context ended")
+	}
+}
+
+// TestStatusRefresherFirstWait schedules the first background refresh from
+// the cached entry's iat, not from Run: a startup that took long (a slow
+// replay backend) must not leave the startup token past maxStatusAge.
+func TestStatusRefresherFirstWait(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	var offset atomic.Int64
+	r := h.refresher((&fetcher{}).fetch, &offset, nil)
+	if w := r.firstWait(h.iv.AgentID); w != 0 {
+		t.Fatalf("nothing cached: first wait %s, want 0", w)
+	}
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now, Token: mustVerify(t, h, h.mint(scitt.StatusActive, 0))})
+	if w := r.firstWait(h.iv.AgentID); w > r.interval || w < r.interval*8/10 {
+		t.Fatalf("token issued now: first wait %s, want the jittered interval", w)
+	}
+	offset.Store(100) // Run starts 100 s after the startup fetch
+	if w := r.firstWait(h.iv.AgentID); w > r.interval-100*time.Second || w < r.interval*8/10-100*time.Second {
+		t.Fatalf("100 s later: first wait %s, want the interval less 100 s", w)
+	}
+	offset.Store(int64(r.interval / time.Second))
+	if w := r.firstWait(h.iv.AgentID); w != 0 {
+		t.Fatalf("a full interval later: first wait %s, want 0", w)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestNewStatusRefresherErrors validates the refresher's wiring.
+func TestNewStatusRefresherErrors(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	fetch := (&fetcher{}).fetch
+	src := IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: fetch}
+	for _, tc := range []struct {
+		name    string
+		cache   StatusCache
+		keys    KeyProvider
+		age     time.Duration
+		sources []IssuerStatusSource
+		want    string
+	}{
+		{"no cache", nil, h.keys, time.Minute, []IssuerStatusSource{src}, "cache"},
+		{"no keys", h.cache, nil, time.Minute, []IssuerStatusSource{src}, "key provider"},
+		{"no max age", h.cache, h.keys, 0, []IssuerStatusSource{src}, "maxStatusAge"},
+		{"no sources", h.cache, h.keys, time.Minute, nil, "at least one"},
+		{"no host", h.cache, h.keys, time.Minute, []IssuerStatusSource{{AgentID: "a", TL: "t", Fetch: fetch}}, "host"},
+		{"no agent", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", TL: "t", Fetch: fetch}}, "agent"},
+		{"no tl", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", AgentID: "a", Fetch: fetch}}, "transparency log"},
+		{"no fetch", h.cache, h.keys, time.Minute, []IssuerStatusSource{{Host: "a", AgentID: "a", TL: "t"}}, "fetch"},
+		{"duplicate host", h.cache, h.keys, time.Minute, []IssuerStatusSource{src, src}, "duplicate"},
+	} {
+		if _, err := NewStatusRefresher(tc.cache, tc.keys, tc.age, nil, nil, tc.sources...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.want)
+		}
+	}
+	r, err := NewStatusRefresher(h.cache, h.keys, time.Minute, nil, nil, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hosts := r.Hosts(); len(hosts) != 1 || hosts[0] != h.issuer() {
+		t.Fatalf("Hosts = %v", hosts)
+	}
+	if r.sources[0].Timeout != DefaultKeyFetchTimeout || r.backoffMax != 30*time.Second {
+		t.Fatalf("defaults: timeout %s, backoff cap %s", r.sources[0].Timeout, r.backoffMax)
+	}
+}
+
+// TestVerifierDefaultStatusCache: without WithStatusCache a verifier with
+// issuers configured holds its own empty cache, so it fails closed.
+func TestVerifierDefaultStatusCache(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	v, err := NewVerifier(h.config(), h.keys, &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeStatusStale)
+}
+
+type recStatusObserver struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (o *recStatusObserver) IssuerStatusRefresh(_, result string, _ time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seen = append(o.seen, result)
+}
+
+func (o *recStatusObserver) results() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.seen...)
+}
+
+// TestStatusIatInt64MinUnderMaxAge is vector status_iat_int64_min_under_max_age:
+// a TL-signed status token whose iat is the int64 minimum is ancient, not
+// fresh. now-iat wraps there, so the age check must not subtract.
+func TestStatusIatInt64MinUnderMaxAge(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	st := mustVerify(t, h, h.mint(scitt.StatusActive, -10))
+	st.Payload.Iat = math.MinInt64
+	h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: h.iv.Now, Token: st})
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -60))), codeStatusStale)
+}
+
+// TestStatusRefresherFirstWaitAncientIat: a cached iat so old that its age
+// overflows time.Duration still means "refresh at once", not a wrapped wait.
+func TestStatusRefresherFirstWaitAncientIat(t *testing.T) {
+	t.Parallel()
+	for _, iat := range []int64{math.MinInt64, 1_800_000_000 - 9_300_000_000} {
+		h := newStatusHarness(t)
+		r := h.refresher((&fetcher{}).fetch, new(atomic.Int64), nil)
+		h.cache.Install(IssuerStatus{AgentID: h.iv.AgentID, Iat: iat})
+		if w := r.firstWait(h.iv.AgentID); w != 0 {
+			t.Errorf("cached iat %d: first wait %s, want 0", iat, w)
+		}
+	}
+}
+
+// TestStatusCacheAgentIDHeaderLowercase: X-ANS-Agent-Id and the agent_id
+// metadata carry the canonical lower-case id whatever case the winning
+// status token used, so one issuer reaches the upstream under one spelling.
+func TestStatusCacheAgentIDHeaderLowercase(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	const lower = "abcdef00-0000-4000-8000-000000000001"
+	f := &fetcher{}
+	f.set(h.mintFor(lower, h.ansName, scitt.StatusActive, -30, 3600), nil)
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, nil, nil,
+		IssuerStatusSource{Host: h.issuer(), AgentID: lower, TL: "test-tl", Fetch: f.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now, 0) }
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := h.config()
+	cfg.InstanceMode.Issuers[0].AgentID = lower
+	noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+	v, err := NewVerifier(cfg, h.keys, noReplay, nil, nil, WithStatusCache(h.cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(h.iv.Now, 0)
+	v.now = func() time.Time { return now }
+	upper := h.mintFor(strings.ToUpper(lower), h.ansName, scitt.StatusActive, -1, 3600)
+	d := v.Verify(t.Context(), h.request(upper))
+	requireAllowed(t, d, "upper-case presented token")
+	if got := d.Headers[HeaderANSAgentID]; got != lower {
+		t.Fatalf("%s = %q, want %q", HeaderANSAgentID, got, lower)
+	}
+	if got := d.Metadata[MetadataAgentID]; got != lower {
+		t.Fatalf("metadata %s = %v, want %q", MetadataAgentID, got, lower)
+	}
+	if d.Identity.AgentID != lower {
+		t.Fatalf("Identity.AgentID = %q", d.Identity.AgentID)
+	}
+}
+
+// TestRevokedOtherAgent is vector revoked_other_agent: a validly signed
+// REVOKED token about another agent is refused for not being about this
+// issuer (iss_mismatch), the check that runs before the status check, in
+// both status modes. A REVOKED token about this issuer stays revoked.
+func TestRevokedOtherAgent(t *testing.T) {
+	t.Parallel()
+	const otherAgent = "11111111-1111-4111-8111-111111111111"
+	const otherName = "ans://v1.0.0.other.example.test"
+	for _, mode := range []string{"presented", "cache"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			h := newStatusHarness(t)
+			v := h.verifier()
+			if mode == "presented" {
+				noReplay := &fakeCache{check: func(context.Context, string, time.Time) (bool, error) { return false, nil }}
+				var err error
+				if v, err = NewVerifier(h.iv.config(), h.keys, noReplay, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Unix(h.iv.Now, 0)
+				v.now = func() time.Time { return now }
+			} else {
+				f := &fetcher{}
+				f.set(h.mint(scitt.StatusActive, -30), nil)
+				if err := h.refresher(f.fetch, new(atomic.Int64), nil).Refresh(t.Context(), h.issuer()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, tc := range []struct {
+				name, agent, ansName string
+			}{
+				{"other agent and name", otherAgent, otherName},
+				{"other name", h.iv.AgentID, otherName},
+			} {
+				d := v.Verify(t.Context(), h.request(h.mintFor(tc.agent, tc.ansName, scitt.StatusRevoked, -5, 3600)))
+				requireInstanceDenial(t, d, codeIssMismatch)
+				if d.Deny.Category != CategoryBindingFailed {
+					t.Fatalf("%s: Category = %q", tc.name, d.Deny.Category)
+				}
+			}
+			if mode == "cache" {
+				d := v.Verify(t.Context(), h.request(h.mintFor(otherAgent, h.ansName, scitt.StatusRevoked, -5, 3600)))
+				requireInstanceDenial(t, d, codeIssMismatch)
+			}
+			requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusRevoked, -5))), codeRevoked)
+		})
+	}
+}
+
+// TestStatusPayloadNames reads agent_id and ans_name the way the SDK does
+// (integer key over string key) and refuses CBOR it cannot fully walk, so
+// terminalBinding falls back to the SDK's revoked.
+func TestStatusPayloadNames(t *testing.T) {
+	t.Parallel()
+	cose := func(payload []byte) []byte {
+		protected := cborMap(cborInt(1), cborInt(-7), cborInt(4), cborBytes([]byte{1, 2, 3, 4}))
+		return append(cborHead(6, 18), cborArray(cborBytes(protected), cborMap(), cborBytes(payload),
+			cborBytes(make([]byte, es256SigLen)))...)
+	}
+	const agent, name = "a-1", "ans://v1.0.0.x.example"
+	big := append(cborHead(0, 1<<40), cborHead(0, 1<<20)...) // 8- and 4-byte heads, then ignored
+	for _, tc := range []struct {
+		desc        string
+		payload     []byte
+		agent, name string
+		ok          bool
+	}{
+		{"integer keys", cborMap(cborInt(1), cborText(agent), cborInt(5), cborText(name)), agent, name, true},
+		{"string keys", cborMap(cborText("agent_id"), cborText(agent), cborText("ans_name"), cborText(name)), agent, name, true},
+		{"integer key wins", cborMap(cborText("agent_id"), cborText("s"), cborInt(1), cborText(agent),
+			cborInt(5), cborText(name)), agent, name, true},
+		{"other keys skipped", cborMap(cborInt(2), cborText("REVOKED"), cborInt(3), cborInt(-5),
+			cborInt(6), cborArray(cborMap(cborInt(1), cborBytes([]byte{9}))), cborText("x"), append(cborHead(6, 1), cborInt(0)...),
+			cborBytes([]byte{1}), cborHead(7, 20), cborInt(1), cborText(agent), cborInt(5), cborText(name),
+			big[:9], big[9:]), agent, name, true},
+		{"non-text value", cborMap(cborInt(1), cborInt(7), cborInt(5), cborText(name)), "", name, false},
+		{"missing name", cborMap(cborInt(1), cborText(agent)), agent, "", false},
+		{"not a map", cborArray(cborText(agent)), "", "", false},
+		{"truncated", cborMap(cborInt(1), cborText(agent), cborInt(5))[:8], "", "", false},
+		{"trailing bytes", append(cborMap(cborInt(1), cborText(agent), cborInt(5), cborText(name)), 0), "", "", false},
+		{"indefinite map", append([]byte{0xbf}, cborInt(1)...), "", "", false},
+		{"text past end", cborMap(cborInt(1), cborHead(3, 50)), "", "", false},
+		{"string key past end", cborMap(cborHead(3, 50)), "", "", false},
+		{"bytes past end", cborMap(cborInt(9), cborHead(2, 50)), "", "", false},
+		{"huge map", cborMap(cborInt(9), cborHead(5, 1<<30)), "", "", false},
+		{"huge array", cborMap(cborInt(9), cborHead(4, 1<<30)), "", "", false},
+		{"short head", cborMap(cborInt(9), []byte{0x1b, 0}), "", "", false},
+		{"reserved info", cborMap(cborInt(9), []byte{0x1c}), "", "", false},
+		{"too deep", cborMap(cborInt(9), append(bytes.Repeat([]byte{0x81}, cborMaxDepth+2), 0)), "", "", false},
+		{"bad key", cborMap([]byte{0x1c}), "", "", false},
+	} {
+		p, ok := statusPayloadNames(cose(tc.payload))
+		if ok != tc.ok || (ok && (p.AgentID != tc.agent || p.AnsName != tc.name)) {
+			t.Errorf("%s: got %+v, %v; want %q %q %v", tc.desc, p, ok, tc.agent, tc.name, tc.ok)
+		}
+	}
+	if _, ok := statusPayloadNames([]byte("junk")); ok {
+		t.Error("a non-COSE input parsed")
+	}
+}
+
+// i1Refresher is h.refresher with a logger that writes to buf.
+func i1Refresher(t *testing.T, h *statusHarness, f *fetcher, offset *atomic.Int64, obs StatusObserver,
+	buf *syncBuffer) *StatusRefresher {
+	t.Helper()
+	r, err := NewStatusRefresher(h.cache, h.keys, testMaxStatusAge, obs, slog.New(slog.NewTextHandler(buf, nil)),
+		IssuerStatusSource{Host: h.issuer(), AgentID: h.iv.AgentID, TL: "test-tl", Fetch: f.fetch, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return time.Unix(h.iv.Now+offset.Load(), 0) }
+	return r
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a reader.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestStatusCacheSignedRevokedSticky: a signed REVOKED token from the TL is
+// recorded REVOKED and stays terminal for the life of the process; a later
+// ACTIVE fetch for the same agent id is not installed.
+func TestStatusCacheSignedRevokedSticky(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := i1Refresher(t, h, f, &offset, nil, &syncBuffer{})
+	f.set(h.mint(scitt.StatusRevoked, -5), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusRevoked {
+		t.Fatalf("entry after a signed REVOKED = %+v", got)
+	}
+	offset.Store(10)
+	f.set(h.mint(scitt.StatusActive, 5), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err == nil {
+		t.Fatal("an ACTIVE fetch for a revoked agent id reported success")
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusRevoked {
+		t.Fatalf("a later ACTIVE fetch cleared REVOKED: %+v", got)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+// TestStatusCacheSignedExpiredRecovers: a signed EXPIRED token is terminal
+// but clearable. A presented ACTIVE token cannot clear it; a later fetched
+// token that verifies ACTIVE does, the issuer is admitted again, and the
+// recovery is logged at Info with the issuer and agent id.
+func TestStatusCacheSignedExpiredRecovers(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	logs := &syncBuffer{}
+	obs := &recStatusObserver{}
+	r := i1Refresher(t, h, f, &offset, obs, logs)
+	f.set(h.mint(scitt.StatusActive, -30), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	f.set(h.mint(scitt.StatusExpired, -10), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != scitt.StatusExpired {
+		t.Fatalf("entry after a signed EXPIRED = %+v", got)
+	}
+	v := h.verifier()
+	requireInstanceDenial(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal {
+		t.Fatalf("a presented ACTIVE token cleared EXPIRED: %+v", got)
+	}
+
+	f.set(h.mint(scitt.StatusActive, 0), nil)
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatalf("renewed issuer: %v", err)
+	}
+	if got, _ := h.cache.Get(h.iv.AgentID); got.Terminal {
+		t.Fatalf("a fetched ACTIVE token left EXPIRED in place: %+v", got)
+	}
+	requireAllowed(t, v.Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), "after renewal")
+	if got := strings.Join(obs.results(), ","); got != "success,terminal,success" {
+		t.Fatalf("observed %s", got)
+	}
+	out := logs.String()
+	for _, want := range []string{"level=INFO", "issuer status recovered from EXPIRED", "issuer=" + h.issuer(),
+		"agent_id=" + h.iv.AgentID} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStatusCacheBare410Sticky: a bare 410 does not say whether the agent
+// was revoked or expired (the SDK drops the TL's code), so it is held
+// terminal for the life of the process, even after a later ACTIVE fetch.
+func TestStatusCacheBare410Sticky(t *testing.T) {
+	t.Parallel()
+	h := newStatusHarness(t)
+	f := &fetcher{}
+	var offset atomic.Int64
+	r := i1Refresher(t, h, f, &offset, nil, &syncBuffer{})
+	f.set(nil, &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone})
+	if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+		t.Fatal(err)
+	}
+	offset.Store(10)
+	f.set(h.mint(scitt.StatusActive, 5), nil)
+	_ = r.Refresh(t.Context(), h.issuer())
+	if got, _ := h.cache.Get(h.iv.AgentID); !got.Terminal || got.Status != "" {
+		t.Fatalf("entry after 410 then ACTIVE = %+v, want a terminal entry with no status", got)
+	}
+	requireInstanceDenial(t, h.verifier().Verify(t.Context(), h.request(h.mint(scitt.StatusActive, -1))), codeRevoked)
+}
+
+// TestStatusRefresherStuckReportsFailure: while an issuer is held terminal,
+// a live answer from the TL is a failed refresh (observer, error and log),
+// never a success, so last_success_timestamp stops moving and the log says
+// to restart.
+func TestStatusRefresherStuckReportsFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		fetch func(h *statusHarness) ([]byte, error)
+	}{
+		{"bare 410", func(*statusHarness) ([]byte, error) {
+			return nil, &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone}
+		}},
+		{"signed REVOKED", func(h *statusHarness) ([]byte, error) { return h.mint(scitt.StatusRevoked, -5), nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newStatusHarness(t)
+			f := &fetcher{}
+			var offset atomic.Int64
+			obs := &recStatusObserver{}
+			logs := &syncBuffer{}
+			r := i1Refresher(t, h, f, &offset, obs, logs)
+			f.set(h.mint(scitt.StatusActive, -30), nil)
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatal(err)
+			}
+			f.set(tc.fetch(h))
+			if err := r.Refresh(t.Context(), h.issuer()); err != nil {
+				t.Fatal(err)
+			}
+			offset.Store(10)
+			f.set(h.mint(scitt.StatusActive, 5), nil)
+			err := r.Refresh(t.Context(), h.issuer())
+			if err == nil || !strings.Contains(err.Error(), "held terminal") {
+				t.Fatalf("Refresh while stuck = %v, want a failure saying it is held terminal", err)
+			}
+			if got := strings.Join(obs.results(), ","); got != "success,terminal,failure" {
+				t.Fatalf("observed %s", got)
+			}
+			if out := logs.String(); !strings.Contains(out, "issuer status refresh failed") || !strings.Contains(out, "restart ans-authz") {
+				t.Fatalf("log lacks the stuck-terminal failure:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestMemoryStatusCacheExpiredClearable: Install reports whether it wrote.
+// An EXPIRED entry is replaced by another terminal answer or a verified
+// ACTIVE or WARNING token, never by a tokenless or non-live one; REVOKED
+// and 410 entries are never replaced.
+func TestMemoryStatusCacheExpiredClearable(t *testing.T) {
+	t.Parallel()
+	tok := func(s scitt.AgentStatus) *scitt.VerifiedStatusToken {
+		return &scitt.VerifiedStatusToken{Payload: scitt.StatusTokenPayload{Status: s}}
+	}
+	expired := IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusExpired}
+	for _, tc := range []struct {
+		name string
+		cur  IssuerStatus
+		next IssuerStatus
+		want bool
+	}{
+		{"expired, then ACTIVE", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, true},
+		{"expired, then WARNING", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusWarning)}, true},
+		{"expired, then revoked", expired, IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusRevoked}, true},
+		{"expired, then no token", expired, IssuerStatus{AgentID: "a"}, false},
+		{"expired, then DEPRECATED", expired, IssuerStatus{AgentID: "a", Token: tok(scitt.StatusDeprecated)}, false},
+		{"revoked, then ACTIVE", IssuerStatus{AgentID: "a", Terminal: true, Status: scitt.StatusRevoked},
+			IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, false},
+		{"410, then ACTIVE", IssuerStatus{AgentID: "a", Terminal: true},
+			IssuerStatus{AgentID: "a", Token: tok(scitt.StatusActive)}, false},
+	} {
+		c := NewMemoryStatusCache()
+		if !c.Install(tc.cur) {
+			t.Fatalf("%s: first Install refused", tc.name)
+		}
+		if got := c.Install(tc.next); got != tc.want {
+			t.Errorf("%s: Install = %v, want %v", tc.name, got, tc.want)
+		}
+		if got, _ := c.Get("a"); (got.Terminal == tc.cur.Terminal && got.Status == tc.cur.Status && got.Token == nil) == tc.want {
+			t.Errorf("%s: entry %+v does not match Install's report", tc.name, got)
+		}
+	}
+	if NewMemoryStatusCache().Install(IssuerStatus{}) {
+		t.Error("Install without an agent id reported a write")
+	}
+}
